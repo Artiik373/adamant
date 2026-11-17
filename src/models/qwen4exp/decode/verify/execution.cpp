@@ -310,7 +310,7 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
             int64_t cpu_entries = 0;
             if (dm_ != nullptr) {
                 const int32_t* kind = dm_->h_ring[k].kind;
-                for (int i = 0; i < n && kind != nullptr; ++i) cpu_entries += kind[i] < 0 ? 1 : 0;
+                for (int i = 0; i < n * (int) ss.k && kind != nullptr; ++i) cpu_entries += kind[i] < 0 ? 1 : 0;
             } else cpu_entries += n;
             cpu_layer[(size_t) l] += cpu_entries;
         }
