@@ -450,8 +450,7 @@ bool Dflash2Drafter::bind(const WeightTable &wt, const NativeHead *head, std::st
     };
     head_planes_ = head->planes();
     const void *hw = head->weights();
-    const int64_t row_bytes = (int64_t)head->row_bytes();
-    int64_t head_rows = row_bytes > 0 ? (int64_t)(head->weight_bytes() / (uint64_t)row_bytes) : 0;
+    const int64_t head_rows = head->rows();   // an EXL3 head's record is not whole rows of bytes
     if (head_rows != vocab_ || we->ne0 != N_) {
         err = "dflash2: target embedding or head geometry differs";
         return false;
@@ -459,7 +458,7 @@ bool Dflash2Drafter::bind(const WeightTable &wt, const NativeHead *head, std::st
     if (!bind_raw(embed, hw, head->type(), head_rows, {}, err))
         return false;
     basalt::log::info("basalt dflash2", " %lld-token draft head (%.1f MiB), drafter %.0f MiB of VRAM",
-                      (long long)n_dvocab_, (double)(n_dvocab_ * row_bytes) / 1048576.0, (double)vram_ / 1048576.0);
+                      (long long)n_dvocab_, (double)head->weight_bytes() / 1048576.0, (double)vram_ / 1048576.0);
     return true;
 }
 

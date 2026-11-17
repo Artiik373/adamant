@@ -28,6 +28,8 @@ public:
     /// Plan v0.3 P6: the GGUF blocks, for the verify window's multi-column head.
     const void* weights() const { return weights_; }
     int type() const { return type_; }
+    /// Vocabulary rows.
+    int64_t rows() const { return n_out_; }
     /// Bytes of one vocabulary row.
     size_t row_bytes() const { return n_out_ > 0 ? (size_t) (bytes_ / (uint64_t) n_out_) : 0; }
     /// A Q6_K head's 2-bit copy for the verify window's two-stage head (q6k_vhead); null for other types or when it
