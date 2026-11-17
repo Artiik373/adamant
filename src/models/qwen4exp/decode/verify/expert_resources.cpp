@@ -221,7 +221,7 @@ bool Verifier::dm_init(std::string& err) {
         // the combine's wait for them
         constexpr double kLinkBytesPerUs = 18e3, kPoolFixUs = 15.0, kStageFixUs = 35.0;
         // the pool's rate: the EXL3 rows are decoded on the CPU, which is slower than reading the other formats
-        const double kPoolBytesPerUs = exl3_experts ? 14e3 : 45e3;
+        const double kPoolBytesPerUs = exl3_experts ? 22e3 : 45e3;
         const double cpu_us = (double) blob / kPoolBytesPerUs, link_us = (double) blob / kLinkBytesPerUs;
         std::vector<int32_t> kt((size_t) kDmCap + 1, 0);
         for (int m = 1; m <= kDmCap; ++m) {
