@@ -72,3 +72,13 @@ llama-perplexity -m Qwen3.8-Flash-Next-BF16-00001-of-00008.gguf -f wikitext-2-ra
 ```
 
 对照它给 pack 打分：用同一条命令再加上 `-m PACK.gguf --kl-divergence`。
+
+如果磁盘放不下 BF16 GGUF，`tools/bf16_reference.py` 可以从原始 safetensors 生成同样的基准文件：通过 exllamav3 的未量化前向计算，
+每次处理一个模块（用装有支持该模型架构的 exllamav3 的 Python 运行）：
+
+```sh
+python tools/bf16_reference.py --model Qwen3.8-Flash-Next --text wikitext-2-raw/wiki.test.raw --out flashnext-bf16-base.kld --chunks 100
+```
+
+它的基准在计分行上的 PPL 为 3.2783（llama.cpp：3.2733）。UD-IQ3_XXS pack 对照它的得分与对照 llama.cpp 基准相同：
+KLD 0.1180 对 0.1188，top-1 88.53% 对 88.67%。

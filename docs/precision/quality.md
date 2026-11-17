@@ -71,3 +71,13 @@ llama-perplexity -m Qwen3.8-Flash-Next-BF16-00001-of-00008.gguf -f wikitext-2-ra
 ```
 
 Score a pack against it with the same command and `-m PACK.gguf --kl-divergence` added.
+
+Without disk room for a BF16 GGUF, `tools/bf16_reference.py` builds the same base file from the original safetensors, one module at
+a time through exllamav3's unquantized forward (run it with the Python that has exllamav3 for the model's architecture):
+
+```sh
+python tools/bf16_reference.py --model Qwen3.8-Flash-Next --text wikitext-2-raw/wiki.test.raw --out flashnext-bf16-base.kld --chunks 100
+```
+
+Its base reads PPL 3.2783 on the scored rows (llama.cpp: 3.2733). The UD-IQ3_XXS pack scores against it as against llama.cpp's
+base: KLD 0.1180 against 0.1188, top-1 88.53% against 88.67%.
