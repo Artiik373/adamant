@@ -20,7 +20,8 @@ The runtime pack uses Q8_0 projection matrices with planar int8 activations and
 F32 activation scales. Normalization, dynamic convolution, rotary positions and
 attention accumulate in F32. The predecessor/successor codebooks stay BF16.
 Conversion rounds Q8_0 codes to nearest, ties to even. The full target embedding
-and head are shared in their existing formats.
+and head are shared in their existing formats; an EXL3 head drafts on a Q8_0 copy of the draft-vocabulary rows,
+dequantized from the head and rounded as the converter rounds (proposals only).
 
 The private KV ring holds F32 keys and values. HC means are captured from the
 completed target layer output. The deferred FFN-write capture computes its mean

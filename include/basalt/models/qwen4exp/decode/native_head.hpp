@@ -85,4 +85,11 @@ private:
 void set_native_embed(const NativeEmbed* e);
 const NativeEmbed* native_embed();
 
+/// An EXL3 head has no rows of its own (the output transform mixes 128 of them), so a drafter's token subset of it is a
+/// Q8_0 copy of the dequantized rows: rows `ids` in that order into `dst` (device, ids.size() * q80_row_bytes bytes).
+/// Drafts are verified by the head itself; the copy only has to rank the tokens like it.
+size_t q80_row_bytes(int64_t n_embd);
+bool exl3_draft_rows(const NativeHead& head, int64_t n_embd, int64_t n_vocab, const std::vector<int32_t>& ids,
+                     uint8_t* dst);
+
 }  // namespace basalt::core

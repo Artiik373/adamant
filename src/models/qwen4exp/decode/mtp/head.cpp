@@ -13,8 +13,8 @@ bool draft_ctx_rows(int head_type) { return head_type == 13 || head_type == GGML
 bool draft_rows_mapped(int head_type) { return head_type == 14 || head_type == GGML_Q8_0; }
 bool draft_proxy(int head_type) { return head_type == 13 || head_type == 14 || head_type == GGML_Q8_0; }
 
-// An EXL3 head has no rows of its own (the output transform mixes 128 of them), so its draft subset is a Q8_0 copy of
-// the dequantized rows.  Drafts are verified by the head itself: the copy only has to rank the tokens like it.
+}  // namespace
+
 size_t q80_row_bytes(int64_t n_embd) { return (size_t) (n_embd / 32) * 34; }
 
 bool exl3_draft_rows(const NativeHead& head, int64_t n_embd, int64_t n_vocab, const std::vector<int32_t>& ids,
@@ -49,6 +49,8 @@ bool exl3_draft_rows(const NativeHead& head, int64_t n_embd, int64_t n_vocab, co
     cudaFree(dev);
     return ok && cudaMemcpy(dst, out.data(), out.size(), cudaMemcpyHostToDevice) == cudaSuccess;
 }
+
+namespace {
 }  // namespace
 
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int head_type, int64_t n_vocab) const {

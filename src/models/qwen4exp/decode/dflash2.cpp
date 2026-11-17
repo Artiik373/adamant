@@ -11,6 +11,7 @@
 #include "basalt/core/weights.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/cpu/exl3.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/models/qwen4exp/kernels/dflash2.hpp"
 #include "basalt/models/qwen4exp/kernels/native_qsa.hpp"
@@ -58,6 +59,7 @@ Dflash2Drafter::~Dflash2Drafter() {
             cudaFree(p);
     };
     fr(prompt_taps_);
+    fr(dhead_);
     fr(blob_);
     fr(d_meta_);
     fr(xq_);
@@ -424,7 +426,7 @@ bool Dflash2Drafter::bind_raw(EmbedFn embed, const void *head_w, int head_type, 
     return true;
 }
 
-bool Dflash2Drafter::bind(const WeightTable &wt, const NativeHead *head, std::string &err) {
+bool Dflash2Drafter::bind(const WeightTable &wt, const NativeHead *head, const FileRange &draft_vocab, std::string &err) {
     const OnDevice on_device(device_);
     if (head == nullptr || !head->loaded()) {
         err = "dflash2: the drafter needs the native head (--native)";
@@ -455,10 +457,35 @@ bool Dflash2Drafter::bind(const WeightTable &wt, const NativeHead *head, std::st
         err = "dflash2: target embedding or head geometry differs";
         return false;
     }
-    if (!bind_raw(embed, hw, head->type(), head_rows, {}, err))
+    std::vector<int32_t> ids;
+    if (kernels::cpu::exl3_type(head->type()) && !draft_vocab.empty() && draft_vocab.exists() && draft_vocab.size() % 4 == 0) {
+        ids.resize((size_t)(draft_vocab.size() / 4));
+        FILE *f = basalt::platform::open_file_utf8(draft_vocab.path, "rb");
+        const bool read = f != nullptr && basalt::platform::fseek64(f, draft_vocab.offset, SEEK_SET) == 0 &&
+                          std::fread(ids.data(), 4, ids.size(), f) == ids.size();
+        if (f != nullptr)
+            std::fclose(f);
+        for (int32_t t : ids)
+            if (!read || t < 0 || t >= vocab_) {
+                err = "dflash2: the draft vocabulary could not be read";
+                return false;
+            }
+        const size_t bytes = ids.size() * q80_row_bytes(N_);
+        if (cudaMalloc((void **)&dhead_, bytes) != cudaSuccess || !exl3_draft_rows(*head, N_, vocab_, ids, dhead_)) {
+            err = "dflash2: the draft head's rows could not be built from the EXL3 head";
+            return false;
+        }
+        vram_ += bytes;
+        hw = dhead_;
+        head_planes_ = false;
+    }
+    if (!bind_raw(embed, hw, ids.empty() ? head->type() : GGML_Q8_0, ids.empty() ? head_rows : (int64_t)ids.size(), ids,
+                  err))
         return false;
     basalt::log::info("basalt dflash2", " %lld-token draft head (%.1f MiB), drafter %.0f MiB of VRAM",
-                      (long long)n_dvocab_, (double)head->weight_bytes() / 1048576.0, (double)vram_ / 1048576.0);
+                      (long long)n_dvocab_,
+                      (double)(ids.empty() ? head->weight_bytes() : ids.size() * q80_row_bytes(N_)) / 1048576.0,
+                      (double)vram_ / 1048576.0);
     return true;
 }
 

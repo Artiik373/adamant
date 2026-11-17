@@ -429,7 +429,7 @@ int sessions(Context& context) {
                      (unsigned long long) native_head.weight_bytes(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
     }
-    if (!o.dflash2.empty() && !dflash2.bind(wt, &native_head, err)) return fatal_start_error(err);
+    if (!o.dflash2.empty() && !dflash2.bind(wt, &native_head, srcs.mtp_draft_vocab, err)) return fatal_start_error(err);
     std::vector<float> logits((size_t) n_vocab);
     float* d_logits = nullptr;
     if (cudaMalloc(&d_logits, (size_t) n_vocab * 4) != cudaSuccess) {

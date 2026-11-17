@@ -59,7 +59,9 @@ class Dflash2Drafter {
     bool load(const std::string &pack_path, int device, std::string &err);
     /// The target's embedding and head (and the draft vocabulary file, "" or
     /// missing: the whole head).
-    bool bind(const WeightTable &wt, const NativeHead *head, std::string &err);
+    /// `draft_vocab`: the model file's draft token subset (mtp/draft_vocab); with an EXL3 head the drafter ranks that
+    /// subset on a Q8_0 copy of its rows instead of the whole head.
+    bool bind(const WeightTable &wt, const NativeHead *head, const FileRange &draft_vocab, std::string &err);
     /// Tests: an embedding callback and a head given as raw rows of `head_type`
     /// (a native_mmvq type).
     using EmbedFn = std::function<void(const int32_t *tokens_dev, int n, float *out, cudaStream_t)>;
@@ -142,6 +144,7 @@ class Dflash2Drafter {
     int head_type_ = -1;
     int64_t n_dvocab_ = 0;
     int32_t *dvocab_ = nullptr;
+    uint8_t *dhead_ = nullptr;   // an EXL3 head's Q8_0 subset copy
     bool bound_ = false;
     bool head_planes_ = false;
 
