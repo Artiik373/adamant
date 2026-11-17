@@ -212,6 +212,65 @@ def append_section(path: str, name: str, src: str, new_meta: bytes, undo_dir: st
         _sync(f)
 
 
+def replace_sections(path: str, new: dict, new_meta: bytes, undo_dir: str) -> None:
+    """Replaces (or adds) sections without rewriting the file: `new` maps a name to an iterator of byte chunks. The new
+    sections and `new_meta` go past the file's end, then one write replaces the header and table; the replaced sections'
+    old bytes stay where they were, a gap. Until that one write the file reads as it did, and `undo_replace` restores it
+    bit for bit (`undo_dir`, new, keeps the old header)."""
+    m = ModelFile(path)
+    if "meta" in new or any(len(k.encode()) >= 64 for k in new):
+        raise ValueError(f"{path}: cannot replace these sections: {sorted(new)}")
+    with open(path, "r+b") as f:
+        head = f.read(HEADER_BYTES)
+        magic, version, n, file_bytes, reserved = HEADER.unpack_from(head, 0)
+        if os.path.getsize(path) != file_bytes:
+            raise ValueError(f"{path}: {os.path.getsize(path)} bytes, its table says {file_bytes}")
+        if not m.verify("meta"):
+            raise ValueError(f"{path}: its meta section does not match its hash")
+        os.makedirs(undo_dir)
+        with open(os.path.join(undo_dir, "header.bin"), "wb") as u:
+            u.write(head)
+            _sync(u)
+        pos = file_bytes
+        entries = []
+        for name, chunks in list(new.items()) + [("meta", [new_meta])]:
+            off = _align(pos)
+            f.seek(pos)
+            _write_zeros(f, off - pos)
+            h = hashlib.sha256()
+            size = 0
+            for b in chunks:
+                h.update(b)
+                f.write(b)
+                size += len(b)
+            entries.append((name, off, size, h.digest()))
+            pos = off + size
+        _sync(f)
+        table = [(k, v[0], v[1], v[2]) for k, v in m.sections.items() if k not in new and k != "meta"] + entries
+        if len(table) > MAX_SECTIONS:
+            raise ValueError(f"{path}: the section table is full")
+        new_head = HEADER.pack(magic, version, len(table), pos, reserved)
+        new_head += b"".join(ENTRY.pack(k.encode(), o, b, d, b"\0" * 16) for k, o, b, d in table)
+        f.seek(0)
+        f.write(new_head + b"\0" * (HEADER_BYTES - len(new_head)))
+        _sync(f)
+
+
+def undo_replace(path: str, undo_dir: str) -> None:
+    """Restores the file replace_sections changed, bit for bit (its old sections were never touched)."""
+    with open(os.path.join(undo_dir, "header.bin"), "rb") as u:
+        head = u.read()
+    _, _, _, file_bytes, _ = HEADER.unpack_from(head, 0)
+    if len(head) != HEADER_BYTES:
+        raise ValueError(f"{undo_dir}: not what replace_sections kept")
+    with open(path, "r+b") as f:
+        f.seek(0)
+        f.write(head)
+        _sync(f)
+        f.truncate(file_bytes)
+        _sync(f)
+
+
 def undo_append(path: str, undo_dir: str) -> None:
     """Restores the file append_section changed, bit for bit."""
     with open(os.path.join(undo_dir, "header.bin"), "rb") as u:
