@@ -279,7 +279,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         ra.ring = (uint32_t) (r + 1); ra.ctr = v_.dm_->ctr;
         ra.stats = v_.dm_->wstat;
         ra.peer_cap = 0;
-        ra.rows = v_.dm_->rq != nullptr || v_.dm_->warm != nullptr;
+        ra.rows = v_.dm_->rq != nullptr || v_.dm_->warm != nullptr || v_.dm_->trace != nullptr;
         if (v_.dm_->stage_src != nullptr && (v_.batch_rec_ || v_.dm_->stage_decode)) {   // the layer's CPU misses split between the pool and the staged copy
             ra.stage_src = v_.dm_->stage_src + l * g.n_expert;
             ra.stage_k = v_.dm_->stage_k;

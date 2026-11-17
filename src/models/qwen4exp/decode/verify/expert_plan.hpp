@@ -19,6 +19,7 @@ struct DecMoe {
     int32_t* res1 = nullptr;                 ///< CUDA0: the same for the peer's slots
     std::vector<int32_t> shadow0, shadow1;   ///< what res0 / res1 hold
     CpuWarm* warm = nullptr;                 ///< the CPU tier's warm-up (null: off)
+    CpuWarm* trace = nullptr;                ///< --exp expert_trace: only the router tables the trace writes
     basalt::kernels::DmPlan* plan = nullptr;
     unsigned int* ctr = nullptr;
     unsigned long long* slot_off = nullptr;  ///< CUDA0's per-slot offsets (null: slot * blob)

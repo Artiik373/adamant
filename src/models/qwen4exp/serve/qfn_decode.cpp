@@ -513,6 +513,14 @@ inline void QfnRequest::window_timing(int T, int a, bool from_sfx, Clock::time_p
                              msd(tw0, tw1), msd(tw1, tw3));
                 for (int i = 0; i < wprob_n; ++i) std::fprintf(draft_log, " %.4f", wprob[i]);
                 std::fputc('\n', draft_log);
+                basalt::core::WindowExperts& we = basalt::core::window_experts();
+                if (we.T == T) {   // X T ms_wait ms_pool  u[0..T)  c[0..T)  s[0..T)  seq
+                    std::fprintf(draft_log, "X %d %.3f %.3f", T, we.ms_wait, we.ms_pool);
+                    for (const int32_t* v : {we.u, we.c, we.s})
+                        for (int t = 0; t < T; ++t) std::fprintf(draft_log, " %d", v[t]);
+                    std::fprintf(draft_log, " %lld\n", (long long) we.seq);
+                    we.T = 0;   // a window the host did not serve leaves no line
+                }
             }
         }
 }

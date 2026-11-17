@@ -2,6 +2,7 @@
 #include "basalt/models/qwen4exp/kernels/q80_vhead.hpp"
 #include "expert_plan.hpp"
 #include "diagnostics.hpp"
+#include "basalt/core/diag.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/core/on_device.hpp"
@@ -20,6 +21,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cmath>
 #include <string>
 #include <utility>
@@ -196,6 +198,34 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     return true;
 }
 
+WindowExperts& window_experts() {
+    static WindowExperts w;
+    return w;
+}
+
+// --exp expert_trace=N with --draft-log F: F.trace gets, for the first N windows, every served layer's routing and the
+// q8_1 rows of its FFN input (what the warm-up scores the next layer's router on), after a header with the geometry and
+// the warm-up's 4-bit router tables.  Layout (little-endian): header int32 {magic 'XTR1', n_layers, n_expert, n_embd, k,
+// row_bytes}, rq bytes, rs floats; per record int32 {seq, layer, T}, int32 ids[T * k], int32 kind[T * k], T rows.
+static void trace_layer(const CpuWarm& w, int64_t n_layers, int64_t seq, int64_t layer, int T, int k,
+                 const basalt::kernels::DmRing& R, const uint8_t* xq, size_t row_bytes) {
+    static std::FILE* const f = std::fopen((diagnostics().draft_log + ".trace").c_str(), "wb");
+    if (f == nullptr || seq >= (int64_t) exp_flag("expert_trace")) return;
+    static bool head = false;
+    if (!head) {
+        const int32_t h[6] = {0x31525458, (int32_t) n_layers, w.n_expert, w.n_embd, w.k, (int32_t) row_bytes};
+        std::fwrite(h, sizeof h, 1, f);
+        std::fwrite(w.rq.data(), 1, w.rq.size(), f);
+        std::fwrite(w.rs.data(), sizeof(float), w.rs.size(), f);
+        head = true;
+    }
+    const int32_t r[3] = {(int32_t) seq, (int32_t) layer, T};
+    std::fwrite(r, sizeof r, 1, f);
+    std::fwrite(R.ids, sizeof(int32_t), (size_t) T * k, f);
+    std::fwrite(R.kind, sizeof(int32_t), (size_t) T * k, f);
+    std::fwrite(xq, 1, (size_t) T * row_bytes, f);
+}
+
 // The host's side of the window: each layer's ring, served as the GPU reaches it.
 bool Verifier::run_serve(PoolMultiFn pool, void* user, std::string& err) {
     for (;;) {
@@ -313,6 +343,29 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
                 for (int i = 0; i < n * (int) ss.k && kind != nullptr; ++i) cpu_entries += kind[i] < 0 ? 1 : 0;
             } else cpu_entries += n;
             cpu_layer[(size_t) l] += cpu_entries;
+        }
+        if (dm_ != nullptr && !diagnostics().draft_log.empty()) {   // the window's distinct experts per token prefix
+            WindowExperts& we = window_experts();
+            static int64_t seq = -1;
+            if (k == 0) we = WindowExperts{}, we.seq = ++seq;
+            const int nt = std::min(n, 8);
+            we.T = nt;
+            we.ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
+            we.ms_pool += ms_layer;
+            const basalt::kernels::DmRing& R = dm_->h_ring[k];
+            for (int i = 0; i < nt * (int) ss.k; ++i) {
+                bool first = true;
+                for (int j = 0; j < i && first; ++j) first = R.ids[j] != R.ids[i];
+                if (!first) continue;
+                for (int t = i / (int) ss.k; t < nt; ++t) {
+                    ++we.u[t];
+                    we.c[t] += R.kind[i] < 0;
+                    we.s[t] += R.kind[i] == 1;
+                }
+            }
+            if (const CpuWarm* tw = dm_->warm != nullptr ? dm_->warm : dm_->trace; tw != nullptr && exp_flag("expert_trace") > 0)
+                trace_layer(*tw, g.n_layers, we.seq, l, nt, (int) ss.k, R, dm_->h_xq + (size_t) k * dm_->xq_stride,
+                            (size_t) (g.n_embd / 32) * 36);
         }
         ++fl_.k;
     }

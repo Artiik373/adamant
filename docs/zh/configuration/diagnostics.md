@@ -31,7 +31,7 @@
 | `--profile` | serve | 每个请求的 GPU 阶段时间。不用于 A/B 计时。 |
 | `--wait-stats` | serve | decode 循环中主机等待的时间。 |
 | `--decode-timing` | serve | 每个请求一行，说明 decode 时间花在哪。 |
-| `--draft-log FILE` | serve | 每个校验窗口一行（宽度、接受数、时间）。 |
+| `--draft-log FILE` | serve | 每个校验窗口一行（宽度、接受数、时间），随后一行 `X`：该窗口每个 token 前缀的不同专家数，分为全部层级、CPU 池和暂存部分，按层求和。 |
 
 ## 转储与投机测试
 
@@ -97,4 +97,5 @@
 - `concur9_logit_hash=1`：在 stderr 上打印每个被接受行的 head logits 哈希。
 - `concur5_digest=1`：批处理槽位每个窗口打印一次状态摘要。
 - `spec_log=1`：配合 `--draft-log` 时，同时写下每行的目标分布。
+- `expert_trace=N`：配合 `--draft-log FILE` 时，为前 N 个窗口写入 `FILE.trace`：在 4 位路由表之后，记录每层的专家、层级和 FFN 输入行。格式见 `decode/verify/execution.cpp`。
 - `host_ev=1`：打印每个窗口的校验、提交和 draft 的 GPU 时间，以及空闲间隔。

@@ -31,7 +31,7 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--profile` | serve | GPU stage times per request. Not for A/B timing. |
 | `--wait-stats` | serve | Host wait times in the decode loop. |
 | `--decode-timing` | serve | One line per request on where decode time went. |
-| `--draft-log FILE` | serve | One line per verify window (width, accepted, time). |
+| `--draft-log FILE` | serve | One line per verify window (width, accepted, time), then an `X` line: the window's distinct experts per token prefix, all tiers, CPU pool and staged, summed over the layers. |
 
 ## Dumps and speculation tests
 
@@ -98,4 +98,5 @@ build runs on it), `--link-rates` (one `pcie_h2d BUS_ID GB_PER_S` line per GPU, 
 - `concur9_logit_hash=1`: print a hash of each accepted row's head logits on stderr.
 - `concur5_digest=1`: batch slots print a state digest per window.
 - `spec_log=1`: with `--draft-log`, also write each row's target distribution.
+- `expert_trace=N`: with `--draft-log FILE`, write `FILE.trace` for the first N windows: each layer's experts, tiers and FFN input rows, after the 4-bit router tables. The layout is in `decode/verify/execution.cpp`.
 - `host_ev=1`: print GPU time per window's verify, commit and draft, and the idle gap.

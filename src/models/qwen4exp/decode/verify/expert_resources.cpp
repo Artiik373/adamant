@@ -109,9 +109,10 @@ bool Verifier::dm_init(std::string& err) {
     std::vector<uint8_t> rq4_h;
     std::vector<float> rs4_h;
     const bool peer_on = peer_ != nullptr && peer_->valid();
-    const bool codes_ok = (cpu_warm || peer_on) &&
+    const bool trace = !cpu_warm && exp_flag("expert_trace") > 0 && !diagnostics().draft_log.empty();
+    const bool codes_ok = (cpu_warm || peer_on || trace) &&
                           router_codes(*wt_, g, peer_on ? &rq_h : nullptr, peer_on ? &rs_h : nullptr,
-                                       cpu_warm ? &rq4_h : nullptr, cpu_warm ? &rs4_h : nullptr);
+                                       cpu_warm || trace ? &rq4_h : nullptr, cpu_warm || trace ? &rs4_h : nullptr);
     const bool router_ok = peer_on && codes_ok;
     if (peer_ != nullptr && peer_->valid()) {
         const OnDevice on(peer_->device());
@@ -194,6 +195,13 @@ bool Verifier::dm_init(std::string& err) {
         w->logits.assign((size_t) kVerifyMaxT * g.n_expert, 0.0f);
         d->warm = w;
     }
+    if (trace && codes_ok) {
+        CpuWarm* w = new CpuWarm;
+        w->rq = std::move(rq4_h);
+        w->rs = std::move(rs4_h);
+        w->n_expert = (int) g.n_expert; w->n_embd = (int) N; w->k = (int) K;
+        d->trace = w;
+    }
     // The staged share: on one card, a batch window's layer with enough CPU misses sends some of them to CUDA0, copied
     // over PCIe from their RAM copies into staging while the pool reads the rest.  An expert without a mapped RAM copy
     // is never staged; the addresses are read again before a batch window when the source's places moved (a swap).
@@ -262,6 +270,7 @@ void Verifier::dm_free() {
         warm_pool_->idle_stop();
         delete d->warm;
     }
+    delete d->trace;
     if (d->pdev >= 0) {
         const OnDevice on(d->pdev);
         if (d->ps) { cudaStreamSynchronize(d->ps); cudaStreamDestroy(d->ps); }

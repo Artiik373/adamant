@@ -54,6 +54,16 @@ struct DecMoe;
 using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                              int64_t layer);
 
+/// --draft-log: the last verify window's experts, each summed over the layers the host served: [t] the distinct
+/// experts of tokens 0..t, all tiers (u), the CPU pool's (c) and the staged share's (s).
+struct WindowExperts {
+    int T = 0;
+    int32_t u[8] = {}, c[8] = {}, s[8] = {};
+    double ms_wait = 0, ms_pool = 0;   // the host's waits for the GPU and its pool time, this window
+    int64_t seq = 0;                   // the window's number in the expert trace (--exp expert_trace=N)
+};
+WindowExperts& window_experts();
+
 struct VerifyHits {
     const int32_t* d_res = nullptr;      ///< device [n_layers * n_expert] slot or -1
     const int32_t* h_res = nullptr;      ///< host [n_layers * n_expert] slot or -1 (when all >= 0 in stage: zero-doorbell)
