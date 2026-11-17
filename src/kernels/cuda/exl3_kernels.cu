@@ -91,13 +91,16 @@ __device__ __forceinline__ void fx_mma(float (&c)[4], const uint32_t (&a)[4], ui
 // A tile is one m16n8k16 product per half of its columns: the lane's 8 decoded weights are its two B fragments (small
 // integers, exact in fp16), and the A fragment holds the pass's entries as fp16 pairs hi + lo (rows 0..7 the hi parts,
 // rows 8..15 the lo parts), so the products are exact, the sums are fp32 and an entry costs no decode of its own.
-template <int KBW, int KPW, int NS, bool FROM_Q81, int KA, bool HALF>
+//   NC: the output columns (n); with a known rate (KA > 0) the tile addresses are then constants off one base.
+template <int KBW, int KPW, int NS, int NC, bool FROM_Q81, int KA, bool HALF>
 __global__ void __launch_bounds__(KBW * NS * 32, KBW * NS >= 20 ? 2 : 4)
 exl3_proj_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
                     const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_src,
                     const int32_t* __restrict__ out_rows, const Q81* __restrict__ xq, const float* __restrict__ xf,
-                    float* __restrict__ y0, float* __restrict__ y1, int w, size_t rec0, size_t rec1, int n, int variant) {
+                    float* __restrict__ y0, float* __restrict__ y1, int w_arg, size_t rec0, size_t rec1, int variant) {
     constexpr int K = 128 * KBW * KPW;
+    constexpr int n = NC;
+    const int w = KA > 0 ? 16 * KA + (HALF ? 8 : 0) : w_arg;
     // xs[entry][k / 2] = {hi(k), hi(k + 1) | lo(k), lo(k + 1)}: two words a pair of activations
     __shared__ __align__(16) uint32_t xs[kE][K];
     __shared__ float part[KBW][kE][128];
@@ -700,31 +703,31 @@ void launch_dense(const uint8_t* w_blob, const Q81* xq, float* y, int k, int n, 
     else launch_dense_g<KA, HALF, 1>(w_blob, xq, y, k, n, w, nkg, kpw, ncols, variant, s);
 }
 
-template <int KBW, int KPW, int NS, bool FROM_Q81, int KA, bool HALF>
+template <int KBW, int KPW, int NS, int NC, bool FROM_Q81, int KA, bool HALF>
 void launch_rate(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_src, const int32_t* out_rows, const Q81* xq,
-                 const float* xf, float* y0, float* y1, int w, size_t rec0, size_t rec1, int n, int variant) {
+                 const float* xf, float* y0, float* y1, int w, size_t rec0, size_t rec1, int variant) {
     // the largest shared-memory split, so that as many CTAs as the registers allow share a multiprocessor
     static std::atomic<bool> attr[64];
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= 64) dev = 0;
     if (!attr[dev].load(std::memory_order_acquire)) {
-        cudaFuncSetAttribute(exl3_proj_kernel<KBW, KPW, NS, FROM_Q81, KA, HALF>,
+        cudaFuncSetAttribute(exl3_proj_kernel<KBW, KPW, NS, NC, FROM_Q81, KA, HALF>,
                              cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         attr[dev].store(true, std::memory_order_release);
     }
-    exl3_proj_kernel<KBW, KPW, NS, FROM_Q81, KA, HALF><<<grid, KBW * NS * 32, 0, s>>>(
-        grp_ptr, grp_start, n_groups, ent_src, out_rows, xq, xf, y0, y1, w, rec0, rec1, n, variant);
+    exl3_proj_kernel<KBW, KPW, NS, NC, FROM_Q81, KA, HALF><<<grid, KBW * NS * 32, 0, s>>>(
+        grp_ptr, grp_start, n_groups, ent_src, out_rows, xq, xf, y0, y1, w, rec0, rec1, variant);
 }
 
 // The common rates (2, 2.5, 3, 3.5 and 4 bits) get their own window arithmetic, any other the generic one.
-template <int KBW, int KPW, int NS, bool FROM_Q81>
+template <int KBW, int KPW, int NS, int NC, bool FROM_Q81>
 void launch_proj(int w, dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_src, const int32_t* out_rows, const Q81* xq,
-                 const float* xf, float* y0, float* y1, size_t rec0, size_t rec1, int n, int variant) {
+                 const float* xf, float* y0, float* y1, size_t rec0, size_t rec1, int variant) {
     switch (w) {
-#define EXL3_RATE(W, KA, HALF)     case W: launch_rate<KBW, KPW, NS, FROM_Q81, KA, HALF>(grid, s, grp_ptr, grp_start, n_groups, ent_src, out_rows, xq, xf, y0, y1, w, rec0, rec1, n, variant); break;
+#define EXL3_RATE(W, KA, HALF)     case W: launch_rate<KBW, KPW, NS, NC, FROM_Q81, KA, HALF>(grid, s, grp_ptr, grp_start, n_groups, ent_src, out_rows, xq, xf, y0, y1, w, rec0, rec1, variant); break;
     EXL3_RATE(32, 2, false)
     EXL3_RATE(40, 2, true)
     EXL3_RATE(48, 3, false)
@@ -732,8 +735,8 @@ void launch_proj(int w, dim3 grid, cudaStream_t s, const unsigned long long* grp
     EXL3_RATE(64, 4, false)
 #undef EXL3_RATE
     default:
-        launch_rate<KBW, KPW, NS, FROM_Q81, 0, false>(grid, s, grp_ptr, grp_start, n_groups, ent_src, out_rows, xq, xf, y0,
-                                                     y1, w, rec0, rec1, n, variant);
+        launch_rate<KBW, KPW, NS, NC, FROM_Q81, 0, false>(grid, s, grp_ptr, grp_start, n_groups, ent_src, out_rows, xq, xf,
+                                                         y0, y1, w, rec0, rec1, variant);
     }
 }
 
@@ -966,15 +969,15 @@ void exl3_expert_grouped(const NativeExpertLayout& L, float limit, const unsigne
     float* h = (float*) ((uint8_t*) scratch + 2 * fa);
     const unsigned gy = (unsigned) ((grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups);
     // gate and up: K = n_embd = 20 blocks (10 k groups x 2 column splits), 5 column blocks, z selects the projection
-    launch_proj<10, 2, 2, true>(w, dim3((unsigned) (L.n_ff / 128), gy, 2), s, grp_ptr, grp_start, n_groups, ent_tok,
-                                nullptr, (const Q81*) x_q8_1, nullptr, gate, up, 0, L.up_off, (int) L.n_ff, variant);
+    launch_proj<10, 2, 2, 640, true>(w, dim3((unsigned) (L.n_ff / 128), gy, 2), s, grp_ptr, grp_start, n_groups,
+                                     ent_tok, nullptr, (const Q81*) x_q8_1, nullptr, gate, up, 0, L.up_off, variant);
     check("exl3_expert_grouped/gu");
     const long long nh = (long long) cap_entries * L.n_ff;
     exl3_swiglu_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, grp_start, n_groups, (int) L.n_ff, limit, h);
     check("exl3_expert_grouped/swiglu");
     // down: K = n_ff = 5 blocks (5 warps x 2 column halves), 20 column blocks
-    launch_proj<5, 1, 2, false>(wd, dim3((unsigned) (L.n_embd / 128), gy, 1), s, grp_ptr, grp_start, n_groups, nullptr,
-                                ent_dst, nullptr, h, out, out, L.down_off, L.down_off, (int) L.n_embd, variant);
+    launch_proj<5, 1, 2, 2560, false>(wd, dim3((unsigned) (L.n_embd / 128), gy, 1), s, grp_ptr, grp_start, n_groups,
+                                      nullptr, ent_dst, nullptr, h, out, out, L.down_off, L.down_off, variant);
     check("exl3_expert_grouped/down");
 }
 
