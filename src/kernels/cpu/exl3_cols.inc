@@ -43,27 +43,10 @@ constexpr int kColsTok = 8;   // tokens one decode serves
 
 // NT > 0: the token count is a constant (one token keeps its sums in registers); NT = 0: `ntok` tokens.
 template <int NT>
-void cols_n(const Exl3Proj& p, const RingTable& rt, const float* const* x2, int ntok, float* const* y1, int c0, int c1) {
+void cols_n(const Exl3Proj& p, const RingTable& rt, const float* const* xp, const float* bias, int ntok,
+            float* const* y1, int c0, int c1) {
     const int nt = NT ? NT : ntok;
     const int ktiles = p.k / 16;
-    // per token, k tile and t&3: the activations the 8 lanes of a group multiply (rows 2q, 2q+1, 2q+8, 2q+9, twice)
-    thread_local std::vector<float> xp_store;
-    const size_t xp_tok = (size_t) ktiles * 32;
-    xp_store.resize(xp_tok * (size_t) nt + 8);
-    float* xp = (float*) (((uintptr_t) xp_store.data() + 31) & ~(uintptr_t) 31);
-    float bias[kColsTok];
-    for (int t = 0; t < nt; ++t) {
-        const float* xt = x2[t];
-        for (int kt = 0; kt < ktiles; ++kt)
-            for (int q = 0; q < 4; ++q) {
-                const float* x = xt + kt * 16 + q * 2;
-                _mm256_store_ps(xp + (size_t) t * xp_tok + ((size_t) kt * 4 + q) * 8,
-                                _mm256_setr_ps(x[0], x[1], x[8], x[9], x[0], x[1], x[8], x[9]));
-            }
-        float sumx = 0.f;
-        for (int i = 0; i < p.k; ++i) sumx += xt[i];
-        bias[t] = 510.f * sumx;
-    }
     Avx2Consts k;
     k.mul = _mm256_set1_epi32((int) kMul);
     k.ones8 = _mm256_set1_epi8(1);
@@ -85,7 +68,7 @@ void cols_n(const Exl3Proj& p, const RingTable& rt, const float* const* x2, int 
             quad<6>(rt, wd, k, cd);
             quad<7>(rt, wd, k, cd);
             for (int t = 0; t < nt; ++t) {
-                const float* xk = xp + (size_t) t * xp_tok + (size_t) kt * 32;
+                const float* xk = xp[t] + (size_t) kt * 32;
                 const __m256 x0 = _mm256_load_ps(xk), x1 = _mm256_load_ps(xk + 8), x2v = _mm256_load_ps(xk + 16),
                              x3 = _mm256_load_ps(xk + 24);
                 for (int c = 0; c < 8; ++c) {
@@ -110,15 +93,13 @@ void cols_n(const Exl3Proj& p, const RingTable& rt, const float* const* x2, int 
 
 }  // namespace
 
-void BASALT_EXL3_COLS(const Exl3Proj& p, const float* const* x2, int nt, float* const* y1, int c0, int c1) {
+void BASALT_EXL3_COLS(const Exl3Proj& p, const float* const* xp, const float* bias, int nt, float* const* y1, int c0,
+                      int c1) {
     const RingTable& rt = ring_table(p.w);
-    if (!rt.fast[1]) {   // under 2 bits per weight: the windows of the first groups wrap; not a rate EXL3 ships here
-        for (int t = 0; t < nt; ++t) exl3_cols_ref(p, x2[t], y1[t], c0, c1);
-        return;
-    }
-    for (; nt > kColsTok; nt -= kColsTok, x2 += kColsTok, y1 += kColsTok) cols_n<0>(p, rt, x2, kColsTok, y1, c0, c1);
-    if (nt == 1) cols_n<1>(p, rt, x2, 1, y1, c0, c1);
-    else cols_n<0>(p, rt, x2, nt, y1, c0, c1);
+    for (; nt > kColsTok; nt -= kColsTok, xp += kColsTok, bias += kColsTok, y1 += kColsTok)
+        cols_n<0>(p, rt, xp, bias, kColsTok, y1, c0, c1);
+    if (nt == 1) cols_n<1>(p, rt, xp, bias, 1, y1, c0, c1);
+    else cols_n<0>(p, rt, xp, bias, nt, y1, c0, c1);
 }
 
 }  // namespace basalt::kernels::cpu::exl3_detail

@@ -3,6 +3,7 @@
 #include "basalt/kernels/cpu/exl3.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -198,6 +199,29 @@ int main(int argc, char** argv) {
         float back;
         exl3_unpack_act(&h, 1, &back);
         if (std::fabs(back - v) > std::fabs(v) * 1e-3 + 1e-7) { std::printf("fp16 round trip %g -> %g FAIL\n", v, back); ++g_fail; }
+    }
+    // the 8-wide conversions give the bits of the one-value (plain C) ones: ties, subnormals, overflow, random values
+    {
+        std::mt19937 rng(11);
+        std::vector<float> v(4096);
+        for (size_t i = 0; i < v.size(); ++i) {
+            const uint32_t r = rng();
+            v[i] = std::ldexp((float) (int) (r & 0xFFFFFF) - 8388608.f, (int) ((r >> 24) % 48) - 50);
+        }
+        const float edge[8] = {1.00048828125f, 1.00146484375f, 65520.f, 1e30f, 5.9e-8f, 2.98e-8f, -0.f, 6.1e-5f};
+        std::copy(edge, edge + 8, v.begin());
+        std::vector<uint16_t> hv(v.size()), hs(v.size());
+        std::vector<float> fv(v.size()), fs(v.size());
+        exl3_pack_act(v.data(), (int) v.size(), hv.data());
+        exl3_unpack_act(hv.data(), (int) v.size(), fv.data());
+        for (size_t i = 0; i < v.size(); ++i) {
+            exl3_pack_act(&v[i], 1, &hs[i]);
+            exl3_unpack_act(&hs[i], 1, &fs[i]);
+        }
+        if (std::memcmp(hv.data(), hs.data(), hv.size() * 2) != 0 || std::memcmp(fv.data(), fs.data(), fv.size() * 4) != 0) {
+            std::printf("fp16 conversions: 8-wide and one-value bits differ FAIL\n");
+            ++g_fail;
+        }
     }
     run(2560, 640, 48, avx2);
     run(2560, 640, 56, avx2);

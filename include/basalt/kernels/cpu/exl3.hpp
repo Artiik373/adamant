@@ -65,6 +65,13 @@ void exl3_cols_ref(const Exl3Proj& p, const float* x2, float* y1, int c0, int c1
 /// The same on AVX2 for `nt` prepared inputs, the trellis decoded once for all of them (call only behind
 /// cpu_avx2_ok()).  A token's values do not depend on the others.
 void exl3_cols_avx2(const Exl3Proj& p, const float* const* x2, int nt, float* const* y1, int c0, int c1);
+/// The column kernel's own form of a prepared input, for callers that run many column ranges on one input:
+/// exl3_expand_input fills xp (2 k floats, 32-byte aligned) and the bias; exl3_cols_expanded_avx2 is exl3_cols_avx2 on
+/// them, bit for bit.  Only for a rate exl3_cols_avx2_ok accepts (2 bits per weight and more).
+bool exl3_cols_avx2_ok(int w);
+void exl3_expand_input(const float* x2, int k, float* xp, float* bias);
+void exl3_cols_expanded_avx2(const Exl3Proj& p, const float* const* xp, const float* bias, int nt, float* const* y1,
+                             int c0, int c1);
 /// The output transform and svh over 128-blocks [b0, b1) of y1, in place.
 void exl3_finish(const Exl3Proj& p, float* y, int b0, int b1, int variant);
 

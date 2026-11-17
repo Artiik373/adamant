@@ -265,10 +265,21 @@ void ExpertPool::drain(int id, uint32_t epoch) {
             const int n = fused_n_, pg = fused_gu_parts_, pd = fused_d_parts_;
             if ((int) i < n * pg) {
                 const int e = (int) i / pg, part = (int) i % pg;
-                native_gu_range(e, part_row(part, pg, (int) nfmt_->n_ff, gu_align_),
-                                part_row(part + 1, pg, (int) nfmt_->n_ff, gu_align_));
                 FusedExpert& fe = fused_[(size_t) e];
-                if (fe.gu_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                bool last;
+                if (exl3_ppb_ > 0) {   // the part's block ends with its output transform and SwiGLU
+                    const int b = part / exl3_ppb_, w = 128 / exl3_ppb_, r0 = b * 128 + (part % exl3_ppb_) * w;
+                    native_gu_range(e, r0, r0 + w);
+                    last = false;
+                    if (fe.blk_left[b].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        exl3_finish_block(e, b);
+                        last = fe.gu_left.fetch_sub(1, std::memory_order_acq_rel) == 1;
+                    }
+                } else {
+                    native_gu_range(e, part_row(part, pg, (int) nfmt_->n_ff, 1), part_row(part + 1, pg, (int) nfmt_->n_ff, 1));
+                    last = fe.gu_left.fetch_sub(1, std::memory_order_acq_rel) == 1;
+                }
+                if (last) {
                     native_quantize(e);
                     fe.ready.store(1, std::memory_order_release);
                 }
@@ -333,10 +344,10 @@ void ExpertPool::native_gu_range(int e, int r0, int r1) {
     }
     float* ff[MAXT];
     for (int t = 0; t < j.nt; ++t) ff[t] = sb.ff[t];
-    if (nfmt_->exl3_w != 0) {   // the products only; native_quantize ends them
+    if (nfmt_->exl3_w != 0) {   // the products only; the last part of a block ends it
         float* up[MAXT];
         for (int t = 0; t < j.nt; ++t) up[t] = sb.up[t];
-        if (r0 < r1) exl3_gu_cols(*nfmt_, j.blob, j.nact, j.nt, ff, up, r0, r1, (batch_stamp_ << 7) | (uint64_t) e);
+        exl3_gu_cols(*nfmt_, j.blob, j.nact, j.nt, ff, up, r0, r1, (batch_stamp_ << 7) | (uint64_t) e);
         return;
     }
     native_gu_rows(*nfmt_, j.blob, j.nact, j.nt, ff, r0, r1);
@@ -357,14 +368,16 @@ void ExpertPool::native_down_range(int e, int r0, int r1) {
     native_down_rows(*nfmt_, j.blob, hq, j.nt, j.out, r0, r1);
 }
 
+void ExpertPool::exl3_finish_block(int e, int b) {
+    SplitBufMulti& sb = split_multi_[(size_t) e];
+    float* ff[MAXT];
+    float* up[MAXT];
+    for (int t = 0; t < mjobs_[e].nt; ++t) { ff[t] = sb.ff[t]; up[t] = sb.up[t]; }
+    exl3_gu_finish(*nfmt_, mjobs_[e].blob, mjobs_[e].nt, ff, up, b, b + 1);
+}
+
 void ExpertPool::native_quantize(int e) {
     SplitBufMulti& sb = split_multi_[(size_t) e];
-    if (nfmt_->exl3_w != 0) {
-        float* ff[MAXT];
-        float* up[MAXT];
-        for (int t = 0; t < mjobs_[e].nt; ++t) { ff[t] = sb.ff[t]; up[t] = sb.up[t]; }
-        exl3_gu_finish(*nfmt_, mjobs_[e].blob, mjobs_[e].nt, ff, up, 0, (int) (nfmt_->n_ff / 128));
-    }
     for (int t = 0; t < mjobs_[e].nt; ++t)
         if (q2_native_kernels(nfmt_->d_type)) act_quant_any(sb.ff[t], (int) nfmt_->n_ff, sb.a2[t]);
         else native_quant_h(*nfmt_, sb.ff[t], sb.hq[t]);
@@ -431,16 +444,21 @@ int ExpertPool::split_multi_batch(const NativeFmt& f, ExpertJobMulti* jobs, int 
     gu_share = (double) f.down_off / (double) (f.down_off + f.d_row * (size_t) f.n_embd);
     fused_n_ = nb;
     fused_tail_ = threads;
-    gu_align_ = f.exl3_w != 0 ? 16 : 1;
     d_align_ = f.exl3_w != 0 ? 128 : 1;
     static std::atomic<uint64_t> stamps{0};
     batch_stamp_ = stamps.fetch_add(1, std::memory_order_relaxed) + 1;
-    fused_gu_parts_ = (std::min)((int) f.n_ff / gu_align_,
-                                 (std::max)(1, (int) std::lround(kTasksPerThread * threads * gu_share / nb)));
+    const int gu_want = (std::max)(1, (int) std::lround(kTasksPerThread * threads * gu_share / nb));
+    const int gu_blocks = (int) f.n_ff / 128;
+    exl3_ppb_ = 0;
+    if (f.exl3_w != 0)   // whole tile columns: 8, 4, 2 or 1 parts a block
+        for (exl3_ppb_ = 8; exl3_ppb_ > 1 && gu_blocks * exl3_ppb_ > gu_want;) exl3_ppb_ /= 2;
+    fused_gu_parts_ = exl3_ppb_ > 0 ? gu_blocks * exl3_ppb_ : (std::min)((int) f.n_ff, gu_want);
     fused_d_parts_ = (std::min)((int) f.n_embd / d_align_,
                                 (std::max)(1, (int) std::lround(kTasksPerThread * threads * (1.0 - gu_share) / nb)));
     for (int e = 0; e < nb; ++e) {
-        fused_[(size_t) e].gu_left.store(fused_gu_parts_, std::memory_order_relaxed);
+        fused_[(size_t) e].gu_left.store(exl3_ppb_ > 0 ? gu_blocks : fused_gu_parts_, std::memory_order_relaxed);
+        for (int b = 0; b < (exl3_ppb_ > 0 ? gu_blocks : 0); ++b)
+            fused_[(size_t) e].blk_left[b].store(exl3_ppb_, std::memory_order_relaxed);
         fused_[(size_t) e].ready.store(0, std::memory_order_relaxed);
     }
     return nb * (fused_gu_parts_ + fused_d_parts_);

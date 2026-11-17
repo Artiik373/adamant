@@ -138,6 +138,8 @@ private:
     /// quantization, and the down projection into the job's outputs.
     void native_gu_range(int e, int r0, int r1);
     void native_quantize(int e);
+    /// EXL3: block `b` of expert `e`, all its gate/up parts done: the output transforms and SwiGLU of its 128 rows.
+    void exl3_finish_block(int e, int b);
     /// A down part that finds its expert's intermediate not yet quantized: prefetch its `bytes` of down rows at `p`
     /// while the gate/up parts finish, stopping early once they have.
     void prefetch_until_ready(int e, const uint8_t* p, size_t bytes) const;
@@ -200,15 +202,17 @@ private:
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // native down activations
     };
     const NativeFmt* nfmt_ = nullptr;
-    // run_split_multi_native's one batch per layer (mode 8): per expert, the gate/up parts left to do and whether its
-    // intermediate is quantized
+    // run_split_multi_native's one batch per layer (mode 8): per expert, the gate/up parts left to do (EXL3: the
+    // 128-blocks left to finish) and whether its intermediate is quantized
     struct alignas(64) FusedExpert {
         std::atomic<int> gu_left{0};
         std::atomic<int> ready{0};
+        std::atomic<int> blk_left[kNativeMaxFF / 128];   // EXL3: gate/up parts left in each 128-block
     };
     std::unique_ptr<FusedExpert[]> fused_;
     int fused_n_ = 0, fused_gu_parts_ = 1, fused_d_parts_ = 1, fused_tail_ = 1;
-    int gu_align_ = 1, d_align_ = 1;   // rows a part starts on: EXL3 gate/up cut by tile columns, down by 128-blocks
+    int d_align_ = 1;                  // rows a down part starts on: EXL3 cuts by 128-blocks
+    int exl3_ppb_ = 0;                 // EXL3: gate/up parts in a 128-block (0: not an EXL3 layer)
     uint64_t batch_stamp_ = 0;         // names the batch to the EXL3 input cache
     /// The first row of `part` of `parts` over `rows` rows (`part == parts` gives `rows`): equal parts, then
     /// `fused_tail_` quarter-size ones, each starting on a multiple of `align`.

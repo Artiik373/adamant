@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -24,39 +25,55 @@ namespace {
 
 const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
 
-// The prepared inputs of one projection record for `nt` fp16 activations: x2[t * k ...].
-void exl3_inputs(const Exl3Proj& p, const void* const* act, int nt, std::vector<float>& x2) {
+// The prepared inputs of one projection record: x2[t * k ...], and on AVX2 their column-kernel form.
+struct Exl3In {
+    std::vector<float> x2, store, bias;
+    float* xp = nullptr;   // 32-byte aligned, 2 k floats a token
+    bool fast = false;
+};
+
+void exl3_inputs(const Exl3Proj& p, const void* const* act, int nt, Exl3In& in) {
     static const bool avx2 = cpu_avx2_ok();
     const int variant = exl3_variant();
     thread_local std::vector<float> xs;
     xs.resize((size_t) p.k);
-    x2.resize((size_t) p.k * (size_t) nt);
+    in.x2.resize((size_t) p.k * (size_t) nt);
+    in.fast = avx2 && exl3_cols_avx2_ok(p.w);
+    const size_t per = (size_t) p.k * 2;
+    if (in.fast) {
+        in.store.resize(per * (size_t) nt + 8);
+        in.bias.resize((size_t) nt);
+        in.xp = (float*) (((uintptr_t) in.store.data() + 31) & ~(uintptr_t) 31);
+    }
     for (int t = 0; t < nt; ++t) {
+        float* x2 = in.x2.data() + (size_t) t * p.k;
         exl3_unpack_act((const uint16_t*) act[t], p.k, xs.data());
-        if (avx2) exl3_prepare_input_avx2(xs.data(), p.suh, p.k, variant, x2.data() + (size_t) t * p.k);
-        else exl3_prepare_input(xs.data(), p.suh, p.k, variant, x2.data() + (size_t) t * p.k);
+        if (avx2) exl3_prepare_input_avx2(xs.data(), p.suh, p.k, variant, x2);
+        else exl3_prepare_input(xs.data(), p.suh, p.k, variant, x2);
+        if (in.fast) exl3_expand_input(x2, p.k, in.xp + (size_t) t * per, &in.bias[(size_t) t]);
     }
 }
 
 // y1[t][c] for columns [c0, c1) of one record from prepared inputs.
-void exl3_cols(const Exl3Proj& p, const float* x2, int nt, float* const* y1, int c0, int c1) {
-    static const bool avx2 = cpu_avx2_ok();
+void exl3_cols(const Exl3Proj& p, const Exl3In& in, int nt, float* const* y1, int c0, int c1) {
+    if (!in.fast) {
+        for (int t = 0; t < nt; ++t) exl3_cols_ref(p, in.x2.data() + (size_t) t * p.k, y1[t], c0, c1);
+        return;
+    }
     const float* xp[64];
     for (int t0 = 0; t0 < nt; t0 += 64) {
         const int n = (std::min)(64, nt - t0);
-        for (int t = 0; t < n; ++t) xp[t] = x2 + (size_t) (t0 + t) * p.k;
-        if (avx2) exl3_cols_avx2(p, xp, n, y1 + t0, c0, c1);
-        else
-            for (int t = 0; t < n; ++t) exl3_cols_ref(p, xp[t], y1[t0 + t], c0, c1);
+        for (int t = 0; t < n; ++t) xp[t] = in.xp + (size_t) (t0 + t) * p.k * 2;
+        exl3_cols_expanded_avx2(p, xp, in.bias.data() + t0, n, y1 + t0, c0, c1);
     }
 }
 
 void exl3_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out, int r0,
                     int r1) {
     const Exl3Proj p = exl3_proj_at(blob + f.down_off, (int) f.n_ff, (int) f.n_embd, f.exl3_w);
-    thread_local std::vector<float> x2;
-    exl3_inputs(p, hq, nt, x2);
-    exl3_cols(p, x2.data(), nt, out, r0, r1);
+    thread_local Exl3In in;
+    exl3_inputs(p, hq, nt, in);
+    exl3_cols(p, in, nt, out, r0, r1);
     for (int t = 0; t < nt; ++t) exl3_finish(p, out[t], r0 / 128, r1 / 128, exl3_variant());
 }
 
@@ -69,7 +86,7 @@ void exl3_gu_cols(const NativeFmt& f, const uint8_t* blob, const void* const* ac
     struct Cache {
         uint64_t stamp = 0;
         const uint8_t* blob = nullptr;
-        std::vector<float> xg, xu;
+        Exl3In xg, xu;
     };
     thread_local Cache c;
     if (stamp == 0 || c.stamp != stamp || c.blob != blob) {
@@ -78,8 +95,8 @@ void exl3_gu_cols(const NativeFmt& f, const uint8_t* blob, const void* const* ac
         c.stamp = stamp;
         c.blob = blob;
     }
-    exl3_cols(pg, c.xg.data(), nt, g1, c0, c1);
-    exl3_cols(pu, c.xu.data(), nt, u1, c0, c1);
+    exl3_cols(pg, c.xg, nt, g1, c0, c1);
+    exl3_cols(pu, c.xu, nt, u1, c0, c1);
 }
 
 void exl3_gu_finish(const NativeFmt& f, const uint8_t* blob, int nt, float* const* ff, float* const* u1, int b0, int b1) {

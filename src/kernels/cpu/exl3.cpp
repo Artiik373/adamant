@@ -16,7 +16,8 @@
 
 namespace basalt::kernels::cpu {
 namespace exl3_detail {
-void cols_avx2_vnni(const Exl3Proj& p, const float* const* x2, int nt, float* const* y1, int c0, int c1);
+void cols_avx2_vnni(const Exl3Proj& p, const float* const* xp, const float* bias, int nt, float* const* y1, int c0,
+                    int c1);
 }
 using namespace exl3_detail;
 namespace {
@@ -136,10 +137,43 @@ void exl3_finish(const Exl3Proj& p, float* y, int b0, int b1, int variant) {
     for (int b = b0; b < b1; ++b) store_block(p, y + b * 128, variant, b);
 }
 
-void exl3_cols_avx2(const Exl3Proj& p, const float* const* x2, int nt, float* const* y1, int c0, int c1) {
+bool exl3_cols_avx2_ok(int w) { return ring_table(w).fast[1]; }
+
+void exl3_expand_input(const float* x2, int k, float* xp, float* bias) {
+    for (int kt = 0; kt < k / 16; ++kt)
+        for (int q = 0; q < 4; ++q) {
+            const float* x = x2 + kt * 16 + q * 2;
+            _mm256_store_ps(xp + ((size_t) kt * 4 + q) * 8, _mm256_setr_ps(x[0], x[1], x[8], x[9], x[0], x[1], x[8], x[9]));
+        }
+    float sumx = 0.f;
+    for (int i = 0; i < k; ++i) sumx += x2[i];
+    *bias = 510.f * sumx;
+}
+
+void exl3_cols_expanded_avx2(const Exl3Proj& p, const float* const* xp, const float* bias, int nt, float* const* y1,
+                             int c0, int c1) {
     static const bool vnni = cpu_avxvnni_ok();
-    if (vnni) exl3_detail::cols_avx2_vnni(p, x2, nt, y1, c0, c1);
-    else exl3_detail::cols_avx2(p, x2, nt, y1, c0, c1);
+    if (vnni) exl3_detail::cols_avx2_vnni(p, xp, bias, nt, y1, c0, c1);
+    else exl3_detail::cols_avx2(p, xp, bias, nt, y1, c0, c1);
+}
+
+void exl3_cols_avx2(const Exl3Proj& p, const float* const* x2, int nt, float* const* y1, int c0, int c1) {
+    if (!exl3_cols_avx2_ok(p.w)) {   // under 2 bits per weight: the windows of the first groups wrap; not a rate EXL3 ships here
+        for (int t = 0; t < nt; ++t) exl3_cols_ref(p, x2[t], y1[t], c0, c1);
+        return;
+    }
+    thread_local std::vector<float> store, bias;
+    thread_local std::vector<const float*> ptr;
+    const size_t per = (size_t) p.k * 2;
+    store.resize(per * (size_t) nt + 8);
+    bias.resize((size_t) nt);
+    ptr.resize((size_t) nt);
+    float* xp = (float*) (((uintptr_t) store.data() + 31) & ~(uintptr_t) 31);
+    for (int t = 0; t < nt; ++t) {
+        exl3_expand_input(x2[t], p.k, xp + (size_t) t * per, &bias[(size_t) t]);
+        ptr[(size_t) t] = xp + (size_t) t * per;
+    }
+    exl3_cols_expanded_avx2(p, ptr.data(), bias.data(), nt, y1, c0, c1);
 }
 
 namespace {
@@ -164,12 +198,23 @@ void exl3_rows_avx2(const Exl3Proj& p, const float* x2, float* y, int r0, int r1
 }
 
 
+// Both conversions round to nearest even, the F16C instructions' bits and the plain C ones' alike.
 void exl3_pack_act(const float* x, int n, uint16_t* dst) {
-    for (int i = 0; i < n; ++i) dst[i] = float_to_half(x[i]);
+    static const bool avx2 = cpu_avx2_ok();
+    int i = 0;
+    if (avx2)
+        for (; i + 8 <= n; i += 8)
+            _mm_storeu_si128((__m128i*) (dst + i),
+                             _mm256_cvtps_ph(_mm256_loadu_ps(x + i), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    for (; i < n; ++i) dst[i] = float_to_half(x[i]);
 }
 
 void exl3_unpack_act(const uint16_t* src, int n, float* x) {
-    for (int i = 0; i < n; ++i) x[i] = half_to_float(src[i]);
+    static const bool avx2 = cpu_avx2_ok();
+    int i = 0;
+    if (avx2)
+        for (; i + 8 <= n; i += 8) _mm256_storeu_ps(x + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*) (src + i))));
+    for (; i < n; ++i) x[i] = half_to_float(src[i]);
 }
 
 namespace {
