@@ -64,6 +64,6 @@ const ExpertLayout& expert_layout();
 bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err,
                              int64_t n_embd, int64_t n_ff, float swiglu_limit = 0.f);
 /// The newest layout version this engine reads.
-inline constexpr int kExpertLayoutVersion = 7;   // v6: NVFP4 blobs end in a 16-byte scale tail; v7: up_type column
+inline constexpr int kExpertLayoutVersion = 8;   // v6: NVFP4 blobs end in a 16-byte scale tail; v7: up_type column; v8: EXL3 types (exl3.hpp)
 
 }  // namespace basalt::kernels::cpu

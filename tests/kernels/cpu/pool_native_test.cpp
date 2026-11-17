@@ -4,7 +4,7 @@
 //
 // `run_split_multi_native` cuts a layer's experts into row ranges and hands them to the workers; whatever the
 // cut, every output row must be bitwise what one thread computes alone (the gate/up rows, the intermediate's
-// quantization, the down rows).  The check runs the formats of the i-quant and NVFP4 packs on random blobs, 1 to 130
+// quantization, the down rows).  The check runs the formats of the i-quant, NVFP4 and EXL3 packs on random blobs, 1 to 130
 // experts (more than the pool's buffers too), 1 to 8 tokens per expert, at several active worker counts, with a
 // pause longer than the workers' spin in the middle, and fails on the first differing word or untouched output.
 // `--bench` prints the time and rate of one layer of 15 experts.
@@ -62,6 +62,15 @@ void fill_blob(uint8_t* p, const cpu::NativeFmt& f, uint64_t seed) {
     for (size_t i = 0; i + 8 <= f.bytes; i += 8) {
         const uint64_t v = rng();
         std::memcpy(p + i, &v, 8);
+    }
+    if (f.exl3_w != 0) {   // EXL3: finite fp16 sign/scale vectors after each record's trellis
+        const size_t tb = (size_t) (f.n_embd / 16) * (size_t) (f.n_ff / 16) * (size_t) f.exl3_w * 2;
+        for (const size_t rec : {(size_t) 0, f.up_off, f.down_off})
+            for (size_t i = rec + tb; i < rec + tb + (size_t) (f.n_embd + f.n_ff) * 2; i += 2) {
+                const uint16_t h = (uint16_t) (((p[i + 1] & 0x80) << 8) | 0x3800 | (p[i] & 0xff));
+                std::memcpy(p + i, &h, 2);
+            }
+        return;
     }
     auto scales = [&](size_t off, size_t len, int type) {
         const size_t bs = ggml_type_size((ggml_type) type);
@@ -128,7 +137,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     std::vector<Format> formats;
-    for (auto g : {std::pair<int, int>{22, 20}, {18, 20}, {21, 20}, {23, 20}, {22, 42}, {21, 42}, {42, 20}, {42, 42}, {40, 40}}) {
+    for (auto g : {std::pair<int, int>{22, 20}, {18, 20}, {21, 20}, {23, 20}, {22, 42}, {21, 42}, {42, 20}, {42, 42}, {40, 40}, {102, 102}, {103, 103}}) {
         Format fm;
         fm.gu = g.first;
         fm.d = g.second;

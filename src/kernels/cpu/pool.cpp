@@ -265,7 +265,8 @@ void ExpertPool::drain(int id, uint32_t epoch) {
             const int n = fused_n_, pg = fused_gu_parts_, pd = fused_d_parts_;
             if ((int) i < n * pg) {
                 const int e = (int) i / pg, part = (int) i % pg;
-                native_gu_range(e, part_row(part, pg, (int) nfmt_->n_ff), part_row(part + 1, pg, (int) nfmt_->n_ff));
+                native_gu_range(e, part_row(part, pg, (int) nfmt_->n_ff, gu_align_),
+                                part_row(part + 1, pg, (int) nfmt_->n_ff, gu_align_));
                 FusedExpert& fe = fused_[(size_t) e];
                 if (fe.gu_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     native_quantize(e);
@@ -273,10 +274,18 @@ void ExpertPool::drain(int id, uint32_t epoch) {
                 }
             } else {
                 const int k = (int) i - n * pg, e = k / pd, part = k % pd;
-                const int r0 = part_row(part, pd, (int) nfmt_->n_embd), r1 = part_row(part + 1, pd, (int) nfmt_->n_embd);
+                const int r0 = part_row(part, pd, (int) nfmt_->n_embd, d_align_),
+                          r1 = part_row(part + 1, pd, (int) nfmt_->n_embd, d_align_);
                 // every gate/up task is claimed before any down task, so this waits only for tasks already running;
                 // the wait would leave the memory bus idle, so it first pulls this part's down rows into the cache
                 if (fused_[(size_t) e].ready.load(std::memory_order_acquire) == 0) {
+                    if (nfmt_->exl3_w != 0) {   // the part's tile columns, one run per k tile
+                        const size_t tile = (size_t) nfmt_->exl3_w * 2, pitch = (size_t) (nfmt_->n_embd / 16) * tile;
+                        const uint8_t* p = mjobs_[e].blob + nfmt_->down_off + (size_t) (r0 / 16) * tile;
+                        for (int kt = 0; kt < (int) (nfmt_->n_ff / 16) &&
+                                         fused_[(size_t) e].ready.load(std::memory_order_relaxed) == 0; ++kt)
+                            prefetch_until_ready(e, p + (size_t) kt * pitch, (size_t) ((r1 - r0) / 16) * tile);
+                    } else
                     prefetch_until_ready(e, mjobs_[e].blob + nfmt_->down_off + (size_t) r0 * nfmt_->d_row,
                                          (size_t) (r1 - r0) * nfmt_->d_row);
                     if (fused_[(size_t) e].ready.load(std::memory_order_acquire) == 0) wait_ready(e);
@@ -288,12 +297,13 @@ void ExpertPool::drain(int id, uint32_t epoch) {
     }
 }
 
-int ExpertPool::part_row(int part, int parts, int rows) const {
+int ExpertPool::part_row(int part, int parts, int rows, int align) const {
     // the last fused_tail_ parts are a quarter of the others: the threads that finish early pick up short tasks, so
     // the wait for the slowest one before the down rows, and at the end of the layer, is a quarter of a task
     const int small = (std::min)(fused_tail_, parts / 2), big = parts - small;
     const int64_t units = 4 * (int64_t) (std::min)(part, big) + (std::max)(0, part - big);
-    return (int) ((int64_t) rows * units / (4 * (int64_t) big + small));
+    const int r = (int) ((int64_t) rows * units / (4 * (int64_t) big + small));
+    return part < parts ? r - r % align : r;
 }
 
 void ExpertPool::prefetch_until_ready(int e, const uint8_t* p, size_t bytes) const {
@@ -323,6 +333,12 @@ void ExpertPool::native_gu_range(int e, int r0, int r1) {
     }
     float* ff[MAXT];
     for (int t = 0; t < j.nt; ++t) ff[t] = sb.ff[t];
+    if (nfmt_->exl3_w != 0) {   // the products only; native_quantize ends them
+        float* up[MAXT];
+        for (int t = 0; t < j.nt; ++t) up[t] = sb.up[t];
+        if (r0 < r1) exl3_gu_cols(*nfmt_, j.blob, j.nact, j.nt, ff, up, r0, r1, (batch_stamp_ << 7) | (uint64_t) e);
+        return;
+    }
     native_gu_rows(*nfmt_, j.blob, j.nact, j.nt, ff, r0, r1);
 }
 
@@ -343,6 +359,12 @@ void ExpertPool::native_down_range(int e, int r0, int r1) {
 
 void ExpertPool::native_quantize(int e) {
     SplitBufMulti& sb = split_multi_[(size_t) e];
+    if (nfmt_->exl3_w != 0) {
+        float* ff[MAXT];
+        float* up[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) { ff[t] = sb.ff[t]; up[t] = sb.up[t]; }
+        exl3_gu_finish(*nfmt_, mjobs_[e].blob, mjobs_[e].nt, ff, up, 0, (int) (nfmt_->n_ff / 128));
+    }
     for (int t = 0; t < mjobs_[e].nt; ++t)
         if (q2_native_kernels(nfmt_->d_type)) act_quant_any(sb.ff[t], (int) nfmt_->n_ff, sb.a2[t]);
         else native_quant_h(*nfmt_, sb.ff[t], sb.hq[t]);
@@ -409,8 +431,14 @@ int ExpertPool::split_multi_batch(const NativeFmt& f, ExpertJobMulti* jobs, int 
     gu_share = (double) f.down_off / (double) (f.down_off + f.d_row * (size_t) f.n_embd);
     fused_n_ = nb;
     fused_tail_ = threads;
-    fused_gu_parts_ = (std::min)((int) f.n_ff, (std::max)(1, (int) std::lround(kTasksPerThread * threads * gu_share / nb)));
-    fused_d_parts_ = (std::min)((int) f.n_embd, (std::max)(1, (int) std::lround(kTasksPerThread * threads * (1.0 - gu_share) / nb)));
+    gu_align_ = f.exl3_w != 0 ? 16 : 1;
+    d_align_ = f.exl3_w != 0 ? 128 : 1;
+    static std::atomic<uint64_t> stamps{0};
+    batch_stamp_ = stamps.fetch_add(1, std::memory_order_relaxed) + 1;
+    fused_gu_parts_ = (std::min)((int) f.n_ff / gu_align_,
+                                 (std::max)(1, (int) std::lround(kTasksPerThread * threads * gu_share / nb)));
+    fused_d_parts_ = (std::min)((int) f.n_embd / d_align_,
+                                (std::max)(1, (int) std::lround(kTasksPerThread * threads * (1.0 - gu_share) / nb)));
     for (int e = 0; e < nb; ++e) {
         fused_[(size_t) e].gu_left.store(fused_gu_parts_, std::memory_order_relaxed);
         fused_[(size_t) e].ready.store(0, std::memory_order_relaxed);

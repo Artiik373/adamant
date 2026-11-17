@@ -34,6 +34,8 @@ struct NativeFmt {
     size_t tail = 0;                    ///< NVFP4: the blob's last 16 bytes, FP32 {s_gate, s_up, s_down, 0}
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
     float swiglu_limit = 0.f;           ///< > 0: gate capped at it and up clamped to +-it before the product
+    int exl3_w = 0;                     ///< EXL3 layer: 16-bit words per 16x16 tile (0: a GGUF layer); the blob is three
+                                        ///< EXL3 projection records [gate | up | down] (exl3.hpp), activations are fp16
 };
 
 /// Fills `f` for a layer (`swiglu_limit`: the model's SwiGLU limit, 0 for none; `up_type`: the up rows' type, -1 for
@@ -56,5 +58,13 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 /// out[t][r] = down_r . hq[t] for rows r in [r0, r1) (NVFP4: times s_down).
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1);
+
+/// An EXL3 layer's gate and up in two steps, so that tasks can be cut finer than the 128-block of the output transform:
+/// g1[t][c] and u1[t][c] for output columns [c0, c1) (multiples of 16), the weights decoded once for the `nt` tokens.
+/// `stamp` (not 0) names the expert of a batch: a thread prepares its inputs once per stamp.
+void exl3_gu_cols(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* g1,
+                  float* const* u1, int c0, int c1, uint64_t stamp);
+/// Then the output transforms and SwiGLU over 128-blocks [b0, b1): ff (holding g1) becomes the intermediate.
+void exl3_gu_finish(const NativeFmt& f, const uint8_t* blob, int nt, float* const* ff, float* const* u1, int b0, int b1);
 
 }  // namespace basalt::kernels::cpu

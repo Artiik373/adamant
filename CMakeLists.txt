@@ -276,8 +276,9 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/dequant_bf16.cu
                         src/kernels/cuda/wait_abort.cu
                         src/kernels/cuda/iq_kernels.cu
+                        src/kernels/cuda/exl3_kernels.cu
                         src/ngram/ple_reader.cpp)
-target_link_libraries(kernels PUBLIC core artifact)
+target_link_libraries(kernels PUBLIC core artifact kernels_cpu)
 # the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
 if(BUILD_TESTING)
   add_executable(qsa_prompt_attn_parity tests/models/qwen4exp/kernels/qsa_prompt_attn_parity.cpp)
@@ -760,6 +761,9 @@ target_include_directories(native_gr_norm_parity PRIVATE ${_gpu_include_director
 target_link_libraries(native_gr_norm_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 target_compile_options(native_gr_norm_parity PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
 basalt_gpu_test(NAME native_gr_norm_parity COMMAND native_gr_norm_parity)
+add_executable(expert_gemm_bench tests/prefill/expert_gemm_bench.cu)
+target_include_directories(expert_gemm_bench PRIVATE ${_gpu_include_directories})
+target_link_libraries(expert_gemm_bench PRIVATE ${_gpu_runtime_target} ${_gpu_blas_target})
 add_executable(shared_expert_parity tests/models/qwen4exp/kernels/shared_expert_parity.cpp)
 target_include_directories(shared_expert_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(shared_expert_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
@@ -1188,7 +1192,7 @@ endif()
 
 add_library(kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
             src/kernels/cpu/cpu_quota.cpp src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp
-            src/kernels/cpu/q2_avx2_vnni.cpp)
+            src/kernels/cpu/q2_avx2_vnni.cpp src/kernels/cpu/exl3.cpp src/kernels/cpu/exl3_vnni.cpp)
 target_include_directories(kernels_cpu PUBLIC include)
 # only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
@@ -1196,6 +1200,9 @@ target_include_directories(kernels_cpu PUBLIC include)
 set_source_files_properties(src/kernels/cpu/expert.cpp
                             PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags}")
 set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+# EXL3 projections: AVX2 + F16C rows behind cpu_avx2_ok(); the plain C rows run anywhere
+set_source_files_properties(src/kernels/cpu/exl3.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+set_source_files_properties(src/kernels/cpu/exl3_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnni_flags}")
 # the same Q2_0 rows with the AVX-VNNI instructions, called only behind cpu_avxvnni_ok()
 set_source_files_properties(src/kernels/cpu/q2_avx2_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnni_flags}")
 find_package(Threads REQUIRED)
@@ -1365,6 +1372,12 @@ endif()
 add_executable(native_expert_parity tests/kernels/native_expert_parity.cpp)
 target_include_directories(native_expert_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(native_expert_parity PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})
+# EXL3 experts on the GPU (grouped kernels, prompt dequantizers) against the CPU kernels, random weights
+add_executable(exl3_gpu_parity tests/kernels/exl3_gpu_parity.cpp)
+target_include_directories(exl3_gpu_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(exl3_gpu_parity PRIVATE kernels kernels_cpu ${_gpu_runtime_target})
+basalt_gpu_test(NAME exl3_gpu_parity COMMAND exl3_gpu_parity)
+set_tests_properties(exl3_gpu_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 add_executable(native_expert_bench tests/kernels/native_expert_bench.cpp)
 target_include_directories(native_expert_bench PRIVATE ${_gpu_include_directories})
 target_link_libraries(native_expert_bench PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})
@@ -1445,6 +1458,17 @@ if(BUILD_TESTING)
   target_link_libraries(avx_bench PRIVATE kernels_cpu)
 
   # needs the AVX-512 VNNI and VBMI instruction sets, which not every host has
+
+  # EXL3 trellis projections: plain C and AVX2 rows against a bit-by-bit oracle (synthetic, CPU only)
+  add_executable(exl3_cpu_test tests/kernels/cpu/exl3_cpu_test.cpp)
+  target_link_libraries(exl3_cpu_test PRIVATE kernels_cpu)
+  basalt_cpu_test(NAME exl3_cpu_test COMMAND exl3_cpu_test)
+  set_tests_properties(exl3_cpu_test PROPERTIES LABELS "cpu;avx2")
+
+  # the warp-level tile mapping of the EXL3 GPU kernels, lane by lane on the host
+  add_executable(exl3_lane_test tests/kernels/cpu/exl3_lane_test.cpp)
+  target_include_directories(exl3_lane_test PRIVATE include)
+  basalt_cpu_test(NAME exl3_lane_test COMMAND exl3_lane_test)
 
   add_executable(nvfp4_cpu_rows_test tests/kernels/cpu/nvfp4_cpu_rows_test.cpp)
   target_link_libraries(nvfp4_cpu_rows_test PRIVATE kernels_cpu)

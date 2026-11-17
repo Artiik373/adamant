@@ -195,6 +195,7 @@ private:
     ExpertJobMulti* mjobs_ = nullptr;
     struct SplitBufMulti {
         alignas(64) float ff[MAXT][kNativeMaxFF];
+        alignas(64) float up[MAXT][kNativeMaxFF];   // EXL3: the up product before its output transform
         ActQ a2[MAXT];
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // native down activations
     };
@@ -207,9 +208,11 @@ private:
     };
     std::unique_ptr<FusedExpert[]> fused_;
     int fused_n_ = 0, fused_gu_parts_ = 1, fused_d_parts_ = 1, fused_tail_ = 1;
+    int gu_align_ = 1, d_align_ = 1;   // rows a part starts on: EXL3 gate/up cut by tile columns, down by 128-blocks
+    uint64_t batch_stamp_ = 0;         // names the batch to the EXL3 input cache
     /// The first row of `part` of `parts` over `rows` rows (`part == parts` gives `rows`): equal parts, then
-    /// `fused_tail_` quarter-size ones.
-    int part_row(int part, int parts, int rows) const;
+    /// `fused_tail_` quarter-size ones, each starting on a multiple of `align`.
+    int part_row(int part, int parts, int rows, int align) const;
     /// Sets up one batch of at most kMaxSplitMulti experts: its parts per expert; the tasks it makes and the gate/up
     /// share of its bytes.
     int split_multi_batch(const NativeFmt& f, ExpertJobMulti* jobs, int n, double& gu_share);

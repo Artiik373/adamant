@@ -29,6 +29,8 @@
 #include "basalt/kernels/packed_byte.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/exl3_kernels.hpp"
+#include "basalt/kernels/cpu/exl3.hpp"
 #include "basalt/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
@@ -2017,13 +2019,18 @@ void native_iq4_nl_mmvq(const void* weights, const void* x_q8_1, float* y,
 }
 
 bool native_mmvq_supported(int ggml_type) noexcept {
-    return ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 11 ||
+    return cpu::exl3_type(ggml_type) || ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 11 ||
            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
            ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
            ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
 }
 
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
+    if (cpu::exl3_type(ggml_type)) {   // a trellis record: K and N whole 128-blocks
+        if (!cpu::exl3_geometry_ok(n_in, n_out, cpu::exl3_words(ggml_type)))
+            throw std::invalid_argument("native MMVQ: an EXL3 matrix needs K and N in whole blocks of 128");
+        return cpu::exl3_proj_bytes(n_in, n_out, cpu::exl3_words(ggml_type));
+    }
     int block_elems, block_bytes;
     switch (ggml_type) {
     case 2: block_elems = 32; block_bytes = 18; break;
@@ -2052,6 +2059,10 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
 
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream) {
+    if (cpu::exl3_type(ggml_type)) {
+        exl3_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream);
+        return;
+    }
     switch (ggml_type) {
     case 2: native_q4_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 6: native_q5_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;

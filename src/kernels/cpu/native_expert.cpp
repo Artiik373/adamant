@@ -9,17 +9,98 @@
 #include "basalt/kernels/cpu/nvfp4_avx512.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx2.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/cpu/exl3.hpp"
 
 #include "basalt/ggml/ggml.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace basalt::kernels::cpu {
 namespace {
 
 const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
+
+// The prepared inputs of one projection record for `nt` fp16 activations: x2[t * k ...].
+void exl3_inputs(const Exl3Proj& p, const void* const* act, int nt, std::vector<float>& x2) {
+    static const bool avx2 = cpu_avx2_ok();
+    const int variant = exl3_variant();
+    thread_local std::vector<float> xs;
+    xs.resize((size_t) p.k);
+    x2.resize((size_t) p.k * (size_t) nt);
+    for (int t = 0; t < nt; ++t) {
+        exl3_unpack_act((const uint16_t*) act[t], p.k, xs.data());
+        if (avx2) exl3_prepare_input_avx2(xs.data(), p.suh, p.k, variant, x2.data() + (size_t) t * p.k);
+        else exl3_prepare_input(xs.data(), p.suh, p.k, variant, x2.data() + (size_t) t * p.k);
+    }
+}
+
+// y1[t][c] for columns [c0, c1) of one record from prepared inputs.
+void exl3_cols(const Exl3Proj& p, const float* x2, int nt, float* const* y1, int c0, int c1) {
+    static const bool avx2 = cpu_avx2_ok();
+    const float* xp[64];
+    for (int t0 = 0; t0 < nt; t0 += 64) {
+        const int n = (std::min)(64, nt - t0);
+        for (int t = 0; t < n; ++t) xp[t] = x2 + (size_t) (t0 + t) * p.k;
+        if (avx2) exl3_cols_avx2(p, xp, n, y1 + t0, c0, c1);
+        else
+            for (int t = 0; t < n; ++t) exl3_cols_ref(p, xp[t], y1[t0 + t], c0, c1);
+    }
+}
+
+void exl3_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out, int r0,
+                    int r1) {
+    const Exl3Proj p = exl3_proj_at(blob + f.down_off, (int) f.n_ff, (int) f.n_embd, f.exl3_w);
+    thread_local std::vector<float> x2;
+    exl3_inputs(p, hq, nt, x2);
+    exl3_cols(p, x2.data(), nt, out, r0, r1);
+    for (int t = 0; t < nt; ++t) exl3_finish(p, out[t], r0 / 128, r1 / 128, exl3_variant());
+}
+
+}  // namespace
+
+void exl3_gu_cols(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* g1,
+                  float* const* u1, int c0, int c1, uint64_t stamp) {
+    const Exl3Proj pg = exl3_proj_at(blob, (int) f.n_embd, (int) f.n_ff, f.exl3_w);
+    const Exl3Proj pu = exl3_proj_at(blob + f.up_off, (int) f.n_embd, (int) f.n_ff, f.exl3_w);
+    struct Cache {
+        uint64_t stamp = 0;
+        const uint8_t* blob = nullptr;
+        std::vector<float> xg, xu;
+    };
+    thread_local Cache c;
+    if (stamp == 0 || c.stamp != stamp || c.blob != blob) {
+        exl3_inputs(pg, act, nt, c.xg);
+        exl3_inputs(pu, act, nt, c.xu);
+        c.stamp = stamp;
+        c.blob = blob;
+    }
+    exl3_cols(pg, c.xg.data(), nt, g1, c0, c1);
+    exl3_cols(pu, c.xu.data(), nt, u1, c0, c1);
+}
+
+void exl3_gu_finish(const NativeFmt& f, const uint8_t* blob, int nt, float* const* ff, float* const* u1, int b0, int b1) {
+    const Exl3Proj pg = exl3_proj_at(blob, (int) f.n_embd, (int) f.n_ff, f.exl3_w);
+    const Exl3Proj pu = exl3_proj_at(blob + f.up_off, (int) f.n_embd, (int) f.n_ff, f.exl3_w);
+    const int variant = exl3_variant();
+    for (int t = 0; t < nt; ++t) {
+        exl3_finish(pg, ff[t], b0, b1, variant);
+        exl3_finish(pu, u1[t], b0, b1, variant);
+        for (int r = b0 * 128; r < b1 * 128; ++r) {
+            float a = ff[t][r], b = u1[t][r];
+            if (f.swiglu_limit > 0.f) {
+                a = std::fmin(a, f.swiglu_limit);
+                b = std::fmax(std::fmin(b, f.swiglu_limit), -f.swiglu_limit);
+            }
+            ff[t][r] = (a / (1.f + std::exp(-a))) * b;
+        }
+    }
+}
+
+namespace {
 
 // The gate/up rows through ggml's single-token dot; LIMITED applies the SwiGLU limit (gate capped, up clamped).
 template<bool LIMITED>
@@ -76,6 +157,37 @@ void gu_rows_mixed(Rows rows, const NativeFmt& f, const uint8_t* blob, const voi
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
                 float swiglu_limit, int up_type) {
     if (up_type < 0) up_type = gu_type;
+    if (exl3_type(gu_type) || exl3_type(d_type) || exl3_type(up_type)) {
+        if (gu_type != d_type || gu_type != up_type) {
+            err = "native experts: an EXL3 layer has one bit rate for gate, up and down";
+            return false;
+        }
+        const int w = exl3_words(gu_type);
+        if (!exl3_geometry_ok((int) n_embd, (int) n_ff, w) || !exl3_geometry_ok((int) n_ff, (int) n_embd, w)) {
+            err = "native experts: EXL3 geometry is not whole 128-blocks";
+            return false;
+        }
+        f.gu_type = f.d_type = f.up_type = gu_type;
+        f.exl3_w = w;
+        f.n_embd = n_embd;
+        f.n_ff = n_ff;
+        f.swiglu_limit = swiglu_limit;
+        f.gu_act = f.d_act = -1;
+        // bytes of trellis per output row: what a prefetch of a row range covers
+        f.gu_row = f.up_row = (size_t) n_embd * (size_t) w / 128;
+        f.d_row = (size_t) n_ff * (size_t) w / 128;
+        f.up_off = exl3_proj_bytes((int) n_embd, (int) n_ff, w);
+        f.down_off = f.up_off + exl3_proj_bytes((int) n_embd, (int) n_ff, w);
+        f.bytes = f.down_off + exl3_proj_bytes((int) n_ff, (int) n_embd, w);
+        f.tail = 0;
+        f.act_bytes = (size_t) n_embd * 2;
+        f.h_bytes = (size_t) n_ff * 2;
+        if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes || n_ff > kNativeMaxFF) {
+            err = "native experts: activation larger than the pool's buffers";
+            return false;
+        }
+        return true;
+    }
     const ggml_type_traits_cpu* tg = traits(gu_type);
     const ggml_type_traits_cpu* tu = traits(up_type);
     const ggml_type_traits_cpu* td = traits(d_type);
@@ -136,6 +248,10 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 }
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+    if (f.exl3_w) {
+        exl3_pack_act(x, (int) f.n_embd, (uint16_t*) dst);
+        return;
+    }
     static const bool avx512 = cpu_avx512_ok();
     if (f.gu_act == GGML_TYPE_Q8_K) {   // ggml's reference quantizer is scalar
         if (avx512) {
@@ -149,11 +265,24 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
 }
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
+    if (f.exl3_w) {
+        exl3_pack_act(h, (int) f.n_ff, (uint16_t*) dst);
+        return;
+    }
     traits(f.d_act)->from_float(h, dst, f.n_ff);
 }
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    if (f.exl3_w) {   // whole 128-blocks
+        thread_local std::vector<float> u;
+        u.resize((size_t) kNativeMaxFF * (size_t) nt);
+        std::vector<float*> up((size_t) nt);
+        for (int t = 0; t < nt; ++t) up[(size_t) t] = u.data() + (size_t) t * kNativeMaxFF;
+        exl3_gu_cols(f, blob, act, nt, ff, up.data(), r0, r1, 0);
+        exl3_gu_finish(f, blob, nt, ff, up.data(), r0 / 128, r1 / 128);
+        return;
+    }
     // The multi-token kernels decode the weights once for all tokens; the single-token ggml dot below serves the
     // formats without one.  A token's rows round the same alone as in a group, so greedy output does not depend on
     // the number of drafts in a window.  A format with only an AVX-2 kernel (IQ4_XS) takes it on AVX-2 CPUs
@@ -218,6 +347,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
+    if (f.exl3_w) {
+        exl3_down_rows(f, blob, hq, nt, out, r0, r1);
+        return;
+    }
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles once per block instead of once per token;
     // the ggml dot is single-token.
     if (cpu_avx2_ok() && f.d_type == 20 && iq4nl256_fits((int) f.n_ff)) {   // the same rule as the gate/up rows
