@@ -27,9 +27,11 @@ const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((
 
 // The prepared inputs of one projection record: x2[t * k ...], and on AVX2 their column-kernel form.
 struct Exl3In {
-    std::vector<float> x2, store, bias;
-    float* xp = nullptr;   // 32-byte aligned, 2 k floats a token
-    bool fast = false;
+    std::vector<float> x2, store, bias, sc;
+    std::vector<int8_t> qstore;
+    float* xp = nullptr;    // 32-byte aligned, 2 k floats a token
+    int8_t* xq = nullptr;   // q8: 32-byte aligned, 8 k bytes a token
+    bool fast = false, q8 = false;
 };
 
 void exl3_inputs(const Exl3Proj& p, const void* const* act, int nt, Exl3In& in) {
@@ -39,8 +41,14 @@ void exl3_inputs(const Exl3Proj& p, const void* const* act, int nt, Exl3In& in) 
     xs.resize((size_t) p.k);
     in.x2.resize((size_t) p.k * (size_t) nt);
     in.fast = avx2 && exl3_cols_avx2_ok(p.w);
+    in.q8 = in.fast && exl3_q8();
     const size_t per = (size_t) p.k * 2;
-    if (in.fast) {
+    if (in.q8) {
+        in.qstore.resize((size_t) p.k * 8 * (size_t) nt + 32);
+        in.sc.resize((size_t) (p.k / 128) * (size_t) nt);
+        in.bias.resize((size_t) nt);
+        in.xq = (int8_t*) (((uintptr_t) in.qstore.data() + 31) & ~(uintptr_t) 31);
+    } else if (in.fast) {
         in.store.resize(per * (size_t) nt + 8);
         in.bias.resize((size_t) nt);
         in.xp = (float*) (((uintptr_t) in.store.data() + 31) & ~(uintptr_t) 31);
@@ -50,7 +58,10 @@ void exl3_inputs(const Exl3Proj& p, const void* const* act, int nt, Exl3In& in) 
         exl3_unpack_act((const uint16_t*) act[t], p.k, xs.data());
         if (avx2) exl3_prepare_input_avx2(xs.data(), p.suh, p.k, variant, x2);
         else exl3_prepare_input(xs.data(), p.suh, p.k, variant, x2);
-        if (in.fast) exl3_expand_input(x2, p.k, in.xp + (size_t) t * per, &in.bias[(size_t) t]);
+        if (in.q8)
+            exl3_expand_input_q8(x2, p.k, in.xq + (size_t) t * p.k * 8, in.sc.data() + (size_t) t * (p.k / 128),
+                                 &in.bias[(size_t) t]);
+        else if (in.fast) exl3_expand_input(x2, p.k, in.xp + (size_t) t * per, &in.bias[(size_t) t]);
     }
 }
 
@@ -58,6 +69,19 @@ void exl3_inputs(const Exl3Proj& p, const void* const* act, int nt, Exl3In& in) 
 void exl3_cols(const Exl3Proj& p, const Exl3In& in, int nt, float* const* y1, int c0, int c1) {
     if (!in.fast) {
         for (int t = 0; t < nt; ++t) exl3_cols_ref(p, in.x2.data() + (size_t) t * p.k, y1[t], c0, c1);
+        return;
+    }
+    if (in.q8) {
+        const int8_t* xq[64];
+        const float* sc[64];
+        for (int t0 = 0; t0 < nt; t0 += 64) {
+            const int n = (std::min)(64, nt - t0);
+            for (int t = 0; t < n; ++t) {
+                xq[t] = in.xq + (size_t) (t0 + t) * p.k * 8;
+                sc[t] = in.sc.data() + (size_t) (t0 + t) * (p.k / 128);
+            }
+            exl3_cols_q8(p, xq, sc, in.bias.data() + t0, n, y1 + t0, c0, c1);
+        }
         return;
     }
     const float* xp[64];

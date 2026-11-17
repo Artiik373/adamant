@@ -18,6 +18,8 @@ namespace basalt::kernels::cpu {
 namespace exl3_detail {
 void cols_avx2_vnni(const Exl3Proj& p, const float* const* xp, const float* bias, int nt, float* const* y1, int c0,
                     int c1);
+void cols_q8_vnni(const Exl3Proj& p, const int8_t* const* xq, const float* const* sc, const float* bias, int nt,
+                  float* const* y1, int c0, int c1);
 }
 using namespace exl3_detail;
 namespace {
@@ -99,6 +101,11 @@ std::atomic<int> g_variant{0};
 int exl3_variant() { return g_variant.load(std::memory_order_relaxed); }
 void exl3_set_variant(int variant) { g_variant.store(variant & 3, std::memory_order_relaxed); }
 
+bool exl3_q8() {
+    static const bool vnni = cpu_avxvnni_ok();
+    return vnni;
+}
+
 bool exl3_geometry_ok(int k, int n, int w) {
     return k > 0 && n > 0 && k % kExl3Block == 0 && n % kExl3Block == 0 && w > 0 && w % 8 == 0 && w <= kExl3MaxWords;
 }
@@ -148,6 +155,54 @@ void exl3_expand_input(const float* x2, int k, float* xp, float* bias) {
     float sumx = 0.f;
     for (int i = 0; i < k; ++i) sumx += x2[i];
     *bias = 510.f * sumx;
+}
+
+void exl3_expand_input_q8(const float* x2, int k, int8_t* xq, float* sc, float* bias) {
+    // per k tile, group g's 32 bytes: rows 2g, 2g + 1, 2g + 8, 2g + 9 (columns c and c + 8), each byte four times
+    alignas(32) static const uint8_t kRep[4][32] = {
+        {0, 0, 0, 0, 1, 1, 1, 1, 8, 8, 8, 8, 9, 9, 9, 9, 0, 0, 0, 0, 1, 1, 1, 1, 8, 8, 8, 8, 9, 9, 9, 9},
+        {2, 2, 2, 2, 3, 3, 3, 3, 10, 10, 10, 10, 11, 11, 11, 11, 2, 2, 2, 2, 3, 3, 3, 3, 10, 10, 10, 10, 11, 11, 11, 11},
+        {4, 4, 4, 4, 5, 5, 5, 5, 12, 12, 12, 12, 13, 13, 13, 13, 4, 4, 4, 4, 5, 5, 5, 5, 12, 12, 12, 12, 13, 13, 13, 13},
+        {6, 6, 6, 6, 7, 7, 7, 7, 14, 14, 14, 14, 15, 15, 15, 15, 6, 6, 6, 6, 7, 7, 7, 7, 14, 14, 14, 14, 15, 15, 15, 15}};
+    const __m256 sign = _mm256_set1_ps(-0.f);
+    double sum = 0.0;
+    for (int b = 0; b < k / 128; ++b) {
+        const float* xb = x2 + b * 128;
+        __m256 m = _mm256_setzero_ps();
+        for (int i = 0; i < 128; i += 8) m = _mm256_max_ps(m, _mm256_andnot_ps(sign, _mm256_loadu_ps(xb + i)));
+        alignas(32) float mv[8];
+        _mm256_store_ps(mv, m);
+        float mx = 0.f;
+        for (float v : mv) mx = std::fmax(mx, v);
+        const float s = mx > 0.f ? mx / 127.f : 1.f;
+        const __m256 inv = _mm256_set1_ps(1.f / s);
+        __m256i qs = _mm256_setzero_si256();
+        for (int kt = 0; kt < 8; ++kt) {
+            // 16 values rounded to nearest even (as lrint), packed to bytes in order
+            const __m256i a = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xb + kt * 16), inv));
+            const __m256i c = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xb + kt * 16 + 8), inv));
+            qs = _mm256_add_epi32(qs, _mm256_add_epi32(a, c));
+            const __m128i w16 = _mm_packs_epi32(_mm256_castsi256_si128(a), _mm256_extracti128_si256(a, 1));
+            const __m128i w16b = _mm_packs_epi32(_mm256_castsi256_si128(c), _mm256_extracti128_si256(c, 1));
+            const __m256i src = _mm256_broadcastsi128_si256(_mm_packs_epi16(w16, w16b));
+            int8_t* dst = xq + (size_t) (b * 8 + kt) * 128;
+            for (int g = 0; g < 4; ++g)
+                _mm256_store_si256((__m256i*) (dst + g * 32),
+                                   _mm256_shuffle_epi8(src, _mm256_load_si256((const __m256i*) kRep[g])));
+        }
+        alignas(32) int32_t qv[8];
+        _mm256_store_si256((__m256i*) qv, qs);
+        int qsum = 0;
+        for (int v : qv) qsum += v;
+        sc[b] = s;
+        sum += (double) s * qsum;
+    }
+    *bias = (float) (510.0 * sum);
+}
+
+void exl3_cols_q8(const Exl3Proj& p, const int8_t* const* xq, const float* const* sc, const float* bias, int nt,
+                  float* const* y1, int c0, int c1) {
+    exl3_detail::cols_q8_vnni(p, xq, sc, bias, nt, y1, c0, c1);
 }
 
 void exl3_cols_expanded_avx2(const Exl3Proj& p, const float* const* xp, const float* bias, int nt, float* const* y1,

@@ -25,6 +25,8 @@ inline constexpr int kExl3SignBeforeHadOut = 2;           // output: H(y * svh) 
 /// The sign placement every EXL3 projection of the process uses (0 unless set).
 int exl3_variant();
 void exl3_set_variant(int variant);
+/// Whether the CPU tier takes int8 activations (exl3_expand_input_q8 / exl3_cols_q8): when the CPU has AVX-VNNI.
+bool exl3_q8();
 
 struct Exl3Proj {
     const uint8_t* trellis = nullptr;   ///< int16 [k/16][n/16][w], little endian
@@ -72,6 +74,12 @@ bool exl3_cols_avx2_ok(int w);
 void exl3_expand_input(const float* x2, int k, float* xp, float* bias);
 void exl3_cols_expanded_avx2(const Exl3Proj& p, const float* const* xp, const float* bias, int nt, float* const* y1,
                              int c0, int c1);
+/// The int8 form of a prepared input: one scale a 128-block (sc, k / 128 floats), the values rounded to int8 and laid
+/// out four times a lane (xq, 8 k bytes, 32-byte aligned), and the bias from the rounded values.  exl3_cols_q8 is the
+/// column kernel on them (call only when exl3_q8()).
+void exl3_expand_input_q8(const float* x2, int k, int8_t* xq, float* sc, float* bias);
+void exl3_cols_q8(const Exl3Proj& p, const int8_t* const* xq, const float* const* sc, const float* bias, int nt,
+                  float* const* y1, int c0, int c1);
 /// The output transform and svh over 128-blocks [b0, b1) of y1, in place.
 void exl3_finish(const Exl3Proj& p, float* y, int b0, int b1, int variant);
 

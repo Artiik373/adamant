@@ -155,6 +155,37 @@ void run(int k, int n, int w, bool avx2) {
         for (int i = 0; i < n; ++i) em = std::fmax(em, std::fabs(cm[(size_t) n + (size_t) i] - c1[(size_t) i]));
         std::snprintf(name, sizeof name, "variant %d columns, 3 tokens", variant);
         check(name, em, scale, 0.0);
+        if (!cpu_avxvnni_ok()) continue;
+        // int8 activations: close to the float columns (the rounding of the activations), and a token's bits do not
+        // depend on the others
+        std::vector<int8_t> qs((size_t) k * 8 * 2 + 32);
+        int8_t* q0 = (int8_t*) (((uintptr_t) qs.data() + 31) & ~(uintptr_t) 31);
+        int8_t* q1 = q0 + (size_t) k * 8;
+        std::vector<float> sc((size_t) k / 64), cq((size_t) n), cq3((size_t) n * 3);
+        float bias[2];
+        exl3_expand_input_q8(x2v.data(), k, q0, sc.data(), &bias[0]);
+        exl3_expand_input_q8(xo.data(), k, q1, sc.data() + k / 128, &bias[1]);
+        const int8_t* xq1[1] = {q0};
+        const float* sc1[1] = {sc.data()};
+        float* oq = cq.data();
+        exl3_cols_q8(p, xq1, sc1, bias, 1, &oq, 0, n);
+        double eq = 0, cs = 0;
+        for (int i = 0; i < n; ++i) {
+            eq = std::fmax(eq, std::fabs(cq[(size_t) i] - c1[(size_t) i]));
+            cs = std::fmax(cs, std::fabs(c1[(size_t) i]));
+        }
+        std::snprintf(name, sizeof name, "variant %d q8 columns", variant);
+        check(name, eq, cs, 2e-2);
+        const int8_t* xq3[3] = {q1, q0, q1};
+        const float* sc3[3] = {sc.data() + k / 128, sc.data(), sc.data() + k / 128};
+        const float b3[3] = {bias[1], bias[0], bias[1]};
+        float* oq3[3] = {cq3.data(), cq3.data() + n, cq3.data() + 2 * (size_t) n};
+        exl3_cols_q8(p, xq3, sc3, b3, 3, oq3, 0, 48);
+        exl3_cols_q8(p, xq3, sc3, b3, 3, oq3, 48, n);
+        double e3 = 0;
+        for (int i = 0; i < n; ++i) e3 = std::fmax(e3, std::fabs(cq3[(size_t) n + (size_t) i] - cq[(size_t) i]));
+        std::snprintf(name, sizeof name, "variant %d q8 columns, 3 tokens", variant);
+        check(name, e3, cs, 0.0);
     }
 }
 
@@ -178,6 +209,28 @@ void bench(int k, int n, int w) {
             }
             const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
             std::printf("bench k %d n %d w %d, %d tokens, %s: %.1f us/proj (%g)\n", k, n, w, nt, cold ? "cold" : "hot",
+                        us / (double) recs, sink);
+        }
+    if (!cpu_avxvnni_ok()) return;
+    std::vector<int8_t> qs((size_t) k * 8 + 32);
+    int8_t* q = (int8_t*) (((uintptr_t) qs.data() + 31) & ~(uintptr_t) 31);
+    std::vector<float> sc((size_t) k / 128);
+    float bias = 0;
+    exl3_expand_input_q8(x2.data(), k, q, sc.data(), &bias);
+    const int8_t* xq[3] = {q, q, q};
+    const float* scs[3] = {sc.data(), sc.data(), sc.data()};
+    const float bs[3] = {bias, bias, bias};
+    for (const int nt : {1, 3})
+        for (const bool cold : {true, false}) {
+            const auto t0 = std::chrono::steady_clock::now();
+            float sink = 0;
+            for (size_t r = 0; r < recs; ++r) {
+                const Exl3Proj p = exl3_proj_at(buf.data() + (cold ? r : 0) * bytes, k, n, w);
+                exl3_cols_q8(p, xq, scs, bs, nt, ys, 0, n);
+                sink += y[0];
+            }
+            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            std::printf("bench q8 k %d n %d w %d, %d tokens, %s: %.1f us/proj (%g)\n", k, n, w, nt, cold ? "cold" : "hot",
                         us / (double) recs, sink);
         }
 }
