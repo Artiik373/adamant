@@ -127,6 +127,7 @@ Command line `--name`; the Where column says which config block takes it.
 | --- | --- | --- | --- | --- |
 | `prefill` | engine | `auto`, `auto:N` (N = 8192, 16384 or 32768), or tokens | `auto` | Flash-Next only. Prompt chunk size. |
 | `prefill-cpu-share` | engine | 0 to 1 | 0.6 | Flash-Next only. Share of streamed prompt experts the CPU computes. Fixed, so output is the same run to run. |
+| `exl3-variant` | engine | 0 to 3 | 0 | Flash-Next EXL3 packs only. Where the sign vectors sit relative to the Hadamard transforms: bit 0 applies the input signs after the transform, bit 1 applies the output signs before it. |
 | `short-read` | engine | tokens | 64 (`0` = off) | Flash-Next only. A fresh part of at most N tokens is read through decode windows. |
 | `no-peer-prefill` | engine | switch | off | Flash-Next only. The peer card computes none of the prompt rows; the prompt stays on the main card. |
 | `read-beside` | engine | switch | off | With `batch`: a prompt read short enough to take the GPU alone (under 16384 tokens) runs beside the decoding slots instead of holding them back, so their tokens keep coming while a new prompt is read. A read with no slot decoding takes the alone path, so one stream behaves exactly as before. Beside the slots the read lends only RAM-backed cache slots (no other cap when RAM copies exist) and is still slower than a read alone because it shares the GPU with the windows; a conversation checkpoint inside such a read still pauses the windows. |

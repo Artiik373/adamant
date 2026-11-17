@@ -125,6 +125,7 @@ bin/basalt serve MODEL.basalt [--python PY] [options]
 | --- | --- | --- | --- | --- |
 | `prefill` | engine | `auto`、`auto:N`（N = 8192、16384 或 32768），或 token 数 | `auto` | 仅 Flash-Next。提示词块大小。 |
 | `prefill-cpu-share` | engine | 0 到 1 | 0.6 | 仅 Flash-Next。流式提示词专家中由 CPU 计算的比例。固定值，所以输出逐次运行一致。 |
+| `exl3-variant` | engine | 0 到 3 | 0 | 仅 Flash-Next 的 EXL3 模型包。符号向量相对 Hadamard 变换的位置：第 0 位表示输入符号在变换之后应用，第 1 位表示输出符号在变换之前应用。 |
 | `short-read` | engine | token | 64（`0` 关闭） | 仅 Flash-Next。至多 N 个 token 的新增部分走 decode 窗口读取。 |
 | `no-peer-prefill` | engine | 开关 | 关闭 | 仅 Flash-Next。对等卡不计算任何提示词行；提示词留在主卡。 |
 | `read-beside` | engine | 开关 | 关闭 | 配合 `batch`：短到可以独占 GPU 的提示词读取（16,384 token 以下）与解码槽位同时进行，而不是挡住它们，因此新提示词读取期间槽位仍持续出 token。没有槽位在解码时走独占路径，所以单流的行为与以前完全一致。与槽位并行时，该读取只出借有 RAM 副本的缓存槽位（有 RAM 副本时没有别的上限），并且因为与窗口共享 GPU 仍比独占读取慢；这样一次读取中的会话 checkpoint 仍会暂停窗口。 |
