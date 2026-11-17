@@ -456,8 +456,12 @@ uint64_t moe_hit_grouped_scratch_bytes(int64_t n_hits, int64_t n_embd, int64_t n
     // the fp32 scales for the INTERMEDIATE's own quantization, one per 32-element chunk per hit.
     const uint64_t hs = (uint64_t) n_hits * (uint64_t) (n_ff / 32) * 4;
     const uint64_t xh = (uint64_t) (n_embd / 32) * 4;
-    return ((gu + 15) & ~15ull) + ((q8 + 15) & ~15ull) + 2 * ((hs + 15) & ~15ull) +
-           ((xh + 15) & ~15ull);
+    const uint64_t base = ((gu + 15) & ~15ull) + ((q8 + 15) & ~15ull) + 2 * ((hs + 15) & ~15ull) +
+                          ((xh + 15) & ~15ull);
+    // EXL3 experts keep gate, up and the SwiGLU output as three fp32 regions of 256-byte-aligned size
+    const uint64_t exl3 = 3 * (((uint64_t) n_hits * (uint64_t) n_ff * 4 + 255) & ~255ull) +
+                          (((uint64_t) n_hits * (uint64_t) n_ff * 17 + 255) & ~255ull);
+    return base > exl3 ? base : exl3;
 }
 
 void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,

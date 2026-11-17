@@ -1,5 +1,7 @@
 #include "common.hpp"
 
+#include "basalt/ggml/ggml.h"
+
 namespace basalt::core {
 
 using namespace mtp_detail;
@@ -10,6 +12,43 @@ namespace {
 bool draft_ctx_rows(int head_type) { return head_type == 13 || head_type == GGML_Q8_0; }
 bool draft_rows_mapped(int head_type) { return head_type == 14 || head_type == GGML_Q8_0; }
 bool draft_proxy(int head_type) { return head_type == 13 || head_type == 14 || head_type == GGML_Q8_0; }
+
+// An EXL3 head has no rows of its own (the output transform mixes 128 of them), so its draft subset is a Q8_0 copy of
+// the dequantized rows.  Drafts are verified by the head itself: the copy only has to rank the tokens like it.
+size_t q80_row_bytes(int64_t n_embd) { return (size_t) (n_embd / 32) * 34; }
+
+bool exl3_draft_rows(const NativeHead& head, int64_t n_embd, int64_t n_vocab, const std::vector<int32_t>& ids,
+                     uint8_t* dst) {
+    constexpr int64_t kSlice = 4096;   // head rows dequantized at a time
+    const size_t rb = q80_row_bytes(n_embd);
+    std::vector<std::pair<int32_t, int64_t>> want(ids.size());
+    for (size_t i = 0; i < ids.size(); ++i) want[i] = {ids[i], (int64_t) i};
+    std::sort(want.begin(), want.end());
+    uint16_t* dev = nullptr;
+    if (cudaMalloc((void**) &dev, (size_t) kSlice * (size_t) n_embd * 2) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    std::vector<uint16_t> half((size_t) kSlice * (size_t) n_embd);
+    std::vector<uint8_t> out(ids.size() * rb);
+    std::vector<float> row((size_t) n_embd);
+    const auto* q8 = ggml_get_type_traits((ggml_type) GGML_Q8_0);
+    size_t w = 0;
+    bool ok = true;
+    for (int64_t r0 = 0; r0 < n_vocab && w < want.size() && ok; r0 += kSlice) {
+        const int64_t rows = std::min(kSlice, n_vocab - r0);
+        if (want[w].first >= r0 + rows) continue;
+        basalt::kernels::exl3_dequant_dense_f16(head.type(), head.weights(), n_embd, n_vocab, r0, rows, dev, nullptr);
+        ok = cudaMemcpy(half.data(), dev, (size_t) rows * (size_t) n_embd * 2, cudaMemcpyDeviceToHost) == cudaSuccess;
+        for (; ok && w < want.size() && want[w].first < r0 + rows; ++w) {
+            const uint16_t* h = half.data() + (size_t) (want[w].first - r0) * (size_t) n_embd;
+            for (int64_t i = 0; i < n_embd; ++i) row[(size_t) i] = ggml_fp16_to_fp32(h[i]);
+            q8->from_float_ref(row.data(), out.data() + (size_t) want[w].second * rb, n_embd);
+        }
+    }
+    cudaFree(dev);
+    return ok && cudaMemcpy(dst, out.data(), out.size(), cudaMemcpyHostToDevice) == cudaSuccess;
+}
 }  // namespace
 
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int head_type, int64_t n_vocab) const {
@@ -17,7 +56,9 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int head_type, int64_t 
     if (dhead_ == nullptr && !rows_mapped_) {
         if (!draft_vocab_.empty() && draft_vocab_.exists()) {
             const long size = (long) draft_vocab_.size();
-            if (size >= 4 && size % 4 == 0) {
+            if (basalt::kernels::cpu::exl3_type(head_type)) {   // the Q8_0 copy and the map
+                if (size >= 4 && size % 4 == 0) bytes += (uint64_t) (size / 4) * q80_row_bytes(g_->n_embd) + (uint64_t) size;
+            } else if (size >= 4 && size % 4 == 0) {
                 const uint64_t xr = (uint64_t) kDraftCtxRows;
                 // a Q6_K head reads the main head's rows; others copy them
                 if (!draft_rows_mapped(head_type)) bytes += (uint64_t) (size / 4 + xr) * head_row_bytes;
@@ -89,6 +130,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     }
     // the draft head's token subset, when the model file carries one
     if (dhead_ == nullptr && !rows_mapped_) {
+        const bool exl3 = basalt::kernels::cpu::exl3_type(head->type());
         std::vector<uint8_t> raw;
         if (read_file(draft_vocab_, raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             const int64_t n_raw = (int64_t) (raw.size() / 4);
@@ -110,7 +152,8 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             std::fill(map.begin() + n_base, map.begin() + n_base + n_xcap_, -1);
             std::copy(ids + n_base, ids + n_raw, map.begin() + n_base + n_xcap_);
             n_dvocab_ = n_raw + n_xcap_;
-            const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
+            // a vocabulary row of the native head, or of an EXL3 head's Q8_0 copy
+            const int64_t row_bytes = exl3 ? (int64_t) q80_row_bytes(g_->n_embd) : (int64_t) head->row_bytes();
             const bool mapped = draft_rows_mapped(head->type());
             if (cudaMalloc((void**) &dvocab_, map.size() * 4) != cudaSuccess ||
                 (!mapped && cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess) ||
@@ -136,6 +179,13 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 std::vector<int32_t> gmap = map;
                 for (int32_t& v : gmap) if (v < 0) v = ids[0];
                 cudaMemcpy(dvocab_, gmap.data(), gmap.size() * 4, cudaMemcpyHostToDevice);
+                if (exl3) {
+                    if (!exl3_draft_rows(*head, g_->n_embd, n_vocab_, gmap, dhead_)) {
+                        err = "mtp: the draft head's rows could not be built from the EXL3 head";
+                        return false;
+                    }
+                    dhead_type_ = GGML_Q8_0;
+                } else
                 basalt::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_,
                                              nullptr);
                 cudaDeviceSynchronize();

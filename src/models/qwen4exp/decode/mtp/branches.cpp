@@ -9,16 +9,13 @@ using namespace mtp_detail;
 // own weights right after the hc read, beside the K/V append.
 void MtpDrafter::pf_fork(cudaStream_t from) {
     if (!par_) return;
-    const ModelGeometry& g = *g_;
-    const int64_t N = g.n_embd, NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
-    auto q8_bytes = [&](int64_t rows, int64_t cols) { return (size_t) (rows * (cols / 32) * 34); };
-    auto pf = [&](const void* w, size_t bytes) { basalt::kernels::dense_tc_l2_prefetch(w, bytes, cs3_); };
+    auto pf = [&](const char* name) { basalt::kernels::dense_tc_l2_prefetch(q8(name), (size_t) wbytes(name), cs3_); };
     cudaEventRecord(ev_pf_, from);
     cudaStreamWaitEvent(cs3_, ev_pf_, 0);
-    pf(q8("fc_embedding.weight"), q8_bytes(N, N));
-    pf(q8("self_attn.k_proj.weight"), q8_bytes(NKV * HD, N));
-    pf(q8("self_attn.v_proj.weight"), q8_bytes(NKV * HD, N));
-    pf(q8("self_attn.o_proj.weight"), q8_bytes(N, NH * HD));
+    pf("fc_embedding.weight");
+    pf("self_attn.k_proj.weight");
+    pf("self_attn.v_proj.weight");
+    pf("self_attn.o_proj.weight");
     pf_open_ = true;
 }
 

@@ -38,7 +38,13 @@
 namespace basalt {
 
 // ---- ggml type ids we care about. 42 = Q2_0, the PrismML ternary 2-bit encoding this engine targets.
+// EXL3 (QTIP trellis) tensors carry ids 97..112 = 96 + W/8, W the 16-bit words of a 16x16 tile (bits per weight =
+// W / 16).  They are not block formats: the payload of a [K, N] tensor is the trellis int16[K/16][N/16][W], then
+// suh fp16[K], then svh fp16[N] (see tools/exl3/build_experts.py).
+inline bool exl3_tensor_type(uint32_t t) { return t > 96 && t <= 112; }
+
 inline const char* ggml_type_name(uint32_t t) {
+    if (exl3_tensor_type(t)) return "EXL3";
     switch (t) {
     case 0:
         return "F32";
@@ -476,6 +482,11 @@ private:
 // Bytes of a tensor's payload from its shape and block geometry; 0 when the type is unknown, a row is not whole
 // blocks, or the count overflows.
 inline uint64_t tensor_payload_bytes(const TensorInfo& t) {
+    if (exl3_tensor_type(t.type)) {   // K, N whole 128-blocks (the Hadamard transform's size)
+        if (t.shape.size() != 2 || t.shape[0] == 0 || t.shape[1] == 0 || t.shape[0] % 128 || t.shape[1] % 128) return 0;
+        const uint64_t k = t.shape[0], n = t.shape[1], w = (uint64_t) (t.type - 96) * 8;
+        return k / 16 * (n / 16) * w * 2 + 2 * (k + n);
+    }
     int be = 0, bb = 0;
     if (t.shape.empty() || !block_geometry(t.type, be, bb) || t.shape[0] % (uint64_t) be) return 0;
     uint64_t elements = 1;

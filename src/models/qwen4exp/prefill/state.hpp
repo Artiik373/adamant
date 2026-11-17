@@ -33,6 +33,8 @@ struct Prefill::Impl {
     int64_t hist_n = 0, hist_tokens = 0;
     bool hist_on = false;
     cudaStream_t cs = nullptr, copy = nullptr;
+    cudaStream_t ds = nullptr;               // the fp16 path's dequant stream (overlaps the GEMMs on cs)
+    cudaEvent_t dq_done[DQ] = {}, dq_free[DQ] = {};   // dequant q finished / the GEMMs that read buffer q finished
     Gemm gemm;
     std::vector<void*> owned;
     // chunk buffers

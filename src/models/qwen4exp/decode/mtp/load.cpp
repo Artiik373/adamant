@@ -39,7 +39,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     std::optional<LoadProgress> progress;
     // ---- the index and the dense weights
     {
-        if (!parse_index(files.index, tensors_, err)) return false;
+        if (!parse_index(files.index, tensors_, ex_, err)) return false;
         std::vector<uint8_t> blob;
         if (!read_file(files.dense, blob)) { err = "mtp: cannot read " + files.dense.path; return false; }
         if (basalt::kernels::hc8_only()) {   // the hyper-connection matrices as 8-bit copies only: out of the blob
@@ -72,7 +72,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
                   (info == cudaSuccess ? std::to_string(free_bytes >> 20) + " MiB" : "unknown");
             return false;
         }
-        progress.emplace(LoadProgress::cuda(device_), blob.size() + (uint64_t) g.n_expert * basalt::kernels::cpu::BLOB);
+        progress.emplace(LoadProgress::cuda(device_), blob.size() + (uint64_t) g.n_expert * expert_blob());
         cudaMemcpy(dense_, blob.data(), blob.size(), cudaMemcpyHostToDevice);
         progress->add(blob.size());
         vram_ += blob.size();
@@ -80,7 +80,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     }
     // ---- the 512 routed experts, one blob each
     {
-        const uint64_t bytes = (uint64_t) g.n_expert * basalt::kernels::cpu::BLOB;
+        const uint64_t bytes = (uint64_t) g.n_expert * expert_blob();
         if (files.experts.empty() || !files.experts.exists() || files.experts.size() < bytes) {
             err = "mtp: " + files.experts.path + " is missing or shorter than the draft layer's experts";
             return false;
@@ -98,7 +98,16 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     const char* required[] = {"fc_embedding.weight", "fc_hidden.weight", "self_attn.q_proj.weight", "self_attn.k_proj.weight",
                               "self_attn.v_proj.weight", "self_attn.o_proj.weight", "mlp.shared_expert.gate_proj.weight",
                               "mlp.shared_expert.up_proj.weight", "mlp.shared_expert.down_proj.weight"};
-    for (const char* n : required) if (!q8(n)) { err = std::string("mtp: ") + n + " is missing (q8_0)"; return false; }
+    for (const char* n : required) if (!q8(n)) { err = std::string("mtp: ") + n + " is missing (a q8_0 or exl3 projection)"; return false; }
+    if (ex_.exl3) {   // the experts' kernels are checked before anything else is allocated
+        if (!basalt::kernels::native_expert_supported(ex_.gu_type, ex_.d_type, g.n_embd, g.n_ff) ||
+            basalt::kernels::native_expert_layout(ex_.gu_type, ex_.d_type, g.n_embd, g.n_ff).bytes != ex_.blob) {
+            err = "mtp: the EXL3 experts' types " + std::to_string(ex_.gu_type) + "/" + std::to_string(ex_.d_type) +
+                  " or blob size do not fit the model";
+            return false;
+        }
+        ex_layout_ = basalt::kernels::native_expert_layout(ex_.gu_type, ex_.d_type, g.n_embd, g.n_ff);
+    }
 
     // ---- the layer's own K/V (dense attention: no indexer state is read)
     const basalt::kernels::QsaShapes s = shapes_of(g);
@@ -218,8 +227,11 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         grp_ptr_ = b.take<unsigned long long>(T * K); grp_start_ = b.take<int32_t>(T * K + 1);
         grp_counts_ = b.take<int32_t>(4);
-        hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
-        hit_scratch_ = b.take<uint8_t>(basalt::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff));
+        // q8_0 rows (34 B a block) or, for EXL3 experts, q8_1 (36)
+        hit_xq_ = b.take<uint8_t>(T * (N / 32) * 36); hit_xs_ = b.take<float>(T * (N / 32));
+        hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
+            basalt::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
+            ex_.exl3 ? basalt::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff) : 0));
         sh_scratch_ = (float*) b.take<uint8_t>(basalt::kernels::shared_expert_scratch_bytes(g.n_ff));
         out_ids_ = b.take<int32_t>(T + 4);
         probs_ = b.take<float>(T + 4);
@@ -289,9 +301,9 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
         cudaMemset(gstamp_, 0, 16);
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
     basalt::log::info("basalt mtp", "draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)",
-                 (double) vram_ / 1048576.0, (double) g.n_expert * basalt::kernels::cpu::BLOB / 1048576.0,
+                 (double) vram_ / 1048576.0, (double) g.n_expert * expert_blob() / 1048576.0,
                  (double) tensors_.back().off / 1048576.0, files_s,
-                 files_s > 0 ? ((double) g.n_expert * basalt::kernels::cpu::BLOB + (double) tensors_.back().off) /
+                 files_s > 0 ? ((double) g.n_expert * expert_blob() + (double) tensors_.back().off) /
                                    1048576.0 / files_s : 0.0);
     return true;
 }

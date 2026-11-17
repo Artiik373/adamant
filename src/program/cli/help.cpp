@@ -191,6 +191,8 @@ void usage() {
                  "  --prefill-cpu-share F  share of the streamed prompt experts the CPU computes, 0 to 1 (default\n"
                  "                       0.6; 0 = the GPU streams them all).  Fixed, so the output is the same\n"
                  "                       from run to run; a weaker CPU may prefer a lower value\n"
+                 "  --exl3-variant N     EXL3 packs: where the sign vectors sit relative to the Hadamard transforms,\n"
+                 "                       0..3 (bit 0: input H(x) then suh; bit 1: output svh before H; default 0)\n"
                  "  --adapt-swaps N      most experts a round swaps into the main GPU (default 96; 0 = off). On a\n"
                  "                       server without a layer split, a round after one that found twice as many\n"
                  "                       misses swaps four times as many, and the RAM copy keeps 4 N free places\n"

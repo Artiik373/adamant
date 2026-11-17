@@ -39,7 +39,7 @@ void MtpDrafter::record_hidden(const float* R, int T, uint8_t* xq, cudaStream_t 
     for (int c0 = 0; c0 < T * HC; c0 += 8) {
         const int nc = (int) std::min<int64_t>(8, T * HC - c0);
         native_quantize_q8_1(hn_ + (size_t) c0 * N, xq, (int) N, nc, cs);
-        native_mmvq(GGML_Q8_0, q8("fc_hidden.weight"), xq, h2_ + (size_t) c0 * N, (int) N, (int) N, nc, cs);
+        native_mmvq(wtype("fc_hidden.weight"), q8("fc_hidden.weight"), xq, h2_ + (size_t) c0 * N, (int) N, (int) N, nc, cs);
     }
 }
 
@@ -104,7 +104,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             }
             native_qsa_rms_norm_weighted(emb_, f32("pre_fc_norm_embedding.weight"), en_, (int) N, T, EPS, ce);
             native_quantize_q8_1(en_, xqe, (int) N, T, ce);
-            native_mmvq(GGML_Q8_0, q8("fc_embedding.weight"), xqe, e2_, (int) N, (int) N, T, ce);
+            native_mmvq(wtype("fc_embedding.weight"), q8("fc_embedding.weight"), xqe, e2_, (int) N, (int) N, T, ce);
             pscope_off();
             if (!(have_pre_ && full)) record_hidden(Rin_, T, xq_, cs);
             if (par_) join(cs);
@@ -145,8 +145,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             if (kv_side) fork(cs);
             const cudaStream_t ckv = kv_side ? cs2_ : cs;
             pscope(true);   // the K/V branch follows the fork
-            native_mmvq(GGML_Q8_0, q8("self_attn.k_proj.weight"), xq_, kcur_, (int) N, (int) (NKV * HD), T, ckv);
-            native_mmvq(GGML_Q8_0, q8("self_attn.v_proj.weight"), xq_, vcur_, (int) N, (int) (NKV * HD), T, ckv);
+            native_mmvq(wtype("self_attn.k_proj.weight"), q8("self_attn.k_proj.weight"), xq_, kcur_, (int) N, (int) (NKV * HD), T, ckv);
+            native_mmvq(wtype("self_attn.v_proj.weight"), q8("self_attn.v_proj.weight"), xq_, vcur_, (int) N, (int) (NKV * HD), T, ckv);
             if (kv_fused) {   // the rows' K norm + RoPE and appends in one launch
                 QsaDecKvPost kp;
                 kp.kcur = kcur_; kp.vcur = vcur_; kp.pos_k = pos; kp.pos_stride = (int) NH;
@@ -178,11 +178,11 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             return true;
         }
         pscope(false);   // the query follows the hc read (or its quantize)
-        if (T == 1)   // read once a step: streamed past the layer's other weights in L2
+        if (T == 1 && wtype("self_attn.q_proj.weight") == GGML_Q8_0)   // read once a step: streamed past the layer's other weights in L2
             native_q8_0_mmvq_stream(q8("self_attn.q_proj.weight"), kv_open_ ? xqr_ : xq_, qfull_, (int) N,
                                     (int) (NH * 2 * HD), cs);
         else
-            native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
+            native_mmvq(wtype("self_attn.q_proj.weight"), q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
         if (!st_.kv_rot && qsa_dec_fused_supported(s)) {
             QsaDecQPost qp;   // the query split, norm and RoPE in one launch
             qp.q_full = qfull_; qp.qcur = qcur_; qp.pos_q = pos; qp.q_norm = f32("self_attn.q_norm.weight"); qp.eps = EPS;
@@ -215,7 +215,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                                       (int) HD, cs);
         }
         if (!aq_done) native_quantize_q8_1(attn32_, xq_, (int) (NH * HD), T, cs);
-        native_mmvq(GGML_Q8_0, q8("self_attn.o_proj.weight"), xq_, bo_, (int) (NH * HD), (int) N, T, cs);
+        native_mmvq(wtype("self_attn.o_proj.weight"), q8("self_attn.o_proj.weight"), xq_, bo_, (int) (NH * HD), (int) N, T, cs);
         // ---- the MLP hyper-connection (the attention write folded in)
         bool routed = false;   // the read ran the router too
         {
@@ -255,15 +255,21 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             if (g.n_expert == 512 && K == 10) native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
             else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
         }
-        moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) basalt::kernels::cpu::BLOB, grp_ptr_,
+        moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) expert_blob(), grp_ptr_,
                            grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
-        quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);
-        moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K, hit_xq_,
-                       hit_xs_, hit_scratch_, parts_, cs);
+        if (ex_.exl3) {   // EXL3 records: q8_1 activations, the native grouped kernels on the same groups
+            native_quantize_q8_1(mixed_, hit_xq_, (int) N, T, cs);
+            native_expert_grouped(ex_layout_, grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K,
+                                  (int64_t) T * K, hit_xq_, hit_scratch_, parts_, cs);
+        } else {
+            quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);
+            moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K, hit_xq_,
+                           hit_xs_, hit_scratch_, parts_, cs);
+        }
         NativeSharedWeights nsw;
-        nsw.gate_type = GGML_Q8_0; nsw.gate_data = q8("mlp.shared_expert.gate_proj.weight");
-        nsw.up_type = GGML_Q8_0; nsw.up_data = q8("mlp.shared_expert.up_proj.weight");
-        nsw.down_type = GGML_Q8_0; nsw.down_data = q8("mlp.shared_expert.down_proj.weight");
+        nsw.gate_type = wtype("mlp.shared_expert.gate_proj.weight"); nsw.gate_data = q8("mlp.shared_expert.gate_proj.weight");
+        nsw.up_type = wtype("mlp.shared_expert.up_proj.weight"); nsw.up_data = q8("mlp.shared_expert.up_proj.weight");
+        nsw.down_type = wtype("mlp.shared_expert.down_proj.weight"); nsw.down_data = q8("mlp.shared_expert.down_proj.weight");
         nsw.q8_1 = xq_;
         const SForm none{};
         const bool fold_write = par_ && dec_draft_hcf();   // the mixer read applies the write
@@ -352,7 +358,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         else if (head_->planes())   // the whole head, in bit planes (a Q8_0 head's rows are always read by the map)
             q80p_mmvq(head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         else
-            native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
+            native_mmvq(sub && dhead_type_ >= 0 ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_,
+                        head_logits_, (int) N, (int) nv, T, cs);
         if (sub && n_xcap_ > 0)   // a context row without a token never wins (the other rows always have one)
             for (int t = 0; t < T; ++t)
                 q5k_head_mask_unmapped(head_logits_ + (size_t) t * (size_t) nv + (size_t) xbase_, dvocab_ + xbase_,

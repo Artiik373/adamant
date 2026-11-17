@@ -250,6 +250,10 @@ std::string dec_moe_peer_diag(const uint32_t* d) {
 }
 
 bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type) {
+    // EXL3 experts: the planner is format-blind, and the layer runs native_expert_grouped on the device plan
+    if (cpu::exl3_type(gu_type))
+        return d_type == gu_type && (up_type < 0 || up_type == gu_type) && n_embd == 2560 && n_ff == 640 &&
+               !native_grouped_v1();
     if (up_type >= 0 && up_type != gu_type) {
         bool mix = false;
         switch ((gu_type * 100 + up_type) * 100 + d_type) {

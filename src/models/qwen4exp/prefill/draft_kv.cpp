@@ -58,7 +58,11 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     // mixed_h, K and V (KV each), the token id
     // the drafter's Q8_0 matrices through Q8_1 x Q8_0 MMQ - its own pass's integer dot products (mmvq), so its K/V
     // stay close to what the drafter computes itself
-    const bool q8 = mmq::built() && mmq::fits(kQ8_0, Nn) && mmq::fits(kQ8_0, KV);
+    // EXL3 projections go through the f16 GEMM (Gemm::native dequantizes them), Q8_0 ones through MMQ
+    const int t_fe = mtp.tensor_type("fc_embedding.weight"), t_fh = mtp.tensor_type("fc_hidden.weight"),
+              t_k = mtp.tensor_type("self_attn.k_proj.weight"), t_v = mtp.tensor_type("self_attn.v_proj.weight");
+    const bool q8 = mmq::built() && mmq::fits(kQ8_0, Nn) && mmq::fits(kQ8_0, KV) && t_fe == kQ8_0 && t_fh == kQ8_0 &&
+                    t_k == kQ8_0 && t_v == kQ8_0;
     const uint64_t per_row = 4 * (2 * Nn + 4 * HCN + LR + HC + Nn + 2 * KV + 1) + 2 * (Nn + 2 * HCN + LR + Nn) + 64 +
                              (q8 ? (uint64_t) mmq::q8_bytes(g.hc, Nn) + 4 * g.hc : 0);
     int64_t B = std::min<int64_t>(n - r0, (int64_t) (m.region_bytes / per_row) & ~(int64_t) 63);
@@ -99,8 +103,8 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     }
     // y[rows, n_out] = x[rows, k] . w^T for a Q8_0 matrix: MMQ from the FP32 rows (bounds slot 0: rows, 1: rows*hc)
     auto proj = [&](const float* x, const uint16_t* x16, const void* w, float* y, int64_t rows, int64_t n_out,
-                    int64_t k, int slot) {
-        if (!q8) { m.gemm.native(x16, kQ8_0, w, y, rows, n_out, k); return; }
+                    int64_t k, int slot, int type) {
+        if (!q8) { m.gemm.native(x16, type, w, y, rows, n_out, k); return; }
         mmq::quantize(x, nullptr, xq, kQ8_0, k, k, rows, m.cs);
         mmq::Product p;
         p.w = w; p.type = kQ8_0; p.w_rows = n_out; p.w_cols = k; p.expert_bytes = mmq::matrix_bytes(kQ8_0, n_out, k);
@@ -135,11 +139,11 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         }
         rms_rows(emb, w_ne, nb, Nn, Nn, EPS, m.cs);
         if (!q8) to_f16(emb, en16, nb * Nn, m.cs);
-        proj(emb, en16, w_fe, e2, nb, Nn, Nn, 0);
+        proj(emb, en16, w_fe, e2, nb, Nn, Nn, 0, t_fe);
         cudaMemcpyAsync(hn, R_rows + (size_t) b0 * HCN, (size_t) nb * HCN * 4, cudaMemcpyDefault, m.cs);   // (or pinned host rows)
         rms_rows(hn, w_nh, nb, HCN, HCN, EPS, m.cs);
         if (!q8) to_f16(hn, hn16, nb * HCN, m.cs);
-        proj(hn, hn16, w_fh, h2, nb * g.hc, Nn, Nn, 1);   // every stream through fc_hidden
+        proj(hn, hn16, w_fh, h2, nb * g.hc, Nn, Nn, 1, t_fh);   // every stream through fc_hidden
         basalt::kernels::add_streams_broadcast(h2, e2, Rm, Nn, (int) g.hc, (int) nb, m.cs);
         // the attention hyper-connection's read (its mixed input only: this pass writes nothing back)
         gr_norm_rs(Rm, w_hn, EPS, grs, xn16, nb, m.cs);
@@ -147,8 +151,8 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         gr_silu(lo, lo16, nb, m.cs);
         up_mix(m.gemm, w_up, lo16, gated, Rm, grs, w_hn, mixed, nullptr, mixed_h, nb, m.cs);
         // K and V into the drafter's cache, as the prompt path's QSA layers append theirs
-        proj(mixed, mixed_h, w_k, Kc, nb, KV, Nn, 0);
-        proj(mixed, mixed_h, w_v, Vc, nb, KV, Nn, 0);
+        proj(mixed, mixed_h, w_k, Kc, nb, KV, Nn, 0, t_k);
+        proj(mixed, mixed_h, w_v, Vc, nb, KV, Nn, 0, t_v);
         rms_rows(Kc, w_kn, nb * g.n_head_kv, g.head_dim, g.head_dim, EPS, m.cs);
         rope(Kc, nb, g.n_head_kv, g.head_dim, KV, c0, basalt::kernels::rope_scaling(), m.cs);
         if (st.kv_rot) {   // rotated as the drafter's own decode stores them (src/models/qwen4exp/decode/mtp/forward.cpp)

@@ -43,6 +43,11 @@ void Prefill::release() {
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
     }
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
+    for (int i = 0; i < DQ; ++i) {
+        if (impl_->dq_done[i]) cudaEventDestroy(impl_->dq_done[i]);
+        if (impl_->dq_free[i]) cudaEventDestroy(impl_->dq_free[i]);
+    }
+    if (impl_->ds) cudaStreamDestroy(impl_->ds);
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
     for (float* p : {impl_->cpu_x, impl_->cpu_rows})
         if (p) cudaFreeHost(p);

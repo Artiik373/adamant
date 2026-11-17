@@ -7,6 +7,8 @@
 namespace basalt::prefill {
 using namespace detail;
 
+void fp16_timing_flush(int layer);
+
 bool Prefill::Run::Chunk::Experts::execute() {
     if (fused_l) {
         if (!fused()) return false;
@@ -14,7 +16,9 @@ bool Prefill::Run::Chunk::Experts::execute() {
         Group group(*this);
         if (!group.execute()) return false;
     }
-    return finish();
+    const bool ok = finish();
+    fp16_timing_flush((int) l);
+    return ok;
 }
 
 bool Prefill::Run::Chunk::Experts::Group::execute() {

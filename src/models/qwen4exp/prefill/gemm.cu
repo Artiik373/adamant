@@ -1,6 +1,8 @@
 // src/models/qwen4exp/prefill/gemm.cu - see include/basalt/models/qwen4exp/prefill/gemm.hpp.
 #include "basalt/models/qwen4exp/prefill/gemm.hpp"
 #include "basalt/kernels/dequant_bf16.hpp"
+#include "basalt/kernels/exl3_kernels.hpp"
+#include "basalt/kernels/cpu/exl3.hpp"
 #include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 
 #include <cublas_v2.h>
@@ -177,6 +179,20 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta) {
+    // An EXL3 matrix is dequantized in whole 128-row blocks (the output transform mixes 128 rows)
+    const bool exl3 = basalt::kernels::cpu::exl3_type(ggml_type);
+    if (exl3) {
+        int64_t rows = scratch_elems_ / K / 128 * 128;
+        if (rows <= 0) { basalt::log::error("basalt", "prefill gemm: scratch too small for K=%lld", (long long) K); std::exit(1); }
+        if (rows > N) rows = N;
+        if (ldy <= 0) ldy = N;
+        for (int64_t r0 = 0; r0 < N; r0 += rows) {
+            const int64_t n = (N - r0 < rows) ? N - r0 : rows;
+            basalt::kernels::exl3_dequant_dense_f16(ggml_type, W_blocks, K, N, r0, n, scratch_, stream_);
+            f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
+        }
+        return;
+    }
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.
         const int64_t rows = scratch_elems_ / K;

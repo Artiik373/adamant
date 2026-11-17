@@ -146,6 +146,10 @@ std::optional<int> validate_generation_options(const Options& o, bool multi_gpu,
         basalt::log::error("basalt generate", "invalid sampling or resource parameter");
         return 2;
     }
+    if (o.exl3_variant < 0 || o.exl3_variant > 3) {
+        basalt::log::error("basalt generate", "--exl3-variant must be 0, 1, 2 or 3");
+        return 2;
+    }
     if (!(o.prefill_cpu_share >= 0.0 && o.prefill_cpu_share <= 1.0)) {
         basalt::log::error("basalt generate", "--prefill-cpu-share must be a number from 0 to 1");
         return 2;

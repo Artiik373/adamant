@@ -5,11 +5,25 @@
 #include "basalt/models/qwen4exp/decode/layout.hpp"
 #include "basalt/models/qwen4exp/kernels/cvec.hpp"
 #include "basalt/models/qwen4exp/prefill/kernels.hpp"
+#include "basalt/log.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <string>
 
 namespace basalt::prefill {
 using namespace detail;
+
+// BASALT_PREFILL_TIMING=1: GPU time of a layer's parts (events on the compute stream; read back after each layer)
+namespace {
+struct LayerTiming {
+    bool on = std::getenv("BASALT_PREFILL_TIMING") != nullptr;
+    double hc = 0, attn = 0, moe = 0, total = 0;
+    long long layers = 0;
+};
+LayerTiming& ltiming() { static LayerTiming t; return t; }
+cudaEvent_t tev() { cudaEvent_t e; cudaEventCreate(&e); return e; }
+double ems(cudaEvent_t a, cudaEvent_t b) { float f = 0; cudaEventElapsedTime(&f, a, b); return f; }
+}  // namespace
 
 bool Prefill::Run::Chunk::layer(int64_t l) {
     core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
@@ -20,7 +34,15 @@ bool Prefill::Run::Chunk::layer(int64_t l) {
     if (l == 1 && LB == 0 && ple_on) copy_ahead(1);
     // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
     if (!ple_layer(l)) return false;
+    LayerTiming& lt = ltiming();
+    cudaEvent_t tl0 = nullptr, tl1 = nullptr;
+    double hc_ms = 0, attn_ms = 0, moe_ms = 0;
+    cudaEvent_t pend[8] = {};
+    int npend = 0;
+    if (lt.on) { tl0 = tev(); cudaEventRecord(tl0, m.cs); }
     for (int half = 0; half < 2; ++half) {
+        cudaEvent_t th0 = nullptr, th1 = nullptr;
+        if (lt.on) { th0 = tev(); cudaEventRecord(th0, m.cs); pend[npend++] = th0; }
         // ---- the hyper-connection read of this half
         const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
         const std::string sn = std::string(pre) + "norm.weight", sd = std::string(pre) + "down.weight",
@@ -41,12 +63,18 @@ bool Prefill::Run::Chunk::layer(int64_t l) {
                half == 0 ? nullptr : m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
         if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err)) return false;
 
+        if (lt.on) { th1 = tev(); cudaEventRecord(th1, m.cs); pend[npend++] = th1; }
         if (half == 0 && !core::is_qsa_layer(g, l)) {
             if (!gdn(v)) return false;
         } else if (half == 0) {
             if (!qsa(v)) return false;
         } else {
             if (!moe(l, v)) return false;
+        }
+        if (lt.on) {
+            cudaEvent_t th2 = tev();
+            cudaEventRecord(th2, m.cs);
+            pend[npend++] = th2;
         }
         // ---- the hyper-connection write of this half; fused with the next half's norm when nothing else
         // touches R in between (not the stage's last half, not before the PLE block of layer 1, not under a
@@ -68,6 +96,22 @@ bool Prefill::Run::Chunk::layer(int64_t l) {
         }
         if (half == 1 && basalt::kernels::cvec().covers(l))   // --control-vector-scaled
             basalt::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
+    }
+    if (lt.on) {
+        tl1 = tev();
+        cudaEventRecord(tl1, m.cs);
+        cudaEventSynchronize(tl1);
+        // pend: per half {start, after the hc read, after attention/moe}
+        hc_ms = ems(pend[0], pend[1]) + ems(pend[3], pend[4]);
+        attn_ms = ems(pend[1], pend[2]);
+        moe_ms = ems(pend[4], pend[5]);
+        lt.hc += hc_ms; lt.attn += attn_ms; lt.moe += moe_ms; lt.total += ems(tl0, tl1);
+        for (int i = 0; i < npend; ++i) cudaEventDestroy(pend[i]);
+        cudaEventDestroy(tl0); cudaEventDestroy(tl1);
+        if (++lt.layers % 48 == 0)
+            basalt::log::info("basalt prefill", "layers, %d done: total %.0f ms = hc reads %.0f + attention/GDN %.0f + moe %.0f "
+                              "(+ the rest %.0f)", (int) lt.layers, lt.total, lt.hc, lt.attn, lt.moe,
+                              lt.total - lt.hc - lt.attn - lt.moe);
     }
     return true;
 }

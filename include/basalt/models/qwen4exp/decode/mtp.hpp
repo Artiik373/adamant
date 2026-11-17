@@ -21,6 +21,8 @@
 #include "basalt/models/qwen4exp/decode/layer.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/models/qwen4exp/decode/session.hpp"
+#include "basalt/kernels/cpu/expert.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -179,6 +181,7 @@ public:
     const float* tensor_f32(const char* name) const { return f32(name); }
     const uint16_t* tensor_bf16(const char* name) const { return bf16(name); }
     const void* tensor_q8(const char* name) const { return q8(name); }
+    int tensor_type(const char* name) const { return wtype(name); }
     QsaState& kv_state_rw();
     void wrote(int64_t lo, int64_t hi) { note_cells(lo, hi); }
     int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
@@ -211,7 +214,10 @@ private:
     int chain_j_ = 0;   ///< record_forward: the chain step being recorded (the diagnostic logits' slot)
     const float* f32(const char* name) const;
     const uint16_t* bf16(const char* name) const;
+    /// a dense projection (kind q8_0 or exl3) by name, its native_mmvq type and bytes (0 / -1: none)
     const void* q8(const char* name) const;
+    int wtype(const char* name) const;
+    uint64_t wbytes(const char* name) const;
 
     const ModelGeometry* g_ = nullptr;
     SessionState* ss_ = nullptr;
@@ -260,10 +266,16 @@ private:
         std::string name, kind;
         int64_t rows = 0, cols = 0;
         uint64_t off = 0, bytes = 0;
+        int type = -1;               ///< native_mmvq type of a q8_0 / exl3 projection
         const void* dev = nullptr;   ///< set: the tensor lives here instead of in dense_ (an 8-bit copy)
     };
     std::vector<Tensor> tensors_;
-    static bool parse_index(const FileRange& index, std::vector<Tensor>& out, std::string& err);
+    /// The experts' format: Q2_0 blobs (`#experts` line absent) or EXL3 records [gate | up | down], gate/up at gu_type, down at d_type.
+    struct ExpertFormat { bool exl3 = false; int gu_type = 0, d_type = 0; uint64_t blob = 0; };
+    static bool parse_index(const FileRange& index, std::vector<Tensor>& out, ExpertFormat& ex, std::string& err);
+    ExpertFormat ex_;
+    uint64_t expert_blob() const { return ex_.exl3 ? ex_.blob : (uint64_t) basalt::kernels::cpu::BLOB; }
+    basalt::kernels::NativeExpertLayout ex_layout_;
     static bool is_hc8_matrix(const Tensor& t);
     uint8_t* dense_ = nullptr;
     uint64_t dense_bytes_ = 0;
@@ -325,6 +337,7 @@ private:
     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head.  A Q6_K head
     // reads its rows from the main head through dvocab_ (rows_mapped_); other formats keep a copy in dhead_.
     uint8_t* dhead_ = nullptr;
+    int dhead_type_ = -1;   ///< the copy's native_mmvq type when it is not the main head's (an EXL3 head's Q8_0 rows)
     bool rows_mapped_ = false;
     int32_t* dvocab_ = nullptr;
     int64_t n_dvocab_ = 0;

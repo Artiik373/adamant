@@ -5,6 +5,7 @@
 #include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/models/qwen4exp/options.hpp"
+#include "basalt/kernels/cpu/exl3.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -65,6 +66,10 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
     else if (a == "--adapt-every") { o.adapt_every = std::atoi(args.next("--adapt-every")); o.adapt_every_given = true; }
     else if (a == "--adapt-decay") { o.adapt_decay = (float) std::atof(args.next("--adapt-decay")); o.adapt_decay_set = true; }
     else if (a == "--prefill-cpu-share") o.prefill_cpu_share = std::atof(args.next("--prefill-cpu-share"));
+    else if (a == "--exl3-variant") {
+        o.exl3_variant = std::atoi(args.next("--exl3-variant"));
+        basalt::kernels::cpu::exl3_set_variant(o.exl3_variant);
+    }
     else if (a == "--relaxed-drafting") {   // the value is optional: a number in (0, 1] when one follows
         o.relaxed_drafting = kRelaxedDraftingDefault;
         if (args.peek() != nullptr) {
