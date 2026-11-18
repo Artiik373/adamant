@@ -37,7 +37,7 @@
 - `hit`：专家缓存命中率。`pcie`：路由专家中经 PCIe 读取的比例。
 
 引擎自己的 `basalt ...` 行写入 `~/.cache/basalt/<id>/engine.log`，每个模型文件一个目录（`<id>` 是从文件中取出的 16 位
-十六进制数）；引擎启动失败时 `[server] engine log: PATH` 会指出它。该目录也存放会话缓存。不会从模型文件解包任何
+十六进制数）；启动时 `[server] engine log: PATH` 会指出它。日志达到 10 MiB 或以上时，下次启动会移到 `engine.log.1`。因故障或未处理异常而退出的引擎会写一行 `basalt crash: error: ...`（故障及其所在阶段），服务器的警告会引用它并附上退出状态。该目录也存放会话缓存。不会从模型文件解包任何
 内容：服务器从文件 section 读取分词器，引擎与 `basalt-vision` 就地读取其中的 vision projector。
 
 ## 统计页面
