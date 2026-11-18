@@ -43,7 +43,10 @@ Windows 上：`py -3 -m venv .venv`，然后 `.venv\Scripts\pip install -r requi
 
 ## Windows 限制
 
-- WDDM 下 pinned memory 受驱动上限约束：整个 arena 无法注册时，pinned 切片被限制在 `RAM/2 - 8 GiB`。
+- portable host 注册保持在可见显卡的 DXGI non-local 额度之内，为驱动留出余量。
+  整块 expert 切片保留各自的 device 别名；未注册的尾部锁定在工作集中。
+  驻留 RAM 层在支持时使用 CUDA host VMM，以普通注册作为回退。
+  基于分配的 pin 在 SLEEP/WAKE 期间留在 RAM 中；expert 缓存仍可归还其 VRAM。
 - 大页需要"锁定内存页"特权（Administrators）。没有该特权时 engine 使用 4 KiB 页，并在启动时说明。
 - 没有共享 arena 文件，也没有 cgroup 配额。`--ple-io direct` 经由文件缓存读取。
 - `basalt serve` 把 Python 服务器作为子进程运行。
