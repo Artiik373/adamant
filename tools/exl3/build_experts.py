@@ -108,7 +108,7 @@ class ExpertSource:
                 raise BuildError(f"{pre}.trellis: shape {tr.shape} {tr.dtype}, expected {(k // 16, n // 16, w)} int16")
             if suh.shape != (k,) or svh.shape != (n,) or suh.dtype != np.float16 or svh.dtype != np.float16:
                 raise BuildError(f"{pre}: suh/svh must be fp16 of lengths {k} and {n}")
-            if int(lin["mul1"]) & 0xFFFFFFFF != e.MUL1_MULT:
+            if int(np.asarray(lin["mul1"]).reshape(-1)[0]) & 0xFFFFFFFF != e.MUL1_MULT:
                 raise BuildError(f"{pre}.mul1 is {int(lin['mul1']) & 0xFFFFFFFF:#x}, not {e.MUL1_MULT:#x}")
             parts += [tr.astype("<i2", copy=False).tobytes(), suh.astype("<f2", copy=False).tobytes(),
                       svh.astype("<f2", copy=False).tobytes()]
