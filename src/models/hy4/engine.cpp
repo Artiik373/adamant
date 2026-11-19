@@ -289,7 +289,7 @@ struct Engine::Impl {
     }
 
     // diagnostic (--profile): GPU time by phase, from events recorded after each phase's launches
-    enum Phase { kPhAttn, kPhIdx, kPhExperts, kPhFfn, kPhEngram, kPhHead, kPhCount };
+    enum Phase { kPhAttn, kPhIdx, kPhExperts, kPhFfn, kPhEngram, kPhHead, kPhCopy, kPhCount };
     std::vector<cudaEvent_t> ev_pool;
     std::vector<int> ev_phase;
     double ph_ms[kPhCount] = {}, host_ms = 0;
@@ -836,6 +836,7 @@ struct Engine::Impl {
         Layer& y_ = L[l];
         const int ne = T * kExpertsUsed;
         cudaMemcpyAsync(d_grp, h_grp, sizeof(Groups), cudaMemcpyHostToDevice, s);
+        mark(kPhCopy);   // the cache misses' copies, queued before this segment
         k::native_expert_grouped_clamped(xl, kSwigluLimit, d_grp->ptr, d_grp->start, &d_grp->n, d_grp->dst, d_grp->tok,
                                          ne, ne, xq2, exp_scratch, exp_rows, s);
         mark(kPhExperts);
@@ -1042,7 +1043,8 @@ Engine::~Engine() {
             std::fclose(f);
         }
     if (m_->o.profile && m_->ph_steps > 0) {
-        const char* names[] = {"attention", "indexer + attend", "routed experts", "ffn other", "engram", "embed + head"};
+        const char* names[] = {"attention", "indexer + attend", "routed experts", "ffn other", "engram", "embed + head",
+                               "expert copies"};
         double total = 0;
         for (double v : m_->ph_ms) total += v;
         for (int i = 0; i < Impl::kPhCount; ++i)
