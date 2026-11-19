@@ -135,6 +135,12 @@ SampleResult sample_row(const float* logits, const Sampling& s, std::mt19937_64&
     return {pick, draft_p};
 }
 
+/// The drafts a decode window carries: none unless --spec N (N >= 2) asks for them. Each draft row routes its own
+/// experts, so on a card that holds a small share of them plain decode is faster.
+int drafts(const Hy4Options& o) {
+    return o.dfly && o.spec_given && o.spec >= 2 ? std::min(o.spec - 1, (int) kDflyBlock - 1) : 0;
+}
+
 class Server {
 public:
     Server(Engine& eng, const Hy4Options& o) : eng_(eng), o_(o) {}
@@ -250,9 +256,7 @@ private:
         };
         if (stopped) finish = "cancel";
         else if (max_new > 0) {
-            const int max_draft = !o_.dfly || (o_.spec_given && o_.spec <= 1) ? 0
-                                : (o_.spec_given && o_.spec >= 2 ? std::min(o_.spec - 1, (int) kDflyBlock - 1)
-                                                                 : (int) kDflyBlock - 1);
+            const int max_draft = drafts(o_);
             for (;;) {
                 if (produce(next)) break;
                 if (in_.stopped()) { finish = "cancel"; break; }
@@ -362,7 +366,7 @@ public:
         eo.max_context = (int) ho.max_context;
         eo.vram_reserve_mib = ho.vram_reserve_mib;
         eo.trunk_type = ho.trunk_type;
-        eo.dfly = ho.dfly;
+        eo.dfly = drafts(ho) > 0;   // the drafter's VRAM goes to the expert cache when nothing drafts
         // its own routing counts beside the pack: a shared --expert-profile names another model's file
         eo.expert_profile = ho.model + ".prof";
         Engine eng;
@@ -440,9 +444,8 @@ public:
     }
     int planned_spec(const program::CommonOptions& o) const override {
         const auto& ho = static_cast<const Hy4Options&>(o);
-        if (!ho.dfly) return 0;
-        if (ho.spec_given) return ho.spec >= 2 ? std::min(ho.spec, (int) kDflyBlock) : 0;
-        return kDflyBlock;
+        const int d = drafts(ho);
+        return d > 0 ? d + 1 : 0;
     }
     model::TokenizerSpec tokenizer_spec() const override { return {"tokenizer.json", "hy4"}; }
     model::TokenNames token_names() const override { return {{"<\xef\xbd\x9chy_end:opensource\xef\xbd\x9c>"}, {}, {}}; }
