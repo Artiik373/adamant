@@ -169,43 +169,146 @@ struct Engine::Impl {
             err = "pinned host buffers";
             return false;
         }
-        size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
-        const size_t reserve = (size_t) o.vram_reserve_mib << 20;
-        n_slots = free_b > reserve ? (int) std::min<size_t>((free_b - reserve) / blob_bytes, (size_t) (kLayers - 1) * kExperts) : 0;
-        while (n_slots > 0 && cudaMalloc((void**) &slots, (size_t) n_slots * blob_bytes) != cudaSuccess) {
-            cudaGetLastError();
-            n_slots -= n_slots / 16 + 1;
-        }
-        if (n_slots <= 0) {
-            n_slots = 0;
+        if (!vmm_ok(err)) return false;
+        slots = core::vmm::reserve(chunk_bytes() * (uint64_t) max_chunks());
+        if (slots == nullptr) { err = "cannot reserve address space for the expert cache"; return false; }
+        if (!kv_fit(std::min<int64_t>(kKvStep, o.max_context), err)) return false;
+        cache_grow();
+        if (n_slots == 0) {
             basalt::log::warn("basalt hy4", "no VRAM for an expert cache: every expert is read over PCIe");
             return true;
         }
-        owner.assign((size_t) n_slots, -1);
-        // the first fill: the most routed experts of the profile, else the same share of every layer
-        std::vector<int32_t> order;
-        for (int l = 1; l < kLayers; ++l)
-            for (int e = 0; e < kExperts; ++e) order.push_back(l * kExperts + e);
         const bool have = std::any_of(counts.begin(), counts.end(), [](float c) { return c > 0.f; });
-        if (have)
-            std::stable_sort(order.begin(), order.end(), [&](int32_t a2, int32_t b2) { return counts[a2] > counts[b2]; });
-        else
-            std::stable_sort(order.begin(), order.end(), [](int32_t a2, int32_t b2) { return a2 % kExperts < b2 % kExperts; });
-        for (int i = 0; i < n_slots; ++i) {
-            const int32_t idx = order[(size_t) i];
-            const int l = idx / kExperts, e = idx % kExperts;
-            cudaMemcpyAsync(slots + (size_t) i * blob_bytes, experts + layer_off[(size_t) l] + (size_t) e * blob_bytes,
-                            blob_bytes, cudaMemcpyHostToDevice, s);
-            slot_of[(size_t) idx] = i;
-            owner[(size_t) i] = idx;
-            score[(size_t) idx] = have ? counts[(size_t) idx] : 0.f;
-        }
         if (!cuda_ok(cudaStreamSynchronize(s), "the expert cache first fill", err)) return false;
         basalt::log::info("basalt hy4", "expert cache: %d slots in VRAM (%.2f GiB, %.0f%% of the experts), filled from %s",
                           n_slots, (double) n_slots * blob_bytes / 1073741824.0, 100.0 * n_slots / ((kLayers - 1) * kExperts),
                           have ? o.expert_profile.c_str() : "no profile (the same share of every layer)");
         return true;
+    }
+
+    // ---- VRAM shared by the expert cache and the sparse layers' KV: the KV takes what its positions need, the cache
+    // the rest. Both are reserved address ranges whose backing is mapped and unmapped, so every address stays. ----
+    static constexpr int kSlotChunk = 32;          // slots mapped as one piece
+    static constexpr int64_t kKvStep = 8192;       // positions the KV is backed by at a time
+    struct KvRange {
+        uint8_t* va = nullptr;
+        uint64_t row_bytes = 0;                    // per `ratio` positions
+        int ratio = 1;
+        std::vector<unsigned long long> pieces;    // one granule each, in order
+    };
+    std::vector<KvRange> kv;
+    std::vector<unsigned long long> chunk_h;       // the mapped slot chunks, in order
+    int64_t kv_pos = 0;                            // positions the KV is backed for
+    uint64_t gran = 0;
+
+    bool vmm_ok(std::string& err) {
+        if (gran == 0 && core::vmm::supported()) gran = core::vmm::granularity();
+        if (gran == 0) err = "the device has no virtual memory management";
+        return gran != 0;
+    }
+    uint64_t up(uint64_t b) const { return (b + gran - 1) / gran * gran; }
+    uint64_t chunk_bytes() const { return up((uint64_t) kSlotChunk * blob_bytes); }
+    int max_chunks() const { return ((kLayers - 1) * kExperts + kSlotChunk - 1) / kSlotChunk; }
+    uint8_t* slot_ptr(int i) const {
+        return slots + (uint64_t) (i / kSlotChunk) * chunk_bytes() + (uint64_t) (i % kSlotChunk) * blob_bytes;
+    }
+    uint64_t kv_bytes(const KvRange& r, int64_t positions) const {
+        return up((uint64_t) (positions / r.ratio + 1) * r.row_bytes);
+    }
+    void* kv_reserve(uint64_t row_bytes, int ratio, std::string& err) {
+        if (!vmm_ok(err)) return nullptr;
+        KvRange r;
+        r.row_bytes = row_bytes;
+        r.ratio = ratio;
+        r.va = core::vmm::reserve(kv_bytes(r, o.max_context));
+        if (r.va == nullptr) { err = "cannot reserve address space for the KV"; return nullptr; }
+        kv.push_back(r);
+        return r.va;
+    }
+    static uint64_t vram_free() {
+        size_t f = 0, t = 0;
+        cudaMemGetInfo(&f, &t);
+        return f;
+    }
+    // the KV backed for `positions` (rounded up to kKvStep); slot chunks give way when the VRAM is short, and come
+    // back when the KV shrinks
+    bool kv_fit(int64_t positions, std::string& err) {
+        const int64_t want = std::min<int64_t>((positions + kKvStep - 1) / kKvStep * kKvStep, o.max_context);
+        if (want == kv_pos) return true;
+        cudaStreamSynchronize(s);   // nothing in flight reads what is unmapped
+        if (want < kv_pos) {
+            for (KvRange& r : kv)
+                while ((uint64_t) r.pieces.size() * gran > kv_bytes(r, want)) {
+                    core::vmm::unmap(r.va + (r.pieces.size() - 1) * gran, gran, r.pieces.back());
+                    r.pieces.pop_back();
+                }
+            kv_pos = want;
+            cache_grow();
+            return true;
+        }
+        uint64_t need = 0;
+        for (const KvRange& r : kv) need += kv_bytes(r, want) - (uint64_t) r.pieces.size() * gran;
+        const uint64_t reserve = (uint64_t) o.vram_reserve_mib << 20;
+        while (n_slots > 0 && vram_free() < need + reserve) cache_shrink();
+        for (KvRange& r : kv)
+            while ((uint64_t) r.pieces.size() * gran < kv_bytes(r, want)) {
+                uint8_t* at = r.va + r.pieces.size() * gran;
+                unsigned long long h = core::vmm::map(at, gran);
+                while (h == 0 && n_slots > 0) {
+                    cache_shrink();
+                    h = core::vmm::map(at, gran);
+                }
+                if (h == 0) { err = "out of VRAM for the KV of " + std::to_string(want) + " positions"; return false; }
+                r.pieces.push_back(h);
+                cudaMemsetAsync(at, 0, gran, s);
+            }
+        kv_pos = want;
+        return true;
+    }
+    // drops the last slot chunk; its experts are read from RAM until a miss copies them in again
+    void cache_shrink() {
+        cudaStreamSynchronize(s);
+        const int from = std::max(n_slots - kSlotChunk, 0);
+        for (int i = from; i < n_slots; ++i)
+            if (owner[(size_t) i] >= 0) slot_of[(size_t) owner[(size_t) i]] = -1;
+        n_slots = from;
+        owner.resize((size_t) n_slots);
+        core::vmm::unmap(slots + (uint64_t) (chunk_h.size() - 1) * chunk_bytes(), chunk_bytes(), chunk_h.back());
+        chunk_h.pop_back();
+    }
+    // maps slot chunks while the VRAM above the reserve holds one, and fills them with the most routed uncached experts
+    void cache_grow() {
+        const uint64_t reserve = (uint64_t) o.vram_reserve_mib << 20;
+        const int from = n_slots;
+        while ((int) chunk_h.size() < max_chunks() && vram_free() > reserve + chunk_bytes()) {
+            const unsigned long long h = core::vmm::map(slots + (uint64_t) chunk_h.size() * chunk_bytes(), chunk_bytes());
+            if (h == 0) break;
+            chunk_h.push_back(h);
+        }
+        n_slots = std::min((int) chunk_h.size() * kSlotChunk, (kLayers - 1) * kExperts);
+        owner.resize((size_t) n_slots, -1);
+        if (n_slots <= from) return;
+        // by the routings so far, else the profile's, else the same share of every layer
+        auto any = [](const std::vector<float>& v) { return std::any_of(v.begin(), v.end(), [](float c) { return c > 0.f; }); };
+        const std::vector<float>& key = any(score) ? score : counts;
+        const bool have = any(key);
+        std::vector<int32_t> order;
+        for (int l = 1; l < kLayers; ++l)
+            for (int e = 0; e < kExperts; ++e)
+                if (slot_of[(size_t) (l * kExperts + e)] < 0) order.push_back(l * kExperts + e);
+        if (have)
+            std::stable_sort(order.begin(), order.end(), [&](int32_t a2, int32_t b2) { return key[a2] > key[b2]; });
+        else
+            std::stable_sort(order.begin(), order.end(), [](int32_t a2, int32_t b2) { return a2 % kExperts < b2 % kExperts; });
+        for (int i = from; i < n_slots && (size_t) (i - from) < order.size(); ++i) {
+            const int32_t idx = order[(size_t) (i - from)];
+            const int l = idx / kExperts, e = idx % kExperts;
+            cudaMemcpyAsync(slot_ptr(i), experts + layer_off[(size_t) l] + (size_t) e * blob_bytes, blob_bytes,
+                            cudaMemcpyHostToDevice, s);
+            slot_of[(size_t) idx] = i;
+            owner[(size_t) i] = idx;
+            if (score[(size_t) idx] == 0.f) score[(size_t) idx] = counts[(size_t) idx];
+        }
     }
     // the device address of layer l's expert e, copying it into a slot on a miss; `picked` ([n_picked]) are this
     // window's experts, whose slots are not given up
@@ -217,7 +320,7 @@ struct Engine::Impl {
         if (n_slots == 0) return (unsigned long long) host;
         if (slot_of[idx] >= 0) {
             ++hits;
-            return (unsigned long long) (slots + (size_t) slot_of[idx] * blob_bytes);
+            return (unsigned long long) slot_ptr(slot_of[idx]);
         }
         ++misses;
         int v = -1;
@@ -237,7 +340,7 @@ struct Engine::Impl {
         if (owner[(size_t) v] >= 0) slot_of[(size_t) owner[(size_t) v]] = -1;
         owner[(size_t) v] = (int32_t) idx;
         slot_of[idx] = v;
-        uint8_t* dst = slots + (size_t) v * blob_bytes;
+        uint8_t* dst = slot_ptr(v);
         cudaMemcpyAsync(dst, host, blob_bytes, cudaMemcpyHostToDevice, s);
         return (unsigned long long) dst;
     }
@@ -511,11 +614,16 @@ struct Engine::Impl {
                 return false;
         }
         y.cap = y.sliding ? kWindow + kMaxT : o.max_context;
-        y.ckv = dalloc<uint16_t>((size_t) y.cap * kKvRank, owned);
-        y.kpe = dalloc<uint16_t>((size_t) y.cap * kRope, owned);
+        if (y.sliding) {
+            y.ckv = dalloc<uint16_t>((size_t) y.cap * kKvRank, owned);
+            y.kpe = dalloc<uint16_t>((size_t) y.cap * kRope, owned);
+        } else {   // the whole context: reserved, backed as positions are reached (kv_fit)
+            y.ckv = (uint16_t*) kv_reserve(kKvRank * 2, 1, err);
+            y.kpe = (uint16_t*) kv_reserve(kRope * 2, 1, err);
+        }
         if (y.indexer) {
-            y.tok_keys = dalloc<float>((size_t) o.max_context * kIdxDim, owned);
-            y.grp_keys = dalloc<float>((size_t) (o.max_context / kIdxRatio + 1) * kIdxDim, owned);
+            y.tok_keys = (float*) kv_reserve(kIdxDim * 4, 1, err);
+            y.grp_keys = (float*) kv_reserve(kIdxDim * 4, kIdxRatio, err);
         }
         return y.ckv && y.kpe && (!y.indexer || (y.tok_keys && y.grp_keys));
     }
@@ -1072,7 +1180,14 @@ Engine::~Engine() {
     if (m_->df.h_dsmall) cudaFreeHost(m_->df.h_dsmall);
     if (m_->df.h_toks) cudaFreeHost(m_->df.h_toks);
     if (m_->df.h_conf) cudaFreeHost(m_->df.h_conf);
-    if (m_->slots) cudaFree(m_->slots);
+    if (m_->s) cudaStreamSynchronize(m_->s);
+    for (size_t i = m_->chunk_h.size(); i-- > 0;)
+        core::vmm::unmap(m_->slots + i * m_->chunk_bytes(), m_->chunk_bytes(), m_->chunk_h[i]);
+    if (m_->slots) core::vmm::release_range(m_->slots, m_->chunk_bytes() * (uint64_t) m_->max_chunks());
+    for (auto& r : m_->kv) {
+        for (size_t i = r.pieces.size(); i-- > 0;) core::vmm::unmap(r.va + i * m_->gran, m_->gran, r.pieces[i]);
+        core::vmm::release_range(r.va, m_->kv_bytes(r, m_->o.max_context));
+    }
     if (m_->h_eg_rows) cudaFreeHost(m_->h_eg_rows);
     if (m_->s) cudaStreamDestroy(m_->s);
     if (!m_->o.dump_dir.empty())
@@ -1130,6 +1245,9 @@ bool Engine::step_window(const int32_t* tokens, int n, int64_t pos, int32_t* pic
         return false;
     }
     // a start before the history drops the later positions: their cache rows are written again before anything reads them
+    // the KV grows with the positions; it gives VRAM back to the expert cache when a request starts far below it
+    const int64_t end = pos + n;
+    if ((end > m.kv_pos || end + 2 * Impl::kKvStep <= m.kv_pos) && !m.kv_fit(end, err)) return false;
     m.history.resize((size_t) pos);
     m.history.insert(m.history.end(), tokens, tokens + n);
     const int T = n;
