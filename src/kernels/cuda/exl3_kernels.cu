@@ -946,7 +946,8 @@ void fx_proj(int type, const uint8_t* rec0, size_t rec1, int K, int N, int nproj
 }  // namespace
 
 bool exl3_expert_supported(int type, int64_t n_embd, int64_t n_ff) noexcept {
-    return cpu::exl3_type(type) && n_embd == 2560 && n_ff == 640 && cpu::exl3_words(type) % 8 == 0;
+    return cpu::exl3_type(type) && ((n_embd == 2560 && n_ff == 640) || (n_embd == 1536 && n_ff == 1536)) &&
+           cpu::exl3_words(type) % 8 == 0;
 }
 
 void exl3_expert_grouped(const NativeExpertLayout& L, float limit, const unsigned long long* grp_ptr,
@@ -968,6 +969,18 @@ void exl3_expert_grouped(const NativeExpertLayout& L, float limit, const unsigne
     float* up = (float*) ((uint8_t*) scratch + fa);
     float* h = (float*) ((uint8_t*) scratch + 2 * fa);
     const unsigned gy = (unsigned) ((grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups);
+    if (L.n_embd == 1536) {   // 1536 x 1536 experts: K = 12 blocks (6 k groups x 2) for both projections
+        launch_proj<6, 2, 2, 1536, true>(w, dim3((unsigned) (L.n_ff / 128), gy, 2), s, grp_ptr, grp_start, n_groups,
+                                         ent_tok, nullptr, (const Q81*) x_q8_1, nullptr, gate, up, 0, L.up_off, variant);
+        check("exl3_expert_grouped/gu");
+        const long long nh = (long long) cap_entries * L.n_ff;
+        exl3_swiglu_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, grp_start, n_groups, (int) L.n_ff, limit, h);
+        check("exl3_expert_grouped/swiglu");
+        launch_proj<6, 2, 2, 1536, false>(wd, dim3((unsigned) (L.n_embd / 128), gy, 1), s, grp_ptr, grp_start, n_groups,
+                                          nullptr, ent_dst, nullptr, h, out, out, L.down_off, L.down_off, variant);
+        check("exl3_expert_grouped/down");
+        return;
+    }
     // gate and up: K = n_embd = 20 blocks (10 k groups x 2 column splits), 5 column blocks, z selects the projection
     launch_proj<10, 2, 2, 640, true>(w, dim3((unsigned) (L.n_ff / 128), gy, 2), s, grp_ptr, grp_start, n_groups,
                                      ent_tok, nullptr, (const Q81*) x_q8_1, nullptr, gate, up, 0, L.up_off, variant);
