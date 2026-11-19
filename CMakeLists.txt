@@ -1498,6 +1498,10 @@ if(BUILD_TESTING)
   target_link_libraries(pool_native_test PRIVATE kernels_cpu platform)
   basalt_cpu_test(NAME pool_native_test COMMAND pool_native_test)
   # the AVX2 i-quant rows: the madd build against the AVX-VNNI build (bitwise) and a double reference
+  add_executable(q4_0_dot_test tests/kernels/cpu/q4_0_dot_test.cpp)
+  target_link_libraries(q4_0_dot_test PRIVATE kernels_cpu platform)
+  basalt_cpu_test(NAME q4_0_dot_test COMMAND q4_0_dot_test)
+
   add_executable(iq_avx2_test tests/kernels/cpu/iq_avx2_test.cpp)
   target_link_libraries(iq_avx2_test PRIVATE kernels_cpu platform)
   basalt_cpu_test(NAME iq_avx2_test COMMAND iq_avx2_test)

@@ -22,6 +22,7 @@ extern "C" {
 
 // Ids are the GGUF tensor type numbers.
 enum ggml_type {
+    GGML_TYPE_Q4_0 = 2,
     GGML_TYPE_Q5_0 = 6,
     GGML_TYPE_Q5_1 = 7,
     GGML_TYPE_Q8_0 = 8,

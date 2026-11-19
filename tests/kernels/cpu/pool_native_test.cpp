@@ -137,7 +137,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     std::vector<Format> formats;
-    for (auto g : {std::pair<int, int>{22, 20}, {18, 20}, {21, 20}, {23, 20}, {22, 42}, {21, 42}, {42, 20}, {42, 42}, {40, 40}, {102, 102}, {103, 103}}) {
+    for (auto g : {std::pair<int, int>{22, 20}, {18, 20}, {21, 20}, {23, 20}, {22, 42}, {21, 42}, {42, 20}, {42, 42}, {40, 40}, {11, 2}, {102, 102}, {103, 103}}) {
         Format fm;
         fm.gu = g.first;
         fm.d = g.second;

@@ -56,6 +56,40 @@ void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_REST
     }
 }
 
+void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK4_0;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f, max = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            if (amax < fabsf(v)) { amax = fabsf(v); max = v; }
+        }
+        const float d  = max / -8;
+        const float id = d ? 1.0f/d : 0.0f;
+        y[i].d = GGML_FP32_TO_FP16(d);
+        for (int j = 0; j < qk/2; ++j) {
+            const uint8_t xi0 = MIN(15, (int8_t)(x[i*qk + 0    + j]*id + 8.5f));
+            const uint8_t xi1 = MIN(15, (int8_t)(x[i*qk + qk/2 + j]*id + 8.5f));
+            y[i].qs[j] = xi0 | (xi1 << 4);
+        }
+    }
+}
+
+void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK4_0;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < qk/2; ++j) {
+            y[i*qk + j       ] = ((x[i].qs[j] & 0x0F) - 8)*d;
+            y[i*qk + j + qk/2] = ((x[i].qs[j] >>   4) - 8)*d;
+        }
+    }
+}
+
 void quantize_row_q5_0_ref(const float * GGML_RESTRICT x, block_q5_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK5_0;
 
@@ -1483,6 +1517,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
 #define TYPE(id, name, blck, block, to, from) \
     [id] = {name, blck, sizeof(block), (ggml_to_float_t) (to), (ggml_from_float_t) (from)}
     TYPE(GGML_TYPE_Q2_0, "q2_0", QK2_0, block_q2_0, dequantize_row_q2_0, quantize_row_q2_0_ref),
+    TYPE(GGML_TYPE_Q4_0, "q4_0", QK4_0, block_q4_0, dequantize_row_q4_0, quantize_row_q4_0_ref),
     TYPE(GGML_TYPE_Q5_0, "q5_0", QK5_0, block_q5_0, dequantize_row_q5_0, quantize_row_q5_0_ref),
     TYPE(GGML_TYPE_Q5_1, "q5_1", QK5_1, block_q5_1, dequantize_row_q5_1, quantize_row_q5_1_ref),
     TYPE(GGML_TYPE_Q8_0, "q8_0", QK8_0, block_q8_0, dequantize_row_q8_0, quantize_row_q8_0_ref),

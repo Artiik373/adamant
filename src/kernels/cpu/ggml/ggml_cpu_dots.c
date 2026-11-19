@@ -286,7 +286,37 @@ static inline __m128i get_scale_shuffle(int i) {
     return _mm_loadu_si128((const __m128i*)k_shuffle + i);
 }
 
-static void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+static void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK8_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(qk == QK4_0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q4_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m256 d = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d));
+
+        // nibbles 0..15 shifted to -8..7
+        __m256i qx = _mm256_sub_epi8(bytes_from_nibbles_32(x[ib].qs), _mm256_set1_epi8(8));
+        __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
+
+        acc = _mm256_fmadd_ps(d, mul_sum_i8_pairs_float(qx, qy), acc);
+    }
+
+    *s = hsum_float_8(acc);
+}
+
+static void ggml_vec_dot_q5_0_q8_0(int n,float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
 
@@ -1784,6 +1814,7 @@ static void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRIC
 
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_Q2_0]    = {NULL, ggml_vec_dot_q2_0_q8_0, GGML_TYPE_Q8_0, 1},
+    [GGML_TYPE_Q4_0]    = {NULL, ggml_vec_dot_q4_0_q8_0, GGML_TYPE_Q8_0, 1},
     [GGML_TYPE_Q5_0]    = {NULL, ggml_vec_dot_q5_0_q8_0, GGML_TYPE_Q8_0, 1},
     [GGML_TYPE_Q5_1]    = {NULL, ggml_vec_dot_q5_1_q8_1, GGML_TYPE_Q8_1, 1},
     [GGML_TYPE_Q8_0]    = {quantize_row_q8_0, ggml_vec_dot_q8_0_q8_0, GGML_TYPE_Q8_0, 1},
