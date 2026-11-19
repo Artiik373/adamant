@@ -24,7 +24,8 @@ namespace cpu = basalt::kernels::cpu;
 namespace gpu = basalt::kernels;
 
 namespace {
-constexpr int T = 3, H = 2560, FF = 640;
+constexpr int T = 3;
+int H = 2560, FF = 640;   // the expert geometry: Qwen's 2560 x 640, or Hy4's 1536 x 1536
 int g_fail = 0;
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { std::printf("CUDA error %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); std::exit(2); } } while (0)
@@ -128,6 +129,12 @@ void run(int type, float limit, int variant, int dtype = -1) {
         proj(L.down_off, FF, H, h.data(), &ref[(size_t) t * H], wd);
     }
     report("grouped expert (q8_1 in)", rel(got, ref), 2e-4);
+    if (FF != 640) {   // the prompt path's kernels below are built for 2560 x 640 only
+        for (void* p : {(void*) d_blob, (void*) d_x, (void*) d_out, (void*) d_q, d_scr, (void*) d_ptr, (void*) d_start,
+                        (void*) d_ng, (void*) d_dst, (void*) d_tok})
+            cudaFree(p);
+        return;
+    }
 
     // (b) the prompt path's fp16 weights: W[row][k] . x against the CPU projections
     uint16_t *d_gu, *d_d;
@@ -371,13 +378,13 @@ void run_dense(int type, int k, int n, int variant) {
 }
 
 
-// Timing of one layer's experts as decode runs them: 10 groups of one entry each, blobs rotating through more memory
-// than the L2 holds.
-void bench(int type, bool mixed) {
+// Timing of one layer's experts as decode runs them: `groups` groups of one entry each, blobs rotating through more
+// memory than the L2 holds.
+void bench(int type, bool mixed, int groups = 10) {
     const gpu::NativeExpertLayout L = gpu::native_expert_layout(type, type, H, FF, 0.f);
     // mixed: a 3-token window as the engine sees it, 22 experts taking 29 entries
     static const int kCounts[22] = {1, 1, 2, 1, 1, 3, 1, 2, 1, 1, 1, 2, 1, 1, 3, 1, 1, 2, 1, 1, 1, 1};
-    const int G = mixed ? 22 : 10, SETS = 8;
+    const int G = mixed ? 22 : groups, SETS = 8;
     int E = 0;
     for (int i = 0; i < G; ++i) E += mixed ? kCounts[i] : 1;
     std::mt19937 rng(5);
@@ -494,6 +501,8 @@ int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
         for (const int type : {cpu::kExl3TypeBase + 6, cpu::kExl3TypeBase + 7})
             for (const bool mixed : {false, true}) bench(type, mixed);
+        H = FF = 1536;   // Hy4: 16 experts of one entry, 2.5 bits
+        bench(cpu::kExl3TypeBase + 5, false, 16);
         return 0;
     }
     for (const int type : {cpu::kExl3TypeBase + 6, cpu::kExl3TypeBase + 7})   // 3 and 3.5 bits per weight
@@ -502,6 +511,10 @@ int main(int argc, char** argv) {
     // the drafter's experts: gate/up 2 bits, down 3 bits
     for (const float limit : {0.f})
         for (int variant = 0; variant < 2; ++variant) run(cpu::kExl3TypeBase + 4, limit, variant, cpu::kExl3TypeBase + 6);
+    H = FF = 1536;   // Hy4's experts: 2.5 bits, the SwiGLU limited
+    for (int variant = 0; variant < 4; ++variant) run(cpu::kExl3TypeBase + 5, 10.f, variant);
+    H = 2560;
+    FF = 640;
     std::printf("dense projections\n");
     for (const int type : {cpu::kExl3TypeBase + 10, cpu::kExl3TypeBase + 11, cpu::kExl3TypeBase + 12, cpu::kExl3TypeBase + 14, cpu::kExl3TypeBase + 16})
         for (const auto& kn : {std::pair<int, int>{2560, 640}, {2560, 1536}, {6144, 2560}, {640, 2560}, {2560, 512}})
