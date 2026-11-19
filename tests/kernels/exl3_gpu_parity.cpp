@@ -3,6 +3,7 @@
 //   (a) native_expert_grouped (q8_1 activations): the whole expert, gate/up -> SwiGLU -> down, plain and limited
 //   (b) the prompt path's fp16 dequantizers, as matrix-vector products
 //   (c) dense projections (native_mmvq on an EXL3 type, 1..8 columns) and the dense row-sliced dequantizer
+//   (d) the grouped experts of a wide window (a prompt's), 1536 x 1536
 #include "basalt/kernels/cpu/exl3.hpp"
 #include "basalt/kernels/exl3_kernels.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
@@ -442,6 +443,175 @@ void bench(int type, bool mixed, int groups = 10) {
                 (double) L.bytes * G / 1e6, (double) L.bytes * G / (us * 1e-6) / 1e9);
 }
 
+// (d) a wide window (more entries than a decode window's): several groups of many entries, random tokens and output
+// rows, against the CPU expert on each entry
+void run_wide(int type, float limit, int variant) {
+    cpu::exl3_set_variant(variant);
+    const int w = cpu::exl3_words(type);
+    std::printf("wide type %d (%g bits) limit %g variant %d\n", type, w / 16.0, limit, variant);
+    const gpu::NativeExpertLayout L = gpu::native_expert_layout(type, type, H, FF, limit);
+    std::mt19937 rng(300u + (unsigned) variant);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    constexpr int NB = 2, NT = 48;
+    const std::vector<int> sizes = {70, 33, 1, 40};   // entries a group: more than one pass, one short, one single
+    const int G = (int) sizes.size();
+    std::vector<std::vector<uint8_t>> blobs(NB, std::vector<uint8_t>(L.bytes));
+    for (auto& blob : blobs) {
+        for (auto& b : blob) b = (uint8_t) rng();
+        auto fill = [&](size_t rec, int k, int n) {
+            cpu::Exl3Proj p = cpu::exl3_proj_at(blob.data() + rec, k, n, w);
+            for (int i = 0; i < k; ++i) ((__half*) p.suh)[i] = __float2half(nd(rng) * 0.02f);
+            for (int i = 0; i < n; ++i) ((__half*) p.svh)[i] = __float2half(nd(rng));
+        };
+        fill(0, H, FF);
+        fill(L.up_off, H, FF);
+        fill(L.down_off, FF, H);
+    }
+    std::vector<float> x((size_t) NT * H);
+    for (auto& v : x) v = nd(rng);
+    std::vector<int32_t> start(G + 1, 0), tok, dst;
+    std::vector<int> blob_of(G);
+    for (int g = 0; g < G; ++g) {
+        start[(size_t) g + 1] = start[(size_t) g] + sizes[(size_t) g];
+        blob_of[(size_t) g] = g % NB;
+    }
+    const int E = start[(size_t) G];
+    for (int e = 0; e < E; ++e) tok.push_back((int32_t) (rng() % NT));
+    for (int e = 0; e < E; ++e) dst.push_back(e);
+    std::shuffle(dst.begin(), dst.end(), rng);
+    uint8_t* d_blob[NB];
+    std::vector<unsigned long long> hp((size_t) G);
+    for (int b = 0; b < NB; ++b) {
+        CK(cudaMalloc(&d_blob[b], L.bytes));
+        CK(cudaMemcpy(d_blob[b], blobs[(size_t) b].data(), L.bytes, cudaMemcpyHostToDevice));
+    }
+    for (int g = 0; g < G; ++g) hp[(size_t) g] = (unsigned long long) d_blob[blob_of[(size_t) g]];
+    float *d_x, *d_out;
+    void *d_q, *d_scr;
+    unsigned long long* d_ptr;
+    int32_t *d_start, *d_ng, *d_dst, *d_tok;
+    CK(cudaMalloc(&d_x, x.size() * 4));
+    CK(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+    const size_t qbytes = (size_t) NT * (H / 32) * 36;
+    CK(cudaMalloc(&d_q, qbytes));
+    gpu::quantize_q8_1_rows(d_x, NT, H, d_q, nullptr);
+    CK(cudaDeviceSynchronize());
+    std::vector<uint8_t> hq(qbytes);
+    CK(cudaMemcpy(hq.data(), d_q, qbytes, cudaMemcpyDeviceToHost));
+    std::vector<float> xh((size_t) NT * H);
+    for (int t = 0; t < NT; ++t)
+        for (int b = 0; b < H / 32; ++b) {
+            const uint8_t* blk = hq.data() + ((size_t) t * (H / 32) + b) * 36;
+            __half d;
+            std::memcpy(&d, blk, 2);
+            for (int i = 0; i < 32; ++i) xh[(size_t) t * H + b * 32 + i] = __half2float(d) * (float) (int8_t) blk[4 + i];
+        }
+    CK(cudaMalloc(&d_out, (size_t) E * H * 4));
+    CK(cudaMalloc(&d_scr, gpu::native_expert_scratch_bytes(E, FF)));
+    CK(cudaMalloc(&d_ptr, G * 8));
+    CK(cudaMalloc(&d_start, (G + 1) * 4));
+    CK(cudaMalloc(&d_ng, 4));
+    CK(cudaMalloc(&d_dst, E * 4));
+    CK(cudaMalloc(&d_tok, E * 4));
+    CK(cudaMemcpy(d_ptr, hp.data(), G * 8, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_start, start.data(), (G + 1) * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_ng, &G, 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_dst, dst.data(), E * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_tok, tok.data(), E * 4, cudaMemcpyHostToDevice));
+    gpu::native_expert_grouped_clamped(L, limit, d_ptr, d_start, d_ng, d_dst, d_tok, G, E, d_q, d_scr, d_out, nullptr);
+    CK(cudaDeviceSynchronize());
+    std::vector<float> got((size_t) E * H);
+    CK(cudaMemcpy(got.data(), d_out, got.size() * 4, cudaMemcpyDeviceToHost));
+    std::vector<float> ref((size_t) E * H);
+    for (int g = 0; g < G; ++g) {
+        const uint8_t* blob = blobs[(size_t) blob_of[(size_t) g]].data();
+        auto proj = [&](size_t rec, int k, int n, const float* in, float* out) {
+            const cpu::Exl3Proj p = cpu::exl3_proj_at(blob + rec, k, n, w);
+            std::vector<float> x2((size_t) k);
+            cpu::exl3_prepare_input(in, p.suh, k, variant, x2.data());
+            cpu::exl3_rows_ref(p, x2.data(), out, 0, n, variant);
+        };
+        for (int e = start[(size_t) g]; e < start[(size_t) g + 1]; ++e) {
+            std::vector<float> gt(FF), u(FF), h(FF);
+            const float* in = &xh[(size_t) tok[(size_t) e] * H];
+            proj(0, H, FF, in, gt.data());
+            proj(L.up_off, H, FF, in, u.data());
+            for (int i = 0; i < FF; ++i) {
+                float a = gt[(size_t) i], b = u[(size_t) i];
+                if (limit > 0.f) { a = std::fmin(a, limit); b = std::fmax(std::fmin(b, limit), -limit); }
+                h[(size_t) i] = (a / (1.f + std::exp(-a))) * b;
+            }
+            proj(L.down_off, FF, H, h.data(), &ref[(size_t) dst[(size_t) e] * H]);
+        }
+    }
+    report("grouped expert, wide window", rel(got, ref), 2e-4);
+    for (void* p : {(void*) d_blob[0], (void*) d_blob[1], (void*) d_x, (void*) d_out, (void*) d_q, d_scr, (void*) d_ptr,
+                    (void*) d_start, (void*) d_ng, (void*) d_dst, (void*) d_tok})
+        cudaFree(p);
+}
+
+// Timing of a wide window as a prompt runs it: `nt` tokens of 16 experts each, out of 512, us per layer.
+void bench_wide(int type, int nt) {
+    const gpu::NativeExpertLayout L = gpu::native_expert_layout(type, type, H, FF, 10.f);
+    constexpr int NX = 512, K16 = 16;
+    std::mt19937 rng(9);
+    std::vector<uint8_t> blob(L.bytes);
+    for (auto& b : blob) b = (uint8_t) rng();
+    std::vector<uint8_t*> d_b(NX);
+    for (auto& d : d_b) { CK(cudaMalloc(&d, L.bytes)); CK(cudaMemcpy(d, blob.data(), L.bytes, cudaMemcpyHostToDevice)); }
+    std::vector<std::vector<int32_t>> by(NX);   // the tokens of each expert
+    for (int t = 0; t < nt; ++t) {
+        std::vector<int> ex(NX);
+        for (int i = 0; i < NX; ++i) ex[(size_t) i] = i;
+        std::shuffle(ex.begin(), ex.end(), rng);
+        for (int k = 0; k < K16; ++k) by[(size_t) ex[(size_t) k]].push_back(t);
+    }
+    std::vector<unsigned long long> hp;
+    std::vector<int32_t> start = {0}, tok, dst;
+    for (int x = 0; x < NX; ++x) {
+        if (by[(size_t) x].empty()) continue;
+        hp.push_back((unsigned long long) d_b[(size_t) x]);
+        for (const int32_t t : by[(size_t) x]) { tok.push_back(t); dst.push_back((int32_t) dst.size()); }
+        start.push_back((int32_t) tok.size());
+    }
+    const int G = (int) hp.size(), E = (int) tok.size();
+    unsigned long long* d_ptr;
+    int32_t *d_start, *d_ng, *d_dst, *d_tok;
+    float *d_x, *d_out;
+    void *d_q, *d_scr;
+    CK(cudaMalloc(&d_ptr, G * 8)); CK(cudaMalloc(&d_start, (G + 1) * 4)); CK(cudaMalloc(&d_ng, 4));
+    CK(cudaMalloc(&d_dst, E * 4)); CK(cudaMalloc(&d_tok, E * 4));
+    CK(cudaMemcpy(d_ptr, hp.data(), G * 8, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_start, start.data(), (G + 1) * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_ng, &G, 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_dst, dst.data(), E * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_tok, tok.data(), E * 4, cudaMemcpyHostToDevice));
+    std::vector<float> x((size_t) nt * H, 0.5f);
+    CK(cudaMalloc(&d_x, x.size() * 4)); CK(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&d_q, (size_t) nt * (H / 32) * 36));
+    gpu::quantize_q8_1_rows(d_x, nt, H, d_q, nullptr);
+    CK(cudaMalloc(&d_out, (size_t) E * H * 4));
+    CK(cudaMalloc(&d_scr, gpu::native_expert_scratch_bytes(E, FF)));
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+    auto once = [&] { gpu::native_expert_grouped_clamped(L, 10.f, d_ptr, d_start, d_ng, d_dst, d_tok, G, E, d_q, d_scr, d_out, nullptr); };
+    once();
+    CK(cudaDeviceSynchronize());
+    constexpr int IT = 10;
+    CK(cudaEventRecord(e0));
+    for (int i = 0; i < IT; ++i) once();
+    CK(cudaEventRecord(e1));
+    CK(cudaEventSynchronize(e1));
+    float ms = 0;
+    CK(cudaEventElapsedTime(&ms, e0, e1));
+    const double us = ms * 1e3 / IT;
+    std::printf("bench wide type %d: %.0f us per layer (%d tokens, %d experts, %d entries) = %.0f tokens/s a layer\n", type, us,
+                nt, G, E, nt / (us * 1e-6));
+    for (auto* d : d_b) cudaFree(d);
+    for (void* p : {(void*) d_ptr, (void*) d_start, (void*) d_ng, (void*) d_dst, (void*) d_tok, (void*) d_x, (void*) d_out, d_q, d_scr})
+        cudaFree(p);
+}
+
 // Timing of dense projections as decode runs them (weights rotate through more memory than L2 holds), us per call.
 void bench_dense() {
     struct Shape { const char* what; int k, n; };
@@ -503,6 +673,7 @@ int main(int argc, char** argv) {
             for (const bool mixed : {false, true}) bench(type, mixed);
         H = FF = 1536;   // Hy4: 16 experts of one entry, 2.5 bits
         bench(cpu::kExl3TypeBase + 5, false, 16);
+        bench_wide(cpu::kExl3TypeBase + 5, 2048);
         return 0;
     }
     for (const int type : {cpu::kExl3TypeBase + 6, cpu::kExl3TypeBase + 7})   // 3 and 3.5 bits per weight
@@ -513,6 +684,8 @@ int main(int argc, char** argv) {
         for (int variant = 0; variant < 2; ++variant) run(cpu::kExl3TypeBase + 4, limit, variant, cpu::kExl3TypeBase + 6);
     H = FF = 1536;   // Hy4's experts: 2.5 bits, the SwiGLU limited
     for (int variant = 0; variant < 4; ++variant) run(cpu::kExl3TypeBase + 5, 10.f, variant);
+    for (int variant = 0; variant < 4; ++variant) run_wide(cpu::kExl3TypeBase + 5, 10.f, variant);
+    run_wide(cpu::kExl3TypeBase + 5, 0.f, 0);
     H = 2560;
     FF = 640;
     std::printf("dense projections\n");

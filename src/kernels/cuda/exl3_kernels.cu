@@ -23,6 +23,7 @@ namespace basalt::kernels {
 namespace {
 
 constexpr int kE = 3;   // entries a pass decodes the weights for
+constexpr int kWideEntries = 128;   // more entries than a decode window's take the wide kernel
 
 struct Q81 {            // ggml's block_q8_1
     __half d, s;
@@ -250,6 +251,221 @@ exl3_proj_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* 
             }
             __syncthreads();
         }
+    }
+}
+
+// The grouped experts of a wide window (a prompt's): a CTA takes one group's entries kWM at a time and 128 output
+// columns, decoding each weight tile once for them. The inputs of a k block are transformed into shared memory as fp16
+// hi + lo pairs (the decode kernel's exact products), one m16n8k16 product for each part into the same fp32 sums.
+//   GU: gate (rec0) and up (rec1) of q8_1 token rows ent_src[e], the SwiGLU fused: y row e = h. Otherwise down of the
+//   float rows xf[e], y row out_rows[e].
+constexpr int kWM = 32;     // entries a pass
+constexpr int kWPad = 136;  // smem row pitch in halves: conflict-free ldmatrix
+
+template <int K, int N, bool GU, int KA, bool HALF>
+__global__ void __launch_bounds__(256) exl3_wide_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                        const int32_t* __restrict__ grp_start,
+                                                        const int32_t* __restrict__ n_groups,
+                                                        const int32_t* __restrict__ ent_src,
+                                                        const int32_t* __restrict__ out_rows, const Q81* __restrict__ xq,
+                                                        const float* __restrict__ xf, float* __restrict__ y, int w_arg,
+                                                        size_t rec0, size_t rec1, int variant, float limit) {
+    constexpr int P = GU ? 2 : 1;
+    __shared__ __align__(16) __half As[P][2][kWM * kWPad];   // [projection][hi, lo][row][k]
+    float* stage = (float*) &As[0][0][0];                     // [P][kWM][128] after the k loop
+    static_assert(sizeof(As) >= (size_t) P * kWM * 128 * 4, "stage fits");
+    const int w = KA > 0 ? 16 * KA + (HALF ? 8 : 0) : w_arg;
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nb = blockIdx.x;
+    const int nw32 = w / 2;
+    const Exl3Lane geo = exl3_lane(w, lane);
+    int widx[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) widx[i] = geo.wb + i >= nw32 ? geo.wb + i - nw32 : geo.wb + i;
+    const size_t tb = (size_t) (K / 16) * (size_t) (N / 16) * (size_t) w * 2;
+    const uint32_t as_base = (uint32_t) __cvta_generic_to_shared(&As[0][0][0]);
+    const int a_row = (lane & 7) + ((lane >> 3) & 1) * 8, a_col = (lane >> 4) * 8;
+    const int ng = *n_groups;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* rec[P];
+        rec[0] = (const uint8_t*) grp_ptr[g] + rec0;
+        if (GU) rec[P - 1] = (const uint8_t*) grp_ptr[g] + rec1;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int base = e0; base < e1; base += kWM) {
+            const int ne = e1 - base < kWM ? e1 - base : kWM;
+            float acc[P][2][2][4];
+#pragma unroll
+            for (int p = 0; p < P; ++p)
+#pragma unroll
+                for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h)
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) acc[p][mt][h][i] = 0.f;
+#pragma unroll 1
+            for (int kb = 0; kb < K / 128; ++kb) {
+                __syncthreads();   // the previous k block's fragments are read
+                // rows wid * 4 .. + 3 of the pass: the input transform of this k block, per projection
+                for (int i = 0; i < 4; ++i) {
+                    const int r = wid * 4 + i;
+                    float x0[4] = {0.f, 0.f, 0.f, 0.f};
+                    if (r < ne) {
+                        if (GU) {
+                            const Q81* blk = xq + (size_t) ent_src[base + r] * (K / 32) + kb * 4 + (lane >> 3);
+                            const int q = *(const int*) (blk->qs + (lane & 7) * 4);
+                            const float d = __half2float(blk->d);
+                            x0[0] = d * (float) (int8_t) (q & 255);
+                            x0[1] = d * (float) (int8_t) ((q >> 8) & 255);
+                            x0[2] = d * (float) (int8_t) ((q >> 16) & 255);
+                            x0[3] = d * (float) (int8_t) ((q >> 24) & 255);
+                        } else {
+                            const float4 f = *(const float4*) (xf + (size_t) (base + r) * K + kb * 128 + lane * 4);
+                            x0[0] = f.x; x0[1] = f.y; x0[2] = f.z; x0[3] = f.w;
+                        }
+                    }
+#pragma unroll
+                    for (int p = 0; p < P; ++p) {
+                        const __half* suh = (const __half*) (rec[p] + tb);
+                        float v[4], sg[4];
+#pragma unroll
+                        for (int m = 0; m < 4; ++m) {
+                            v[m] = x0[m];
+                            sg[m] = __half2float(suh[kb * 128 + lane * 4 + m]);
+                        }
+                        if (!(variant & 1))
+#pragma unroll
+                            for (int m = 0; m < 4; ++m) v[m] *= sg[m];
+                        had128(v);
+                        if (variant & 1)
+#pragma unroll
+                            for (int m = 0; m < 4; ++m) v[m] *= sg[m];
+                        __half2 hi[2], lo[2];
+#pragma unroll
+                        for (int q = 0; q < 2; ++q) {
+                            hi[q] = __floats2half2_rn(v[2 * q], v[2 * q + 1]);
+                            const float2 back = __half22float2(hi[q]);
+                            lo[q] = __floats2half2_rn(v[2 * q] - back.x, v[2 * q + 1] - back.y);
+                        }
+                        *(uint2*) &As[p][0][r * kWPad + lane * 4] = *(const uint2*) hi;
+                        *(uint2*) &As[p][1][r * kWPad + lane * 4] = *(const uint2*) lo;
+                    }
+                }
+                __syncthreads();
+#pragma unroll
+                for (int p = 0; p < P; ++p) {
+                    const uint32_t* tile0 = (const uint32_t*) (rec[p] + ((size_t) (kb * 8) * (size_t) (N / 16) +
+                                                                         (size_t) (nb * 8 + wid)) * (size_t) w * 2);
+                    uint32_t xt[8][4];
+#pragma unroll
+                    for (int kt = 0; kt < 8; ++kt)
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) xt[kt][i] = __ldg(tile0 + kt * (N / 16) * w / 2 + widx[i]);
+#pragma unroll
+                    for (int kt = 0; kt < 8; ++kt) {
+                        uint32_t yw[4];
+                        if constexpr (KA > 0) exl3_shift4(xt[kt], geo.pos[0], yw);
+                        __half code[8];
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            uint32_t win;
+                            if constexpr (KA > 0) win = exl3_win_ct<KA, HALF>(yw, j);
+                            else win = exl3_window(xt[kt], geo.pos[j]);
+                            code[j] = __float2half_rn(exl3_code_f(win));
+                        }
+                        uint32_t b[2][2];
+#pragma unroll
+                        for (int h = 0; h < 2; ++h)
+#pragma unroll
+                            for (int r = 0; r < 2; ++r) {
+                                const __half2 pr = __halves2half2(code[h * 4 + r * 2], code[h * 4 + r * 2 + 1]);
+                                b[h][r] = *(const uint32_t*) &pr;
+                            }
+#pragma unroll
+                        for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+                            for (int hl = 0; hl < 2; ++hl) {
+                                uint32_t a[4];
+                                const uint32_t addr = as_base + (uint32_t) (((p * 2 + hl) * kWM * kWPad +
+                                                                             (mt * 16 + a_row) * kWPad + kt * 16 + a_col) * 2);
+                                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                                             : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(addr));
+                                fx_mma(acc[p][mt][0], a, b[0][0], b[0][1]);
+                                fx_mma(acc[p][mt][1], a, b[1][0], b[1][1]);
+                            }
+                    }
+                }
+            }
+            __syncthreads();
+#pragma unroll
+            for (int p = 0; p < P; ++p)
+#pragma unroll
+                for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const int c = wid * 16 + h * 8 + 2 * (lane & 3), ra = mt * 16 + (lane >> 2);
+                        *(float2*) &stage[(p * kWM + ra) * 128 + c] = make_float2(acc[p][mt][h][0], acc[p][mt][h][1]);
+                        *(float2*) &stage[(p * kWM + ra + 8) * 128 + c] = make_float2(acc[p][mt][h][2], acc[p][mt][h][3]);
+                    }
+            __syncthreads();
+            // the output transform of each row, the SwiGLU (GU), the store
+            for (int i = 0; i < 4; ++i) {
+                const int r = wid * 4 + i;
+                if (r >= ne) break;
+                float o[P][4];
+#pragma unroll
+                for (int p = 0; p < P; ++p) {
+                    const __half* svh = (const __half*) (rec[p] + tb) + K;
+                    float v[4], sv[4];
+#pragma unroll
+                    for (int m = 0; m < 4; ++m) {
+                        v[m] = stage[(p * kWM + r) * 128 + lane * 4 + m] * exl3_code_scale();
+                        sv[m] = __half2float(svh[nb * 128 + lane * 4 + m]);
+                    }
+                    if (variant & 2)
+#pragma unroll
+                        for (int m = 0; m < 4; ++m) v[m] *= sv[m];
+                    had128(v);
+                    if (!(variant & 2))
+#pragma unroll
+                        for (int m = 0; m < 4; ++m) v[m] *= sv[m];
+#pragma unroll
+                    for (int m = 0; m < 4; ++m) o[p][m] = v[m];
+                }
+                if constexpr (GU) {
+                    float hv[4];
+#pragma unroll
+                    for (int m = 0; m < 4; ++m) {
+                        float gt = o[0][m], u = o[P - 1][m];
+                        if (limit > 0.0f) {
+                            gt = fminf(gt, limit);
+                            u = fmaxf(fminf(u, limit), -limit);
+                        }
+                        hv[m] = __fmul_rn(gt / (1.0f + expf(-gt)), u);
+                    }
+                    *(float4*) (y + (size_t) (base + r) * N + nb * 128 + lane * 4) = make_float4(hv[0], hv[1], hv[2], hv[3]);
+                } else {
+                    *(float4*) (y + (size_t) out_rows[base + r] * N + nb * 128 + lane * 4) =
+                        make_float4(o[0][0], o[0][1], o[0][2], o[0][3]);
+                }
+            }
+        }
+    }
+}
+
+template <int K, int N, bool GU>
+void launch_wide(int w, dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                 const int32_t* n_groups, const int32_t* ent_src, const int32_t* out_rows, const Q81* xq,
+                 const float* xf, float* y, size_t rec0, size_t rec1, int variant, float limit) {
+    switch (w) {
+#define EXL3_WIDE(W, KA, HALF) case W: exl3_wide_kernel<K, N, GU, KA, HALF><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_src, out_rows, xq, xf, y, w, rec0, rec1, variant, limit); break;
+    EXL3_WIDE(32, 2, false)
+    EXL3_WIDE(40, 2, true)
+    EXL3_WIDE(48, 3, false)
+    EXL3_WIDE(56, 3, true)
+    EXL3_WIDE(64, 4, false)
+#undef EXL3_WIDE
+    default:
+        exl3_wide_kernel<K, N, GU, 0, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_src, out_rows, xq, xf,
+                                                                 y, w, rec0, rec1, variant, limit);
     }
 }
 
@@ -970,6 +1186,16 @@ void exl3_expert_grouped(const NativeExpertLayout& L, float limit, const unsigne
     float* up = (float*) ((uint8_t*) scratch + fa);
     float* h = (float*) ((uint8_t*) scratch + 2 * fa);
     const unsigned gy = (unsigned) ((grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups);
+    if (L.n_embd == 1536 && cap_entries > kWideEntries) {   // a wide window: each weight tile decoded once a pass
+        const unsigned gw = (unsigned) std::min<int64_t>(gy, 1024);
+        launch_wide<1536, 1536, true>(w, dim3((unsigned) (L.n_ff / 128), gw), s, grp_ptr, grp_start, n_groups, ent_tok,
+                                      nullptr, (const Q81*) x_q8_1, nullptr, h, 0, L.up_off, variant, limit);
+        check("exl3_expert_grouped/wide gu");
+        launch_wide<1536, 1536, false>(wd, dim3((unsigned) (L.n_embd / 128), gw), s, grp_ptr, grp_start, n_groups,
+                                       nullptr, ent_dst, nullptr, h, out, L.down_off, 0, variant, 0.0f);
+        check("exl3_expert_grouped/wide down");
+        return;
+    }
     if (L.n_embd == 1536) {   // 1536 x 1536 experts: K = 12 blocks (6 k groups x 2) for both projections
         launch_proj<6, 2, 2, 1536, true>(w, dim3((unsigned) (L.n_ff / 128), gy, 2), s, grp_ptr, grp_start, n_groups,
                                          ent_tok, nullptr, (const Q81*) x_q8_1, nullptr, gate, up, 0, L.up_off, variant);
