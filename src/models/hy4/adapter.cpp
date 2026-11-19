@@ -103,8 +103,13 @@ SampleResult sample_row(const float* logits, const Sampling& s, std::mt19937_64&
     std::vector<std::pair<float, int32_t>> c;
     for (int32_t i = 0; i < kVocab; ++i)
         if (logits[i] >= floor) c.push_back({(logits[i] - mx) / s.temperature, i});
-    std::sort(c.begin(), c.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-    if (s.top_k > 0 && (size_t) s.top_k < c.size()) c.resize((size_t) s.top_k);
+    auto desc = [](const auto& a, const auto& b) { return a.first > b.first; };
+    if (s.top_k > 0 && (size_t) s.top_k < c.size()) {
+        std::nth_element(c.begin(), c.begin() + s.top_k, c.end(), desc);
+        c.resize((size_t) s.top_k);
+    }
+    // the order matters only to the min-p and top-p cuts
+    if (s.top_p < 1.f || s.min_p > 0.f) std::sort(c.begin(), c.end(), desc);
     double sum = 0;
     for (auto& e : c) sum += (e.first = std::exp(e.first));
     size_t keep = c.size();
@@ -358,7 +363,8 @@ public:
         eo.vram_reserve_mib = ho.vram_reserve_mib;
         eo.trunk_type = ho.trunk_type;
         eo.dfly = ho.dfly;
-        if (!ho.expert_profile.empty()) eo.expert_profile = ho.expert_profile;
+        // its own routing counts beside the pack: a shared --expert-profile names another model's file
+        eo.expert_profile = ho.model + ".prof";
         Engine eng;
         std::string err;
         const auto t0 = Clock::now();
