@@ -325,6 +325,7 @@ add_library(tiers STATIC src/core/expert_source.cpp src/core/expert_cache.cpp sr
 target_include_directories(tiers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(tiers PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
 include(src/models/qwen4exp/qwen4exp.cmake)
+include(src/models/hy4/hy4.cmake)
 if(BUILD_TESTING)
   add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)
   target_link_libraries(file_expert_source_test PRIVATE model_qwen4exp_engine)
