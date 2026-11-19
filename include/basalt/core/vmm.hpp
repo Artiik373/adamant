@@ -20,6 +20,13 @@ uint64_t host_granularity();
 /// Returns the padded mapping size for free_host; no portable registration is involved.
 uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped);
 void free_host(uint8_t* ptr, uint64_t mapped);
+/// The size of the separate physical pieces alloc_host maps; offsets and sizes below are piece-aligned.
+uint64_t host_piece_bytes();
+/// Gives the physical memory of [ptr + off, ptr + off + bytes) of an alloc_host range back; the addresses stay reserved
+/// and must not be touched until map_host_piece backs them again.  The caller has made sure nothing reads them.
+bool unmap_host_piece(uint8_t* ptr, uint64_t off, uint64_t bytes);
+/// Backs a range unmap_host_piece gave back with new pinned memory (contents undefined).
+bool map_host_piece(uint8_t* ptr, uint64_t off, uint64_t bytes);
 /// Reserves `bytes` of address space (a multiple of the granularity); null on failure.
 uint8_t* reserve(uint64_t bytes);
 void release_range(uint8_t* va, uint64_t bytes);

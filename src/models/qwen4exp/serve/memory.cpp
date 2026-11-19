@@ -99,6 +99,18 @@ size_t QfnRuntime::release_loan_homes(const char* why) {
     return released;
 }
 
+// Nothing reads the RAM copy: the verify commit, the adaptive swaps in flight and the exchange queue are done and the GPU
+// is idle (a window boundary or between requests).  A prompt's loan out or a peer card's tier keep it busy.
+bool QfnRuntime::ram_idle_point() {
+    if (peer.valid()) return false;
+    for (const PfPart& p : pf_parts)
+        if (!p.lent.empty()) return false;
+    std::string e;
+    if (!ver.wait_commit(e)) return false;
+    apply_pending(true);
+    return xq_drain() && cudaDeviceSynchronize() == cudaSuccess;
+}
+
 // `for_sleep` (SLEEP and WAKE): the cache goes to its smallest size and comes back to the same placement, with no
 // request between the two, so neither --vram-elastic (any segmented cache does) nor a peer card's tier stands in
 // the way

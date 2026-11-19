@@ -6,6 +6,7 @@
 
 #include "basalt/core/pinned.hpp"
 #include "basalt/core/ram_load.hpp"
+#include "basalt/core/vmm.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/direct_file.hpp"
 #include "basalt/platform/memory.hpp"
@@ -511,6 +512,8 @@ void FileExpertSource::close() {
     staged_.clear();
     exchanges_ = 0;
     spare_free_.clear();
+    ram_pieces_.clear();
+    ram_piece_bytes_ = 0;
     file_reads_.store(0);
     complement_arena_ = nullptr;
     complement_host_ = nullptr;
@@ -1166,6 +1169,12 @@ bool FileExpertSource::pin_cache_complement(
                          (long long) spare_free_.size(), spare_sizes.size(), (double) (at - spare_at) / 1048576.0);
     }
     complement_ready_ = true;
+    ram_pieces_.clear();
+    ram_piece_bytes_ = 0;
+    if (complement_allocation_.allocation_pinned() && complement_host_ == complement_allocation_.data()) {
+        ram_piece_bytes_ = vmm::host_piece_bytes();
+        ram_pieces_.resize((size_t) ((complement_allocation_.capacity() + ram_piece_bytes_ - 1) / ram_piece_bytes_));
+    }
     // The GPU cache's experts are not in the complement: refilling a lent slot reads them through the view again.
     basalt::platform::ram_guard_reclaim_view(base_, mapped_bytes_);
     basalt::log::info("basalt", "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s",
@@ -1356,6 +1365,93 @@ uint64_t FileExpertSource::homes_bytes() const {
     uint64_t n = 0;
     for (const auto& r : homes_) n += r.bytes;
     return n;
+}
+
+bool FileExpertSource::ram_can_give_back() const {
+    return complement_ready_ && !ram_pieces_.empty() && !ram_pieces_.front().out && staged_.empty() &&
+           homes_pending_.empty() && !exchange_live();
+}
+
+uint64_t FileExpertSource::ram_given_back() const {
+    uint64_t n = 0;
+    for (size_t k = 0; k < ram_pieces_.size(); ++k)
+        if (ram_pieces_[k].out) n += std::min(ram_piece_bytes_, complement_allocation_.capacity() - k * ram_piece_bytes_);
+    return n;
+}
+
+uint64_t FileExpertSource::ram_give_back(uint64_t want) {
+    uint64_t freed = 0;
+    uint8_t* base = complement_allocation_.data();
+    while (freed < want && ram_can_give_back()) {
+        size_t k = ram_pieces_.size();
+        while (k > 0 && ram_pieces_[k - 1].out) --k;   // the highest piece still held
+        if (k == 0) break;
+        --k;
+        RamPiece& piece = ram_pieces_[k];
+        const uint64_t lo = k * ram_piece_bytes_, bytes = std::min(ram_piece_bytes_, complement_allocation_.capacity() - lo),
+                       hi = lo + bytes;
+        // every expert touching the piece leaves for the file; one spanning the piece below is recorded here, and the
+        // bottom-up take-back maps that piece first
+        for (size_t i = 0; i < complement_offsets_.size(); ++i) {
+            const uint64_t off = complement_offsets_[i];
+            if (off >= complement_bytes_) continue;   // the top-up and homes regions are separate allocations
+            if (off < hi && off + layer_blob_bytes_[i / (size_t) n_expert_] > lo) {
+                piece.experts.emplace_back(i, off);
+                complement_offsets_[i] = kNoComplement;
+            }
+        }
+        for (size_t j = spare_free_.size(); j-- > 0;)
+            if (spare_free_[j].first < hi && spare_free_[j].first + spare_free_[j].second > lo &&
+                spare_free_[j].first < complement_bytes_) {
+                piece.spares.push_back(spare_free_[j]);
+                spare_free_[j] = spare_free_.back();
+                spare_free_.pop_back();
+            }
+        ++places_gen_;
+        if (!vmm::unmap_host_piece(base, lo, bytes)) {
+            // still mapped: the experts stay valid where they are
+            for (const auto& [i, off] : piece.experts) complement_offsets_[i] = off;
+            spare_free_.insert(spare_free_.end(), piece.spares.begin(), piece.spares.end());
+            piece.experts.clear();
+            piece.spares.clear();
+            basalt::log::warn("basalt", "RAM give-back: unmapping %.0f MiB at %.2f GiB failed", bytes / 1048576.0,
+                              lo / 1073741824.0);
+            break;
+        }
+        piece.out = true;
+        freed += bytes;
+    }
+    return freed;
+}
+
+uint64_t FileExpertSource::ram_take_back(uint64_t budget) {
+    if (!complement_ready_ || !staged_.empty() || exchange_live()) return 0;
+    size_t k = 0;
+    while (k < ram_pieces_.size() && !ram_pieces_[k].out) ++k;
+    if (k == ram_pieces_.size()) return 0;
+    RamPiece& piece = ram_pieces_[k];
+    uint8_t* base = complement_allocation_.data();
+    const uint64_t lo = k * ram_piece_bytes_, bytes = std::min(ram_piece_bytes_, complement_allocation_.capacity() - lo);
+    if (bytes > budget || !vmm::map_host_piece(base, lo, bytes)) return 0;
+    std::vector<std::pair<int32_t, int32_t>> ahead;
+    ahead.reserve(piece.experts.size());
+    for (const auto& [i, off] : piece.experts)
+        ahead.emplace_back((int32_t) (i / (size_t) n_expert_), (int32_t) (i % (size_t) n_expert_));
+    (void) advise_pairs(ahead.data(), (int64_t) ahead.size());
+    for (const auto& [i, off] : piece.experts) {
+        const int64_t layer = (int64_t) (i / (size_t) n_expert_), expert = (int64_t) (i % (size_t) n_expert_);
+        // shortcut: an expert the cache moved into a slot meanwhile keeps that slot and gets its RAM copy back too
+        if (complement_offsets_[i] == kNoComplement && copy_from_files(layer, expert, base + off))
+            complement_offsets_[i] = off;
+        else
+            spare_free_.emplace_back(off, layer_blob_bytes_[(size_t) layer]);   // the place stays usable for swaps
+    }
+    spare_free_.insert(spare_free_.end(), piece.spares.begin(), piece.spares.end());
+    piece.experts.clear();
+    piece.spares.clear();
+    piece.out = false;
+    ++places_gen_;
+    return bytes;
 }
 
 uint64_t FileExpertSource::top_up(const std::vector<std::pair<int32_t, int32_t>>& rank,

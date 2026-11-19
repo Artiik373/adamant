@@ -181,6 +181,7 @@ Flow Request::decode_loop(B& b) {
         b.mark_loop_end();
         if (eos) { finish = "stop"; break; }
         b.shed_low();
+        runtime_.ram_balance(false);
         if (runtime_.halted()) { finish = "cancel"; break; }
         x = outv[(size_t) keep - 1];
         p += keep;

@@ -84,6 +84,7 @@ int Runtime::next_line_within(std::string& out, int ms) {
 bool Runtime::halted() {
     if (stop_req.load() || stdin_lost.load()) return true;
     if (basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Critical) return false;
+    if (ram_can_give_back()) return false;   // the next window boundary gives experts back instead
     ram_stop.store(true);
     return true;
 }

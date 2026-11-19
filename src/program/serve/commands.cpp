@@ -53,13 +53,19 @@ Flow Runtime::dispatch() {
             const int r = next_line_within(line, 1000);
             if (r < 0) { basalt::log::info("basalt serve", "input pipe closed"); return Flow::quit; }
             got = r == 1;
+            if (!got) ram_balance(true);
             while (!got && !(got = try_next_line(line)) && disk.enabled() && spill_to_disk(false, 1) > 0) {}
             if (got) break;
             parking = parking && park_idle_engine(pe);
             if (!pe.empty()) { std::printf("ERR %s\n", pe.c_str()); return Flow::error; }
             if (!parking) break;
         }
-        if (!got && !next_line(line)) { basalt::log::info("basalt serve", "input pipe closed"); return Flow::quit; }
+        while (!got) {   // a second at a time, so the experts' RAM follows the system's while no request comes
+            const int r = next_line_within(line, 1000);
+            if (r < 0) { basalt::log::info("basalt serve", "input pipe closed"); return Flow::quit; }
+            got = r == 1;
+            if (!got) ram_balance(true);
+        }
     }
     // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
     // request's prompt and first token as a GEN 1, then continues it in that slot

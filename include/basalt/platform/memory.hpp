@@ -205,6 +205,11 @@ uint64_t ram_guard_drops();
 /// Pauses the guard (`paused`): its readings are not judged, and the level stays the last one judged; for a sleeping
 /// engine, whose GPU state the driver holds in RAM until the wake. Unpausing judges a fresh reading before it returns.
 void ram_guard_pause(bool paused);
+/// Judges a fresh reading now (not while paused or before the guard started): after the engine gave RAM back.
+void ram_guard_judge_now();
+/// Gives the registered view (ram_guard_reclaim_view) back now and judges again: before the engine gives its own RAM
+/// copy away, the file pages it reads go first.  Nothing to do where the OS counts file pages as available (Linux).
+void ram_guard_reclaim_view_now();
 /// Hands the heap's free pages back to the OS (best effort).
 void release_free_heap();
 /// A mapped file view the guard gives back (drop_mapped_view) when a reading comes within 1 GiB of its floor, then

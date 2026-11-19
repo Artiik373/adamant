@@ -88,7 +88,7 @@ uint64_t granularity() {
 
 namespace {
 // Separate backing allocations avoid the driver's single-allocation limit while preserving one address range.
-constexpr uint64_t kHostPieceBytes = 2ull << 30;
+constexpr uint64_t kHostPieceBytes = 512ull << 20;
 
 bool host_prop(CUmemAllocationProp& prop, size_t& g) {
     const Fns& v = fns();
@@ -101,6 +101,37 @@ bool host_prop(CUmemAllocationProp& prop, size_t& g) {
     prop.location = {CU_MEM_LOCATION_TYPE_HOST_NUMA, node < 0 ? 0 : node};
     return v.granularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) == CUDA_SUCCESS && g;
 }
+
+// Backs [p + off, p + off + piece) with a new pinned host allocation readable by the CPU and `dev`; the failing step or null.
+const char* map_host(CUdeviceptr p, uint64_t off, uint64_t piece, const CUmemAllocationProp& prop, int dev, CUresult& error) {
+    const Fns& v = fns();
+    CUmemGenericAllocationHandle h;
+    error = v.create(&h, piece, &prop, 0);
+    if (error != CUDA_SUCCESS) return "create";
+    error = v.map(p + off, piece, 0, h, 0);
+    v.release(h);   // a successful mapping owns the physical allocation
+    if (error != CUDA_SUCCESS) return "map";
+    CUmemAccessDesc a[] = {{prop.location, CU_MEM_ACCESS_FLAGS_PROT_READWRITE},
+        {{CU_MEM_LOCATION_TYPE_DEVICE, dev}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}};
+    error = v.set_access(p + off, piece, a, 2);
+    if (error == CUDA_SUCCESS) return nullptr;
+    v.unmap(p + off, piece);
+    return "access";
+}
+}
+
+uint64_t host_piece_bytes() { return kHostPieceBytes; }
+
+bool unmap_host_piece(uint8_t* ptr, uint64_t off, uint64_t bytes) {
+    return ptr != nullptr && fns().unmap(reinterpret_cast<CUdeviceptr>(ptr) + off, bytes) == CUDA_SUCCESS;
+}
+
+bool map_host_piece(uint8_t* ptr, uint64_t off, uint64_t bytes) {
+    CUmemAllocationProp prop{};
+    size_t g = 0;
+    CUresult error = CUDA_SUCCESS;
+    return ptr != nullptr && host_prop(prop, g) &&
+           map_host(reinterpret_cast<CUdeviceptr>(ptr), off, bytes, prop, current_device(), error) == nullptr;
 }
 
 uint64_t host_granularity() {
@@ -128,22 +159,8 @@ uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped) {
     uint64_t off = 0;
     for (; off < n;) {
         const uint64_t piece = std::min<uint64_t>(kHostPieceBytes, n - off);
-        CUmemGenericAllocationHandle h;
-        const char* op = "create";
-        error = v.create(&h, piece, &prop, 0);
-        if (error == CUDA_SUCCESS) {
-            op = "map";
-            error = v.map(p + off, piece, 0, h, 0);
-            v.release(h);   // a successful mapping owns the physical allocation
-            if (error == CUDA_SUCCESS) {
-                CUmemAccessDesc a[] = {{prop.location, CU_MEM_ACCESS_FLAGS_PROT_READWRITE},
-                    {{CU_MEM_LOCATION_TYPE_DEVICE, dev}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}};
-                op = "access";
-                error = v.set_access(p + off, piece, a, 2);
-                if (error == CUDA_SUCCESS) { off += piece; continue; }
-                v.unmap(p + off, piece);
-            }
-        }
+        const char* op = map_host(p, off, piece, prop, dev, error);
+        if (op == nullptr) { off += piece; continue; }
         refused(op, error, off);
         for (uint64_t at = 0; at < off; at += kHostPieceBytes)
             v.unmap(p + at, std::min<uint64_t>(kHostPieceBytes, off - at));

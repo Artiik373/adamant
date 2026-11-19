@@ -76,7 +76,12 @@ Basalt refuses settings that would leave the machine without memory, and never s
   those experts, at least 4 GiB. Programs left idle beside a small reserve may be swapped out.
 - While serving, the RAM guard holds the reserve: below it, it parks conversations to disk or drops them. A request waits up to 30 s
   for RAM to return. A running request stops with an error only when RAM is critical (under 1 GiB free, or below the reserve under
-  memory pressure). `--ram-reserve-mib 0` turns the guard off.
+  memory pressure) and the experts have no RAM left to give back. `--ram-reserve-mib 0` turns the guard off.
+- Where the experts' RAM copy is host-VMM memory (Windows), the engine gives it back in 512 MiB pieces when RAM falls below the
+  reserve, at the next decode window or prompt chunk, aiming at 1 GiB above the reserve: those experts are then read from the
+  model file. It takes the pieces back between requests once 2 GiB above the reserve stay free and 30 s have passed since the
+  last give-back. The log says `RAM guard: N MiB of experts given back` and `... taken back into RAM`. On Linux the copy is one
+  registered range and a critical request stops as before.
 - Experts on the SSD give one warning, the same for every model: `N experts on SSD (X GiB) · free X GiB RAM`. The console
   repeats it and the stats page turns its Experts block amber.
 - The disk tier keeps its floor a GiB above the reserve.

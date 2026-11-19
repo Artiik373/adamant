@@ -454,6 +454,17 @@ void ram_guard_pause(bool paused) {
     if (g_guard_paused.exchange(false) && g_guard_on.load()) guard_judge(available_memory());
 }
 
+void ram_guard_judge_now() {
+    if (g_guard_on.load() && !g_guard_paused.load()) guard_judge(available_memory());
+}
+
+void ram_guard_reclaim_view_now() {
+#if defined(_WIN32)
+    reclaim_view_now();
+#endif
+    ram_guard_judge_now();
+}
+
 #if defined(_WIN32)
 namespace {
 constexpr uint64_t kPrefetchStep = 128ull << 10;

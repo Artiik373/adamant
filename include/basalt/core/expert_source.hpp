@@ -327,6 +327,17 @@ public:
     bool repin_finish(std::string& err);
     /// Lend-region slots whose experts the compact copy holds (the last ones of the cache).
     int64_t resident_lent_slots() const { return complement_lent_slots_; }
+    /// RAM given back to the system under memory pressure: the RAM copy is host-VMM pieces, and a piece given back
+    /// leaves its experts to the mapped file until it is taken back (read again from the file).  Pieces go from the top
+    /// of the copy down and come back bottom up.  Main thread only, with no pool, exchange or GPU work reading the
+    /// copy (between windows or requests).
+    bool ram_can_give_back() const;
+    /// Gives back pieces until `want` bytes are freed or none is left; returns the bytes freed.
+    uint64_t ram_give_back(uint64_t want);
+    /// Takes back the lowest given-back piece when `budget` covers it; returns the bytes taken (0: none, or failed).
+    uint64_t ram_take_back(uint64_t budget);
+    /// Bytes of the copy given back now.
+    uint64_t ram_given_back() const;
 
     // ---- the resident RAM mode and the adaptive tier.  A swap puts `in` (held here) into a GPU slot and evicts
     // `out` (held only by that slot).  Before the slot is overwritten the caller copies it back into an exchange
@@ -494,6 +505,13 @@ private:
     uint64_t places_gen_ = 0;   ///< places_generation
     int64_t spares_want_ = 0;
     std::vector<std::pair<uint64_t, uint64_t>> spare_free_;   // (offset, bytes) of free places
+    struct RamPiece {
+        bool out = false;                                    // given back: its addresses have no memory
+        std::vector<std::pair<size_t, uint64_t>> experts;    // (expert index, offset) it held
+        std::vector<std::pair<uint64_t, uint64_t>> spares;   // free places it held
+    };
+    std::vector<RamPiece> ram_pieces_;   // the RAM copy's host-VMM pieces, empty when it is not host VMM
+    uint64_t ram_piece_bytes_ = 0;
     std::atomic<int64_t> file_reads_{0};
     int64_t reads_ = 0;
     int fd_ = -1;

@@ -412,6 +412,11 @@ private:
     void relend();
     bool home_given_up(int64_t live, const char* why, std::string& e);
     size_t release_loan_homes(const char* why);
+    bool ram_idle_point();
+    bool ram_can_give_back() override { return src.ram_can_give_back(); }
+    uint64_t ram_give_back(uint64_t want) override { return ram_idle_point() ? src.ram_give_back(want) : 0; }
+    uint64_t ram_take_back(uint64_t budget) override { return ram_idle_point() ? src.ram_take_back(budget) : 0; }
+    uint64_t ram_given_back() override { return src.ram_given_back(); }
     bool vram_command(const std::string& cmd, std::string& e, bool for_sleep, std::string* reply = nullptr) override;
     int64_t cache_floor_slots();
     bool move_routed_below(int64_t first, const char* why, std::string& e,

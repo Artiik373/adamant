@@ -134,6 +134,7 @@ Flow Request::restore() {
     // continues is taken out of the cache), then let it come back before the request starts; a STOP ends the
     // wait, and the request then ends as cancelled.  A request that only continues the live conversation by a
     // few tokens (the server's wrap-up after a thinking budget) is part of a reply already streaming: no wait.
+    if (!runtime_.batch_on()) runtime_.ram_balance(true);
     if (!runtime_.batch_on() && basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Ok) {
         runtime_.shed_if_low();
         if (!basalt::platform::ram_continues_live(from_live && !incoming && !from_disk && slot_source < 0,

@@ -41,6 +41,44 @@ void Runtime::shed_if_low() {
                       (long long) (after >> 20), ((long long) after - (long long) before) / (1ll << 20));
 }
 
+void Runtime::ram_balance(bool idle) {
+    using basalt::platform::RamLevel;
+    constexpr uint64_t kLead = 1ull << 30;               // a give-back aims this far above the guard's floor
+    constexpr uint64_t kTakeMargin = 2ull << 30;         // a take-back leaves this much free above the floor
+    constexpr auto kLowGap = std::chrono::seconds(5);    // between give-backs while the RAM is only low
+    constexpr auto kSettle = std::chrono::seconds(30);   // no take-back this soon after a give-back
+    const auto now = std::chrono::steady_clock::now();
+    uint64_t avail = 0, floor = 0;
+    RamLevel level = basalt::platform::ram_guard_level(&avail, &floor);
+    if (avail == 0 || floor == 0) return;
+    if (level != RamLevel::Ok) {
+        if (!ram_can_give_back()) return;
+        if (level == RamLevel::Low && now - ram_gave_at < kLowGap) return;
+        // the file pages the given-back experts are read through go first: they are not a shortfall of their own
+        if (ram_given_back() > 0) {
+            basalt::platform::ram_guard_reclaim_view_now();
+            level = basalt::platform::ram_guard_level(&avail, &floor);
+            if (level == RamLevel::Ok) return;
+        }
+        const uint64_t want = floor + kLead > avail ? floor + kLead - avail : 1;
+        const uint64_t freed = ram_give_back(want);
+        if (freed == 0) return;
+        ram_gave_at = now;
+        basalt::platform::ram_guard_judge_now();
+        basalt::log::info("basalt serve", "RAM guard: %llu MiB of experts given back, now read from the model file "
+                          "(%llu MiB in all); %llu MiB free", (unsigned long long) (freed >> 20),
+                          (unsigned long long) (ram_given_back() >> 20),
+                          (unsigned long long) (basalt::platform::available_memory() >> 20));
+        return;
+    }
+    if (!idle || ram_given_back() == 0 || now - ram_gave_at < kSettle || avail <= floor + kTakeMargin) return;
+    const uint64_t taken = ram_take_back(avail - floor - kTakeMargin);
+    if (taken == 0) return;
+    basalt::platform::ram_guard_judge_now();
+    basalt::log::info("basalt serve", "RAM guard: %llu MiB of experts taken back into RAM, %llu MiB still read from "
+                      "the model file", (unsigned long long) (taken >> 20), (unsigned long long) (ram_given_back() >> 20));
+}
+
 int Runtime::execute() {
     if (const int code = init_before_input()) return code;
     if (const int code = init_protocol()) return code;

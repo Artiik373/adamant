@@ -701,6 +701,7 @@ Flow SessionRequest::read_to(int64_t to) {
             std::printf("ERR %s\n", r.message.c_str());
             return Flow::error;
         }
+        runtime_.ram_balance(false);
         if (runtime_.halted()) { cancelled = true; return Flow::quit; }
         progress_line("PP", at);
     }

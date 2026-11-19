@@ -113,6 +113,13 @@ public:
     /// when it is on and holds no copy of them yet, the others are dropped), the checkpoint blocks kept for reuse are
     /// freed and the heap's free pages return to the OS. The checkpoints stay: a request may already resume from one.
     void shed_if_low();
+    // RAM the experts give back under pressure and take back once it is free again: `idle` between requests (take-back
+    // reads from the file, so it waits for an idle engine); a window boundary otherwise
+    void ram_balance(bool idle);
+    virtual bool ram_can_give_back() { return false; }
+    virtual uint64_t ram_give_back(uint64_t) { return 0; }
+    virtual uint64_t ram_take_back(uint64_t) { return 0; }
+    virtual uint64_t ram_given_back() { return 0; }
     /// From READY on the RAM guard watches MemAvailable against the reserve (--ram-reserve-mib); with 0 it never
     /// starts. The disk tier keeps a GiB above that floor either way.
     void start_guard();
@@ -178,6 +185,7 @@ public:
     uint64_t ready_avail{};
     uint64_t ready_rss{};
     uint64_t shed_drop{};
+    std::chrono::steady_clock::time_point ram_gave_at{};   // the last give-back
     std::string line{};
     // ---- --batch: the slots of the batch windows
     struct BSlot {
