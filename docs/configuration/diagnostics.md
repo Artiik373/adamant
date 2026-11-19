@@ -14,7 +14,7 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--greedy` | CLI | on | Argmax decoding. |
 | `--seed` | CLI | | Sample with this seed under `--top-k` 20, `--top-p` 0.95, `--temperature` 1.0. |
 | `--stop-eos` | CLI | off | Stop at an end-of-turn token. |
-| `--eos-ids` | engine | `248044,248046` | The end-of-turn tokens. |
+| `--eos-ids` | engine | the pack's | The end-of-turn tokens. |
 | `--gpu-plan` | engine | | Print the `--gpu` choice as JSON and exit. |
 
 ## Timing and profiles
@@ -80,7 +80,7 @@ The request keys go on a `GEN` line of the engine's stdin protocol, before the t
 | `-r N` | 1 | Repetitions; above 1 the table shows mean and deviation. |
 | `--seed N` | | Seed every decode request. |
 | `--set "FLAG VALUE"` | | Replace or add engine arguments (repeatable). |
-| `--engine PATH`, `--fixtures DIR` | built engine, `data/bench` | Binary and fixtures. |
+| `--engine PATH`, `--fixtures DIR` | `basalt` beside the bench, `data/bench` | Binary and fixtures. |
 | `-o md` or `json` | md | Output format. |
 | `--power-label W` | read from the GPU | The power limit to print. |
 | `--logs DIR`, `--no-windows`, `--print-command` | | Logs, window stats, command printing. |

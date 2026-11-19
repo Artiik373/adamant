@@ -186,6 +186,9 @@ class Routing(Base):
         self.assertEqual(data["A"]["status"]["value"], "loaded")
         self.assertEqual(data["B"]["status"]["value"], "unloaded")
         self.assertEqual(data["B"]["meta"]["n_ctx"], 4096)
+        for row in data.values():   # the OpenAI model object's required fields
+            self.assertIs(type(row["created"]), int)
+            self.assertEqual(row["owned_by"], "basalt")
 
     def test_status_routes_answer_for_the_loaded_model(self):
         self.assertEqual(self.chat("B")[0], 200)
@@ -287,7 +290,7 @@ class Swap(Base):
         a = self.engines["A"]
         a.asleep = True
 
-        def wake(timeout=120.0):
+        def wake(timeout=120.0, vram_check=None):
             a.asleep = False
             self.events.append(("wake", "A"))
             return {}
@@ -600,6 +603,8 @@ class Startup(unittest.TestCase):
             eng.write_bytes(b"\0--kv\0--max-context\0--spec\0--pool-workers\0")
             conf = Path(d) / "c.json"
             conf.write_text(json.dumps(cfg))
+            for entry in cfg.get("models", []):                  # the launch check wants every model file to exist
+                (Path(d) / entry["model"]).write_bytes(b"")
             args = ["server", "--config", str(conf), "--engine-bin", str(eng), *argv]
             with mock.patch.object(sys, "argv", args), mock.patch.object(sys, "stderr", err), mock.patch.object(sys, "stdout", sys.stdout), \
                     mock.patch("serve.engine.modelfile.model_config", return_value={"args": [], "engine_bin": str(eng), "log": None, "tokenizer": "/x", "model_name": "m"}), \

@@ -134,9 +134,11 @@ bool parse_gpu_spec(const std::string& text, GpuSpec& out, std::string& err) {
     return true;
 }
 
-bool gpu_supported(const GpuCard& c) {
+// A card of the compiled targets, or of unknown capability (checked by the runtime), can be the main card or a tier.
+bool gpu_main_supported(const GpuCard& c) {
     return (c.cc_major == 0 && c.cc_minor == 0) || basalt::cuda_target::supports(c.cc_major, c.cc_minor);
 }
+bool gpu_peer_supported(const GpuCard& c) { return gpu_main_supported(c); }
 
 std::string gpu_label(const std::vector<GpuCard>& visible, int index) {
     std::string s = "GPU " + std::to_string(index);
@@ -148,7 +150,7 @@ std::string gpu_label(const std::vector<GpuCard>& visible, int index) {
 GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, bool known) {
     GpuChoice c;
     const int n = (int) visible.size();
-    auto unsupported = [&](int i) {
+    auto unsupported_main = [&](int i) {
         return "gpu: " + gpu_label(visible, i) + " is sm_" + std::to_string(visible[(size_t) i].cc_major) +
                std::to_string(visible[(size_t) i].cc_minor) + ", not sm_89 or sm_86";
     };
@@ -157,37 +159,38 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
             c.error = "gpu auto: GPUs not listable (no NVML)";
             return c;
         }
-        std::vector<int> ok;
+        // Main card: the most memory bandwidth, then the most VRAM
+        std::vector<int> main_ok;
         for (int i = 0; i < n; ++i) {
-            if (gpu_supported(visible[(size_t) i])) ok.push_back(i);
+            if (gpu_main_supported(visible[(size_t) i])) main_ok.push_back(i);
             else c.notes.push_back("gpu auto: " + gpu_label(visible, i) + " skipped, not sm_89 or sm_86");
         }
-        if (ok.empty()) {
+        if (main_ok.empty()) {
             c.error = n == 0 ? "gpu auto: no GPU is visible" : "gpu auto: no sm_89 or sm_86 GPU visible";
             return c;
         }
-        // the main card: the most memory bandwidth, then the most VRAM, then the lowest number
-        int best = ok[0];
-        for (int i : ok) {
+        int best = main_ok[0];
+        for (int i : main_ok) {
             const GpuCard& a = visible[(size_t) i];
             const GpuCard& b = visible[(size_t) best];
             if (a.mem_gbps > b.mem_gbps || (a.mem_gbps == b.mem_gbps && a.vram > b.vram)) best = i;
         }
         c.cards.push_back(best);
-        for (int i : ok)
+        // then the other cards as expert tiers
+        for (int i : main_ok)
             if (i != best) c.cards.push_back(i);
         return c;
     }
     if (spec.kind == GpuSpec::Kind::Unset) {
         if (known && n == 0) { c.error = "gpu: no GPU is visible"; return c; }
         c.cards.push_back(0);
-        if (known && !gpu_supported(visible[0])) {
-            c.error = unsupported(0);
+        if (known && !gpu_main_supported(visible[0])) {
+            c.error = unsupported_main(0);
             return c;
         }
         std::vector<int> others;
         for (int i = 1; i < n; ++i)
-            if (gpu_supported(visible[(size_t) i])) others.push_back(i);
+            if (gpu_peer_supported(visible[(size_t) i])) others.push_back(i);
         if (!others.empty()) {
             std::string names, list = "0";
             for (int i : others) {
@@ -198,7 +201,9 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
         }
         return c;
     }
-    for (int i : spec.list) {
+    // Explicit list: the first card is the main, the rest second cards.
+    for (size_t idx = 0; idx < spec.list.size(); ++idx) {
+        const int i = spec.list[idx];
         if (known && i >= n) {
             c.error = "gpu " + std::to_string(i) + ": " +
                       (n == 0 ? std::string("no GPU is visible")
@@ -207,8 +212,13 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
             c.cards.clear();
             return c;
         }
-        if (known && !gpu_supported(visible[(size_t) i])) {
-            c.error = unsupported(i);
+        if (known && idx == 0 && !gpu_main_supported(visible[(size_t) i])) {
+            c.error = unsupported_main(i);
+            c.cards.clear();
+            return c;
+        }
+        if (known && idx > 0 && !gpu_peer_supported(visible[(size_t) i])) {
+            c.error = unsupported_main(i);
             c.cards.clear();
             return c;
         }
@@ -218,7 +228,8 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
 }
 
 const char* gpu_role_name(GpuRole r) {
-    return r == GpuRole::Main ? "main" : r == GpuRole::ExpertTier ? "expert tier" : "idle";
+    return r == GpuRole::Main ? "main" : r == GpuRole::ExpertTier ? "expert tier" : r == GpuRole::PromptSplit ? "prompt split"
+         : r == GpuRole::LayerStage ? "layer stage" : "idle";
 }
 
 std::vector<GpuRole> choose_roles(const RoleInputs& in) {
@@ -226,7 +237,8 @@ std::vector<GpuRole> choose_roles(const RoleInputs& in) {
     if (r.empty()) return r;
     r[0] = GpuRole::Main;
     int tiers = 0;
-    for (size_t i = 1; i < r.size() && tiers < in.max_expert_tiers; ++i, ++tiers) r[i] = GpuRole::ExpertTier;
+    const GpuRole helper = !in.prompt_split ? GpuRole::ExpertTier : in.layer_stage ? GpuRole::LayerStage : GpuRole::PromptSplit;
+    for (size_t i = 1; i < r.size() && tiers < in.max_expert_tiers; ++i, ++tiers) r[i] = helper;
     return r;
 }
 
@@ -256,6 +268,16 @@ std::vector<int> spread_experts(const std::vector<uint64_t>& bytes, const std::v
         }
     }
     return owner;
+}
+
+std::vector<size_t> tiers_holding(const std::vector<uint64_t>& bytes, const std::vector<TierRoom>& tiers) {
+    std::vector<bool> holds(tiers.size(), false);
+    for (int t : spread_experts(bytes, tiers))
+        if (t >= 0) holds[(size_t) t] = true;
+    std::vector<size_t> out;
+    for (size_t t = 0; t < tiers.size(); ++t)
+        if (holds[t]) out.push_back(t);
+    return out;
 }
 
 std::vector<GpuCard> visible_gpus(bool& known) {
@@ -316,7 +338,7 @@ std::string gpu_identity(size_t n) {
 
 std::string gpu_plan_json(const std::vector<GpuCard>& visible, const GpuChoice& c, const std::string& arch,
                           const std::string& quality_flags, int quality_window, int spec, int64_t max_context,
-                          const std::string& model_name) {
+                          const std::string& model_name, const std::string& lossy) {
     std::string devices, cards;
     for (int i : c.cards) {
         const GpuCard g = (size_t) i < visible.size() ? visible[(size_t) i] : unknown_card(i);
@@ -327,7 +349,7 @@ std::string gpu_plan_json(const std::vector<GpuCard>& visible, const GpuChoice& 
     std::string notes;
     for (const std::string& s : c.notes) notes += (notes.empty() ? "" : ",") + json_str(s);
     return "{" + (arch.empty() ? std::string() : "\"arch\":" + json_str(arch) + ",\"model\":" + json_str(model_name) + ",\"quality_flags\":" + json_str(quality_flags) +
-                                     ",\"quality_window\":\"" + std::to_string(quality_window) + "\",\"spec\":" +
+                                     ",\"quality_window\":\"" + std::to_string(quality_window) + "\",\"lossy\":" + json_str(lossy) + ",\"spec\":" +
                                      std::to_string(spec) + ",\"max_context\":" + std::to_string(max_context) + ",") + "\"devices\":" + json_str(devices) + ",\"cards\":[" + cards + "],\"notes\":[" + notes +
            "],\"warning\":" + json_str(c.warning) + ",\"error\":" + json_str(c.error) + "}";
 }

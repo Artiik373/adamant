@@ -236,9 +236,6 @@ private:
     bool pipe_on{};
     basalt::core::PoolMultiFn win_pool_fn{};
     void* win_pool_user{};
-    // A turn-boundary checkpoint's GDN bytes reach the host after the first token (see the deferral class); this
-    // is declared after `checks` so it is destroyed, and its copy finished, before the checkpoints are.
-    basalt::core::ConversationCheckpointDeferral ckd{};
     std::vector<basalt::core::SessionState> rviews{};
     basalt::core::SessionState* rsp{};
     // A layer split's mid-prompt checkpoints: when the last stage reports a chunk, the earlier ones already read
@@ -320,6 +317,7 @@ private:
     static constexpr int64_t kKvWindowCells = 2* basalt::kernels::kVerifyMaxT + 64;   // a decoding session's next window
     static constexpr int64_t kPeerTakeCells = 32768;   // a fit backing this many new cells hands its experts to the peer
     int64_t kv_moves{};
+    int64_t kv_ceiling_sent = -1;   // the elastic KV's ceiling the server was last told (INFO elastic_kv_ceiling)
     bool kv_short{};
     bool kv_keep_routed{};   // an admission while slots decode: a shrink keeps their routed experts
     // a solo request's fits before its prompt read leave their handoffs to the peer to that read: (peer slot, its
@@ -390,7 +388,6 @@ private:
     basalt::core::Verifier& stage_ver(int st);
     int pcie_num_of(double f);
     basalt::core::Verifier& stage_verb(int st);
-    void ckd_finish() override;
     bool capture_admit(uint64_t need, uint64_t floor) override;
     bool park_current(size_t held, int64_t kept) override;
     bool gpu_sync_ok();
@@ -419,6 +416,8 @@ private:
     uint64_t ram_given_back() override { return src.ram_given_back(); }
     bool vram_command(const std::string& cmd, std::string& e, bool for_sleep, std::string* reply = nullptr) override;
     int64_t cache_floor_slots();
+    int64_t kv_ceiling();
+    void kv_ceiling_note() override;
     bool move_routed_below(int64_t first, const char* why, std::string& e,
                            const std::vector<serve_loans::LentEntry>* lent_out = nullptr);
     bool kv_drain(std::string& e);

@@ -37,6 +37,8 @@ A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compa
 git clone <adamant remote> && cd adamant
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j                  # bin/basalt, bin/basalt-bench, bin/basalt-probe, bin/basalt-vision
+                                        # Windows: add -G Ninja to the first line, from an x64 VS 2022 prompt ([platforms](docs/platforms.md#building-on-windows))
+                                        # one model only: -DBASALT_MODELS=qwen4exp, deepseek41 or qwen35 ([building](docs/building.md#building-only-some-models))
 pip install -r requirements.txt
 hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt --local-dir models
 ```
@@ -95,7 +97,13 @@ acceptance per content, not engine speed. No accuracy-reducing option is enabled
 | Guide | [guide](docs/models/qwen38-flash-next.md) |
 | Precision | [precision](docs/precision/qwen38-flash-next.md) |
 
-All models compared: [models](docs/models/index.md).
+All models compared, with each one's context limit, flags and cards: [models](docs/models/index.md).
+
+## Video
+
+Qwen3.8-Flash-Next and Qwen3.8-27B read video; DeepSeek and Hy4-flash do not. A video is named like an image in a chat message, and needs
+`--vision` and FFmpeg on the machine. Flash-Next decodes frames on the GPU with NVDEC; the 27B decodes them on the CPU.
+How a request names a video, and the limits: [video](docs/running.md#video).
 
 On Ada the NVFP4 packs run through the integer MMQ path rather than native FP4
 tensor instructions, so their numerics differ from a Blackwell run; the IQ3_S,
@@ -108,6 +116,7 @@ quant the measurements above used, and the recommended starting point on a
 
 - **Run:** [running](docs/running.md), [configuration](docs/configuration/index.md), [models and the router](docs/configuration/models.md),
   [sampling](docs/configuration/sampling.md), [image sources](docs/configuration/image-sources.md),
+  [documents](docs/configuration/documents.md),
   [diagnostics](docs/configuration/diagnostics.md), [basalt-probe](docs/probe.md), [platforms](docs/platforms.md).
 - **Models:** [models](docs/models/index.md), [Flash-Next](docs/models/qwen38-flash-next.md),
   [the `.basalt` file](docs/model-file.md), [file format changes](docs/basalt-file-changelog.md).

@@ -1,6 +1,7 @@
 // src/program/serve/request_parse.cpp - request parse operations.
 #include "request.hpp"
 #include "../cli/tokens.hpp"
+#include "logprobs.hpp"
 
 namespace basalt::program::serve {
 
@@ -37,6 +38,7 @@ Flow Request::parse() {
     // the chunk teacher-forced through verify windows of T tokens, every token committed
     req_ppl = -1;
     req_ppl_t = 3;
+    req_logprobs = -1;   // logprobs=K (0..20): each sent pick's log probability and the row's K likeliest tokens
     req_clip = 0;   // clip=1 (GENT): max_new is a cap, cut to the room the context leaves after the prompt
     if (endp != nullptr) {   // GENI takes the same keys (image requests were always greedy); its
                              // embedding file path is the first token without an =
@@ -64,6 +66,7 @@ Flow Request::parse() {
             else if (key == "penalty_present") req_penalty_present = fv;
             else if (key == "seed") { req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10); req_seed_given = true; }
             else if (key == "relax") req_relax = fv;
+            else if (key == "logprobs") req_logprobs = std::atoi(tok.c_str() + eq + 1);
             else if (key == "clip") req_clip = std::atoi(tok.c_str() + eq + 1);
             else if (key == "ppl") req_ppl = std::atoi(tok.c_str() + eq + 1);
             else if (key == "ppl_t") req_ppl_t = std::atoi(tok.c_str() + eq + 1);
@@ -83,6 +86,8 @@ Flow Request::parse() {
     else if (!std::isfinite(req_penalty_freq) || !std::isfinite(req_penalty_present))
         bad = "penalty_freq, penalty_present: numbers";
     else if (!(req_relax >= 0.0f && req_relax <= 1.0f)) bad = "relax: 0..1";
+    else if (req_logprobs < -1 || req_logprobs > kMaxTopLogprobs) bad = "logprobs: 0 to 20 alternatives";
+    else if (req_logprobs >= 0 && runtime_.o.batch > 0 && runtime_.pipelined()) bad = "logprobs: pipelined batch groups are not supported";
     if (bad == nullptr && runtime_.o.batch > 0 && runtime_.pipelined() && req_penalty_last_n > 0 &&
         (req_penalty_repeat != 1.0f || req_penalty_freq != 0.0f || req_penalty_present != 0.0f))
         bad = "penalties: pipelined batch groups are not supported";
@@ -118,6 +123,18 @@ Flow Request::parse() {
             } else {
                 pe = "the tokenized prompt is gone";
             }
+        } else if (*endp == '#') {   // a prompt held by handle, then the ids this request adds after it
+            char* after = nullptr;
+            std::lock_guard<std::mutex> lk(runtime_.gent_mu);
+            const auto it = runtime_.prompts.find(std::strtoull(endp + 1, &after, 10));
+            if (it == runtime_.prompts.end()) {
+                pe = "the held prompt is gone";
+            } else {
+                ids.assign(it->second.ids.begin(), it->second.ids.end());
+                std::vector<int64_t> more;
+                ids_ok = *after != '+' || cli::parse_i64_list(after + 1, more, pe);
+                ids.insert(ids.end(), more.begin(), more.end());
+            }
         } else {
             ids_ok = cli::parse_i64_list(endp, ids, pe);
         }
@@ -137,7 +154,7 @@ Flow Request::parse() {
             if (!gguard->begin(req_grammar_text, ids.data(), gp, gerr)) gguard.reset();
             else if (gp < ids.size() && gguard->on()) {
                 const std::vector<int32_t> done(ids.begin() + (std::ptrdiff_t) gp, ids.end());
-                if (gguard->scan(done.data(), (int) done.size()) >= 0) {
+                if (gguard->scan(done.data(), (int) done.size(), 0) >= 0) {
                     gerr = "the tokens already generated do not satisfy the grammar";
                     gguard.reset();
                 }
@@ -150,6 +167,7 @@ Flow Request::parse() {
     }
 
     grammar_resamples = 0;
+    grammar_dead = false;
     runtime_.req_imgs.clear();
     if (geni && !runtime_.o.vision) { std::printf("ERR this engine was started without --vision or --vision-external\n"); return Flow::next; }
 

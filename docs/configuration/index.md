@@ -75,9 +75,10 @@ Command line `--name`; the Where column says which config block takes it.
 | `debug` | server | switch | off | One log line per request, and the raw model text. |
 | `request-lines` | server | switch | off | Echo the per-request summary on stdout. |
 | `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | entry | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling`, else the engine's | Default for a request that leaves the field out. See [sampling](sampling.md). |
+| `reasoning-effort` | entry | `none`, `low`, `medium`, `high`, `xhigh` or `max` | unset (the template's default) | Reasoning effort for requests that name no effort, thinking switch or budget. See [sampling](sampling.md). |
 | `reasoning-budget-tokens` | entry | integer | `0` | Thinking budget for requests that name none. A request's own value wins. |
 | `thinking-loop-tokens` | entry | integer | `256` | End thinking when one token repeats this many times in a row; `0` turns it off. |
-| `answer-room` | entry | switch (`--no-answer-room`) | on | Reserve room for closing the thinking and the answer (caps of 1,024 tokens or more). |
+| `answer-room` | entry | `auto` or integer | `auto` | Output tokens kept for closing the thinking and the answer: `auto`, or a fixed number (`0`: none). See [sampling](sampling.md#thinking). |
 | `config` | command line | path | none | The config file. Command line only. |
 
 ## Model and GPUs
@@ -159,7 +160,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `prompt-cache` | engine | integer | 6 | Conversation checkpoints kept, about 118 MB of RAM each. `0` reads every prompt from the start. |
+| `prompt-cache` | engine | integer | 6 | Conversation checkpoints kept, about 118 MB of RAM each on Flash-Next (page-locked, held from start with one more per slot). `0` reads every prompt from the start. |
 | `prompt-cache-every` | engine | tokens | 16384 (`0` = off) | Flash-Next only. Also checkpoint every N freshly read tokens (RAM only). |
 | `prompt-cache-root` | engine | tokens | 2048 (`0` = never) | Checkpoint the end of the system prompt when it is at least this long. |
 | `turn-token` | engine | token id | 248045 | The token that opens a chat turn; checkpoints go at the last one. |
@@ -179,12 +180,14 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 | `image-url-host` | server | `HOST` or `HOST:PORT`, repeatable | none | Allow `http(s)` image URLs on this host from other machines. [image sources](image-sources.md) |
 | `image-dir` | server | directory, repeatable | none | Allow image files under this directory from other machines. [image sources](image-sources.md) |
 | `image-remote-only` | server | switch | off | Treat this machine's requests as remote too. [image sources](image-sources.md) |
+| `video-max-tokens` | entry | 64 to 65536 | 8192 | The most image tokens one video takes over all its frames. Video needs `vision` and FFmpeg 6, 7, 8 or 9 on the machine. [running](../running.md#video) |
 
 Diagnostic flags: [diagnostics](diagnostics.md).
 
 ## Control vectors
 
-A GGUF control vector added to the residual stream. A request switches it with `experimental_speed_projection`.
+A GGUF control vector added to the residual stream. A request switches it with `experimental_speed_projection`. A layer split
+or a prompt split keeps it on every card: each stage applies the vector to the steered layers it reads.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |

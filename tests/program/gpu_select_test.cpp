@@ -83,8 +83,8 @@ int main() {
         static_assert(!basalt::cuda_target::supports(8, 0));
         static_assert(!basalt::cuda_target::supports(9, 0));
         static_assert(!basalt::cuda_target::supports(12, 0));
-        CHECK(gpu_supported(card(0, "unknown", 0, 0, 0, 0)));
-        CHECK(!gpu_supported(card(0, "invalid", 0, 9, 0, 0)));
+        CHECK(gpu_main_supported(card(0, "unknown", 0, 0, 0, 0)));
+        CHECK(!gpu_main_supported(card(0, "invalid", 0, 9, 0, 0)));
         for (const auto& cc : {std::pair{8, 0}, std::pair{9, 0},
                                std::pair{12, 0}, std::pair{13, 0}}) {
             const std::vector<GpuCard> v = {card(0, "unsupported", cc.first, cc.second, 1, 1)};

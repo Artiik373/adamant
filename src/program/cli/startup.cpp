@@ -40,7 +40,7 @@ std::optional<int> find_model(int argc, char** argv, const model::ModelAdapter*&
     const std::string name = arch && arch->is_string() ? arch->s : std::string();
     adapter = model::find_adapter(name);
     if (adapter == nullptr) {
-        basalt::log::error("basalt", "--model: no model adapter for architecture '%s'", name.c_str());
+        basalt::log::error("basalt", "--model: %s", model::unavailable_architecture(name).c_str());
         return 2;
     }
     return std::nullopt;
@@ -61,6 +61,8 @@ void pack_tokens(const model::ModelAdapter& adapter, CommonOptions& o) {
         basalt::log::warn("basalt", "the pack's vocabulary cannot be read (%s): no end-of-turn or turn token", err.c_str());
         return;
     }
+    // a name with one `*` matches the first token whose text has that start and end (a model whose special tokens carry a suffix
+    // that differs between its files)
     auto id_of = [&](const std::string& name) -> int64_t {
         if (hf) {
             if (const basalt::core::Json* added = vocab.get("added_tokens"))
@@ -69,15 +71,26 @@ void pack_tokens(const model::ModelAdapter& adapter, CommonOptions& o) {
                         if (const basalt::core::Json* id = t.get("id")) return (int64_t) id->u64();
             return -1;
         }
-        const basalt::core::Json* v = vocab.get(name);
-        return v != nullptr ? (int64_t) v->u64() : -1;
+        const size_t star = name.find('*');
+        if (star == std::string::npos) {
+            const basalt::core::Json* v = vocab.get(name);
+            return v != nullptr ? (int64_t) v->u64() : -1;
+        }
+        const std::string head = name.substr(0, star), tail = name.substr(star + 1);
+        for (const auto& [text, v] : vocab.members)
+            if (text.size() >= head.size() + tail.size() && text.compare(0, head.size(), head) == 0 &&
+                text.compare(text.size() - tail.size(), tail.size(), tail) == 0)
+                return (int64_t) v.u64();
+        return -1;
     };
     const model::TokenNames names = adapter.token_names();
     if (o.eos_ids.empty())
         for (const std::string& name : names.eos)
             if (const int64_t id = id_of(name); id >= 0) o.eos_ids.push_back(id);
     if (!o.turn_token_given) o.turn_token = id_of(names.turn);
+    if (!names.reply_role.empty()) o.reply_role_token = id_of(names.reply_role);
     if (!o.image_pad_given) o.image_pad_id = id_of(names.image_pad);
+    if (!names.video_pad.empty()) o.video_pad_id = id_of(names.video_pad);
 }
 
 }  // namespace

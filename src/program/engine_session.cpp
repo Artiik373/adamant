@@ -257,6 +257,40 @@ std::string fixtures_for(const std::string& dir, const std::string& plan_answer)
     return std::filesystem::is_directory(own, ec) ? own.string() : dir;
 }
 
+std::string fixture_vocab_refusal(int64_t max_id, int64_t n_vocab, const std::string& dir) {
+    if (n_vocab <= 0 || max_id < n_vocab) return {};
+    return "the fixtures in " + dir + " hold token id " + std::to_string((long long) max_id) + ", past this model's vocabulary of " +
+           std::to_string((long long) n_vocab) + " tokens: they were made with another tokenizer (a model's own go in " +
+           "data/bench/<arch>, or give --fixtures)";
+}
+
+std::string default_engine(const std::string& self, const std::string& built) {
+    if (!self.empty()) {
+        const std::filesystem::path p(self);
+        const std::string beside = (p.parent_path() / ("basalt" + p.extension().string())).string();
+        if (basalt::platform::path_executable(beside)) return beside;
+    }
+    return built;
+}
+
+std::string default_fixtures(const std::string& root, const std::string& built) {
+    std::error_code ec;
+    if (!root.empty() && std::filesystem::is_directory(std::filesystem::path(root) / "data" / "bench", ec))
+        return (std::filesystem::path(root) / "data" / "bench").string();
+    return built;
+}
+
+std::string community_refusal(const std::vector<std::string>& extra, const std::string& plan_answer) {
+    const std::vector<std::string> lossy = split(plan_field(plan_answer, "lossy"), ',');
+    if (!lossy.empty()) {
+        std::string list;
+        for (const auto& f : lossy) list += (list.empty() ? "" : ", ") + f;
+        return "--community runs the model as it is: " + list + (lossy.size() == 1 ? " is a lossy flag" : " are lossy flags");
+    }
+    return "--community runs the fixed preset: " + (extra.empty() ? std::string("an engine flag") : extra[0]) +
+           " would make the row incomparable";
+}
+
 void Engine::reap() {
     // wait for it, up to the time a normal exit needs, then let go whether or not it ended
     (void) basalt::platform::child_wait(child_.child, 10000);

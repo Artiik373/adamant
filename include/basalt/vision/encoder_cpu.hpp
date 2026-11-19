@@ -22,8 +22,9 @@ public:
     /// `mp` must outlive the encoder.  threads <= 0: all cores.
     bool init(const Mmproj& mp, int threads, bool round_bf16, bool f16_quirks, std::string& err);
 
-    /// patches: [n_patches][768] in merge order (patchify); canvas: the image size in pixels.
-    /// out: [n_patches / 4][proj] floats.
+    /// patches: [n_patches][768] in merge order (patchify), or [n_patches][1536] for a video group (patchify_video:
+    /// the two frames' taps apart); canvas: the picture size in pixels. out: [n_patches / 4][proj] floats; for projector
+    /// hy_v4_flash the merged rows in lines of canvas.w / 32, each followed by the newline row.
     bool encode(const std::vector<float>& patches, Size canvas, std::vector<float>& out, const TapFn& tap = {});
 
 private:
@@ -35,9 +36,18 @@ private:
     int threads_ = 1;
     bool round_ = false, f16_ = false;
     std::vector<Layer> layers_;
-    std::vector<float> wpatch_;               // [embd][768]: the two temporal taps summed
+    std::vector<float> wpatch_;               // [embd][768]: the two temporal taps summed, for a still picture
+    std::vector<float> wpatch2_;              // [embd][1536]: per channel tap 0 then tap 1, for a video group
     const float *bpatch_ = nullptr, *pos_ = nullptr, *postw_ = nullptr, *postb_ = nullptr;
     const float *bm0_ = nullptr, *bm2_ = nullptr;
+    // projector hy_v4_flash: a single patch tap, an edge_ x edge_ position table resampled per grid, no rotation, an RMS norm
+    // (postw_) before an erf-GELU 2x2 merge product, and a newline row after each merged row
+    bool hy4_ = false;
+    int edge_ = 48;
+    const float* newline_ = nullptr;
+    // the matrices that have to be made from the file's (hy4: q, k and v as one, the convolutions as bf16 products)
+    std::vector<std::vector<uint16_t>> own_w_;
+    std::vector<std::vector<float>> own_b_;
     const uint16_t *wm0_ = nullptr, *wm2_ = nullptr;
 };
 

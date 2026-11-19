@@ -43,14 +43,16 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
-# Pre-tokenizers made of several regexes applied in turn, each one splitting the pieces the previous left; text a regex
-# does not match stays a piece for the next. Keyed by the GGUF's tokenizer.ggml.pre.
-PRE_PATTERNS: dict[str, list[str]] = {
-    # Hy4-flash's tokenizer.json: three Isolated splits, then the byte-level map
-    "hy4": [r"\p{N}{1,3}", r"[一-龥぀-ゟ゠-ヿ]+",
-            r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
-            r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"],
-}
+# The `joyai-llm` pre-tokenizer (llama.cpp LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM): the regexes apply in turn, each one
+# splitting the pieces the previous left; text a regex does not match stays a piece for the next.
+JOYAI_PATTERNS = [
+    r"\p{N}{1,3}",
+    "[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+",
+    r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
+    r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+]
+# `hy_v4` (Hy4-flash) is the same three regexes (LLAMA_VOCAB_PRE_TYPE_HY_V4 shares the JOYAI_LLM case).
+PRE_PATTERNS = {"joyai-llm": JOYAI_PATTERNS, "hy_v4": JOYAI_PATTERNS, "hy4": JOYAI_PATTERNS}
 
 
 class Tokenizer:
@@ -287,7 +289,8 @@ def extract_metadata(md: dict, out_dir) -> dict:
     }
     if tk.pre in PRE_PATTERNS:
         cfg["pre_patterns"] = PRE_PATTERNS[tk.pre]
-        cfg["pre_pattern_source"] = "llama.cpp src/llama-vocab.cpp applied in order"
+        cfg["pre_pattern_source"] = ("llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_%s), applied in order"
+                                     % {"hy_v4": "HY_V4"}.get(tk.pre, "JOYAI_LLM"))
     else:
         cfg["pre_pattern"] = QWEN35_PATTERN
         cfg["pre_pattern_source"] = "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_QWEN35)"

@@ -434,6 +434,7 @@ void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* x
         check("dec_moe_vram");
         return;
     }
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900  // the TMA path is built on sm_90+ only
     if (kind == 1) {
         if (L.gu_row * kStageGuRows > (size_t) kStageStage || L.d_row * kStageDownRows > (size_t) kStageStage ||
             (L.gu_row * kStageGuRows) % 16 != 0 || (L.d_row * kStageDownRows) % 16 != 0 || L.down_off % 16 != 0 ||
@@ -458,6 +459,8 @@ void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* x
         check("dec_moe_vram");
         return;
     }
+#endif  // the TMA path
+    if (kind == 1) { basalt::log::error("basalt", "dec_moe_vram: the TMA path is not built for this device"); std::exit(1); }
     switch (L.gu_type * 100 + L.d_type) {
 #define DM_V(TG, TD) case TG * 100 + TD: \
         blocks = dm_vram_blocks<TG, TD>(); \

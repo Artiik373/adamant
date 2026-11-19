@@ -45,6 +45,7 @@ namespace basalt::kernels::cpu { class ExpertPool; }
 namespace basalt::kernels { struct DmMixLayer; }
 
 namespace basalt::core {
+class LoadPlan;
 
 class NativeHead;
 class PeerExperts;
@@ -168,6 +169,9 @@ public:
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     /// Row `t` of the last window's head logits (n_vocab floats) to the host, every one exact. Valid after run().
     bool copy_logits(int t, float* host) const;
+    /// Rows t0..t0+n of the last window's head: picks[t]'s log probability and the row's `top` likeliest tokens,
+    /// kernels::kLogprobStride floats a row to `host` (basalt/kernels/logprobs.hpp). Valid after run().
+    bool row_logprobs(int t0, int n, const int32_t* picks, int top, float* host);
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
@@ -236,9 +240,9 @@ public:
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
     /// The 8-bit copies of every layer's hyper-connection matrices (and the head's) on the current device, from the
-    /// model file's table; called before the expert cache takes the free memory.  False with `err` when a matrix this
-    /// device holds has no copy in the table or no VRAM for it.
-    static bool prepare_hc8(const WeightTable& wt, const ModelGeometry& g, std::string& err);
+    /// model file's table, their bytes copied in `reads`' pass; called before the expert cache takes the free memory.
+    /// False with `err` when a matrix this device holds has no copy in the table or no VRAM for it.
+    static bool prepare_hc8(const WeightTable& wt, const ModelGeometry& g, LoadPlan& reads, std::string& err);
     /// The CUDA0 bytes the GDN mixer split by key head loads after the expert cache is sized (CUDA0's packed rows and
     /// columns of its key heads), for CUDA0 on dev0 and the peer on dev1; 0 when the split is not taken.
     static int64_t gs_cuda0_bytes(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1);
@@ -547,6 +551,8 @@ private:
     std::vector<float> logit_bias_host_;
     float* logit_bias_device_ = nullptr;
     float* row_bias_device_ = nullptr;   ///< resample_row's bias
+    float* lp_buf_ = nullptr;            ///< row_logprobs: its scratch, kLogprobStride floats a row, then the picks
+    size_t lp_cap_ = 0;                  ///< its rows
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     std::atomic<bool> released_{false};   // release_gpu_waits ran (maybe on the watchdog thread): no more windows
     bool all_resident_ = false;           ///< 100% of experts in [lb_, le_) resident in VRAM: zero-doorbell graph
@@ -764,7 +770,8 @@ private:
 /// The loaded hc8 table (model_file.hpp) has a copy of `name` of this shape.
 bool hc8_table_has(const std::string& name, int rows, int cols);
 /// Registers the table's copy of `name` on the current device, keyed by the bf16 matrix `w` or, with w == nullptr, by
-/// the copy itself (the key is returned).  nullptr: no such copy, or no VRAM.
-const void* hc8_table_adopt(const std::string& name, const uint16_t* w, int rows, int cols);
+/// the copy itself (the key is returned); its bytes are copied from the table in `reads`' pass.  nullptr: no such
+/// copy, or no VRAM.
+const void* hc8_table_adopt(const std::string& name, const uint16_t* w, int rows, int cols, LoadPlan& reads);
 
 }  // namespace basalt::core

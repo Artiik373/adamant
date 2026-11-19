@@ -12,7 +12,6 @@ add_library(model_hy4 STATIC
 )
 target_include_directories(model_hy4 PUBLIC ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(model_hy4 PUBLIC model_hy4_kernels core kernels ggml_quants platform model CUDA::cudart)
-target_link_libraries(models PUBLIC model_hy4)
 
 add_executable(hy4_generate src/models/hy4/hy4_generate.cpp)
 target_link_libraries(hy4_generate PRIVATE model_hy4 spec)

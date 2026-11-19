@@ -1,5 +1,6 @@
-// tests/model/adapter_builtin_test.cpp - the program's own registration: the real adapter, once, and its load contract.
-// Linking the models needs the CUDA runtime, so this runs where that is installed; no GPU work.
+// tests/model/adapter_builtin_test.cpp - the program's own registration: every adapter the build holds, once each, DeepSeek's
+// load error and the flags each model reports as lossy. Linking the models needs the CUDA runtime, so this runs where
+// that is installed; no GPU work.
 #include "basalt/model/adapter.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/models/builtin.hpp"
@@ -7,6 +8,8 @@
 
 #include <cstdio>
 #include <memory>
+#include <string>
+#include <vector>
 
 int main() {
     using namespace basalt;
@@ -17,16 +20,49 @@ int main() {
     };
     models::register_builtin_models();
     models::register_builtin_models();
-    check(model::find_adapter("qwen4exp") != nullptr, "the qwen4exp adapter is registered");
-    check(model::find_adapter("hy4") != nullptr, "the hy4 adapter is registered");
-    check(model::adapter_names().size() == 2, "registering twice keeps one adapter per name");
-    if (const model::ModelAdapter* qw = model::find_adapter("qwen4exp")) {
-        std::unique_ptr<model::LoadedModel> loaded;
-        check(qw->load({}, loaded).status == model::Status::NotImplemented, "qwen4exp has no shared-server load: it runs its own start");
-    }
+    // BASALT_MODELS decides which adapters exist: each built model is registered once, each left out is refused by name
+    size_t built = 0;
+    const auto expect = [&](const char* arch, bool is_built) {
+        built += is_built ? 1 : 0;
+        check((model::find_adapter(arch) != nullptr) == is_built, is_built ? "a built model is registered" : "a model left out is not registered");
+        if (!is_built) {
+            const std::string why = model::unavailable_architecture(arch);
+            check(why.find("left out") != std::string::npos && why.find("BASALT_MODELS=") != std::string::npos &&
+                      why.find(std::string("-DBASALT_MODELS=\"")) != std::string::npos && why.find(arch) != std::string::npos,
+                  "a model left out is refused with the option that adds it");
+        }
+    };
+#ifdef BASALT_MODEL_QWEN4EXP
+    expect("qwen4exp", true);
+#else
+    expect("qwen4exp", false);
+#endif
+#ifdef BASALT_MODEL_DEEPSEEK41
+    expect("deepseek41", true);
+#else
+    expect("deepseek41", false);
+#endif
+#ifdef BASALT_MODEL_QWEN35
+    expect("qwen35", true);
+#else
+    expect("qwen35", false);
+#endif
+#ifdef BASALT_MODEL_HY4FLASH
+    expect("hy4flash", true);
+    // and under the architecture its test pack (made from the AngelSlim GGUF) carries
+    check(model::find_adapter("hy_v4_flash") != nullptr, "hy4flash also answers to hy_v4_flash");
+    ++built;
+#else
+    expect("hy4flash", false);
+#endif
+#ifdef BASALT_MODEL_HY4
+    expect("hy4", true);
+#else
+    expect("hy4", false);
+#endif
+    check(model::adapter_names().size() == built, "registering twice keeps one adapter per name");
     if (const model::ModelAdapter* hy = model::find_adapter("hy4")) {
-        std::unique_ptr<model::LoadedModel> loaded;
-        check(hy->load({}, loaded).status == model::Status::NotImplemented, "hy4 has no shared-server load: it runs its own start");
+        check(hy->make_model() == nullptr, "hy4 runs its own start");
         auto opts = hy->make_options();
         check(opts != nullptr, "hy4 make_options returns options");
         check(hy->planned_spec(*opts) == 6, "hy4 default planned_spec is 6");
@@ -50,6 +86,37 @@ int main() {
         char* f4[] = {(char*) "--relaxed-drafting", (char*) "0.5"};
         model::FlagArgs a4(2, f4, i4);
         check(hy->parse_flag("--relaxed-drafting", a4, *opts, code), "hy4 parses --relaxed-drafting");
+    }
+    if (const model::ModelAdapter* ds = model::find_adapter("deepseek41")) {
+        model::Started started;
+        check(ds->start({}, started).status == model::Status::Error, "deepseek41 start without a path is an error");
+        const auto o = ds->make_options();
+        check(!ds->finish_flags(*o) && o->lossy.empty(), "deepseek41 has no lossy flag");
+    }
+    // the flags as the command line gives them, through the model's own parser and finish_flags
+    const auto lossy_of = [](const model::ModelAdapter& a, std::vector<std::string> words) {
+        const auto o = a.make_options();
+        words.insert(words.begin(), "basalt");
+        std::vector<char*> argv;
+        for (auto& w : words) argv.push_back(w.data());
+        for (int i = 1; i < (int) argv.size(); ++i) {
+            int code = 0;
+            model::FlagArgs args((int) argv.size(), argv.data(), i);
+            if (!a.parse_flag(argv[i], args, *o, code) || code != 0) return std::vector<program::CommonOptions::LossyFlag>{{"?", argv[i]}};
+        }
+        (void) a.finish_flags(*o);
+        return o->lossy;
+    };
+    if (const model::ModelAdapter* q = model::find_adapter("qwen4exp")) {
+        check(lossy_of(*q, {}).empty(), "qwen4exp with no flag is not lossy");
+        const auto one = lossy_of(*q, {"--route-tail-skip", "7"});
+        check(one.size() == 1 && one[0].flag == "--route-tail-skip" &&
+                  one[0].effect == "--route-tail-skip 7 drops low-ranked missed experts",
+              "qwen4exp --route-tail-skip 7 is lossy, with its warning");
+        const auto all = lossy_of(*q, {"--relaxed-drafting", "--route-prior", "1.5", "--route-tail-skip"});
+        check(all.size() == 3 && all[0].flag == "--relaxed-drafting" && all[1].effect == "--route-prior 1.5 changes expert routing" &&
+                  all[2].effect == "--route-tail-skip 9 drops low-ranked missed experts",
+              "qwen4exp: every lossy flag, bare ones at their defaults, in the warning order");
     }
     return failures ? 1 : 0;
 }

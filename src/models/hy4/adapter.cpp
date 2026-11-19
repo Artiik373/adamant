@@ -350,9 +350,6 @@ public:
         d.n_vocab = kVocab;
         return d;
     }
-    model::Result load(const model::LoadRequest&, std::unique_ptr<model::LoadedModel>&) const override {
-        return {model::Status::NotImplemented, "Hy4-flash runs its own start"};
-    }
     std::unique_ptr<program::CommonOptions> make_options() const override {
         return std::make_unique<Hy4Options>();
     }

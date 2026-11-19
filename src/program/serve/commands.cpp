@@ -44,6 +44,7 @@ Flow Runtime::dispatch() {
         }
         if (line.rfind("BSTOP ", 0) != 0 && !drain_windows()) return Flow::error;
     } else {
+        kv_ceiling_note();   // between requests too: the free VRAM also moves without the KV
         // idle: once no line has come for a second (a client's next turn usually comes sooner), what a crash would
         // lose goes to disk, then the idle conversations whose time is up leave VRAM, one at a time while no line
         // waits
@@ -79,7 +80,7 @@ Flow Runtime::dispatch() {
         return Flow::next;
     }
     if (line.rfind("BYIELD", 0) == 0) return Flow::next;   // for a prompt read that has ended meanwhile
-    if (line.rfind("ENC ", 0) == 0) {   // the in-engine image encoder, between requests and windows
+    if (line.rfind("ENC ", 0) == 0 || line.rfind("ENCV ", 0) == 0) {   // the in-engine encoder, between requests and windows
         enc_command(line);
         return Flow::next;
     }
@@ -116,6 +117,10 @@ Flow Runtime::dispatch() {
         if (!down) basalt::platform::ram_guard_pause(false);
         if (!verr.empty()) std::printf("ERR %s\n", verr.c_str());
         std::fflush(stdout);
+        return Flow::next;
+    }
+    if (line.rfind("PMATCH ", 0) == 0 || line.rfind("PFREE ", 0) == 0) {   // a prompt held by handle, between requests and windows
+        prompt_command(line);
         return Flow::next;
     }
     if (line.rfind("ERR_GENT ", 0) == 0) {

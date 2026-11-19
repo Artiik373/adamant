@@ -37,7 +37,7 @@ ANSWER = "xy" * 1000
 
 
 class RecordingEngine(MockEngine):
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         self.last_max_new = max_new
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
@@ -48,6 +48,7 @@ class MaxTokens(unittest.TestCase):
         tok = ByteTokenizer()
         cls.engine = RecordingEngine(tok, "</think>\n\n" + ANSWER, max_context=CTX)
         cls.svc = Service(cls.engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
+        cls.svc.answer_room = 0     # no thinking budget: a thinking request's first pass would stop at it
         cls.httpd = serve(cls.svc, port=0)
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
 
@@ -100,21 +101,6 @@ class MaxTokens(unittest.TestCase):
         s2, _, n_in, _ = self.call("anthropic", "how many tokens is this?", max_tokens=8)
         self.assertEqual(s2, 200)
         self.assertEqual(b["input_tokens"], n_in)
-
-    def test_request_line_parses_the_engine_summary(self):
-        line = ("basalt serve: prompt 1200 tokens = 1000 reused + 200 read in 50 ms (4000.0 tok/s), 30 generated in "
-                "300 ms (100.0 tok/s), drafts accepted 20 of 28, 2 checkpoints")
-        from serve.engine.process import ENGINE_REQUEST
-        m = ENGINE_REQUEST.search(line)
-        self.assertIsNotNone(m)
-        self.assertEqual((m["prompt"], m["reused"], m["gen"], m["tg"]), ("1200", "1000", "30", "100.0"))
-        # a request cancelled while its prompt was read says how far it got
-        m = ENGINE_REQUEST.search("basalt serve: prompt 98179 tokens = 0 reused + 12288 of 98179 read in 17565 ms "
-                                  "(699.6 tok/s), 0 generated in 0 ms (0.0 tok/s), drafts accepted 0 of 0, "
-                                  "0 checkpoints (cancelled)")
-        self.assertIsNotNone(m)
-        self.assertEqual((m["prompt"], m["reused"], m["read"], m["pp"], m["gen"]),
-                         ("98179", "0", "17565", "699.6", "0"))
 
     def test_unset_budget_is_the_rest_of_the_context(self):
         cases = {"openai": [{"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None},
@@ -193,6 +179,7 @@ class FitMaxTokens(unittest.TestCase):
         tok = ByteTokenizer()
         cls.engine = RecordingEngine(tok, "</think>\n\n" + ANSWER, max_context=CTX)
         cls.svc = Service(cls.engine, tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"), fit_max_tokens=True)
+        cls.svc.answer_room = 0     # no thinking budget: a thinking request's first pass would stop at it
         cls.httpd = serve(cls.svc, port=0)
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
 
@@ -512,7 +499,7 @@ class LiteralControlTokens(unittest.TestCase):
 
 class CountingEngine(MockEngine):
     """Counts the tokens the engine was asked for, so a test can see it stopped early."""
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         self.yielded = 0
         for t in super().generate(ids, max_new, sampling, cancel, embeddings):
             self.yielded += 1
@@ -1273,7 +1260,7 @@ class GpuChoice(unittest.TestCase):
 
 
 class RecordingPrompt(MockEngine):
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         self.last_ids = list(ids)
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
@@ -1292,7 +1279,7 @@ class DyingEngine(MockEngine):
         self.dead, self.die_after = False, None
         self.restarts += 1
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
             if self.die_after is not None and i == self.die_after:
                 self.dead = True
@@ -1303,7 +1290,7 @@ class DyingEngine(MockEngine):
 class SlowPromptEngine(MockEngine):
     """Reads a "long prompt" for up to 20 s without a token (the engine sends nothing then), stopping on cancel."""
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         self.cancelled_after = None
         t0 = time.monotonic()
         while time.monotonic() - t0 < 20:
@@ -1312,6 +1299,40 @@ class SlowPromptEngine(MockEngine):
                 return
             time.sleep(0.05)
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
+class SessionOnTheMockEngine(unittest.TestCase):
+    """A session header, or the body's session_id, reaches the engine; the mock engine takes it and answers."""
+
+    def test_the_session_is_accepted(self):
+        tok = ByteTokenizer()
+        sessions = []
+
+        class Recording(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
+                sessions.append(session)
+                return super().generate(ids, max_new, sampling, cancel, embeddings, session)
+        svc = Service(Recording(tok, "ok", max_context=CTX), tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        url = f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions"
+        try:
+            for headers, extra in (({"x-session-id": "s1"}, {}), ({}, {"session_id": "s2"}), ({}, {})):
+                body = {"model": "basalt", "max_tokens": 20, "reasoning_effort": "none",
+                        "messages": [{"role": "user", "content": "hi"}], **extra}
+                req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json", **headers})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    self.assertEqual(r.status, 200)
+                    self.assertEqual(json.loads(r.read())["choices"][0]["message"]["content"], "ok")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertEqual(sessions, ["s1", "s2", None])
+
+    def test_the_bare_mock_engine_takes_a_session(self):
+        tok = ByteTokenizer()
+        out = list(MockEngine(tok, "ok").generate(tok.encode("hi"), 8, {}, threading.Event(), session="s1"))
+        self.assertTrue(out)
 
 
 class ClientHangUp(unittest.TestCase):
@@ -1389,7 +1410,7 @@ class EngineDeath(unittest.TestCase):
     def test_engine_err_mid_stream(self):
         """The engine's ERR after the stream started reaches the client as an error event, not a 400."""
         class ErrEngine(MockEngine):
-            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
                 yield None                                  # a prompt-progress heartbeat: the stream has started
                 raise ValueError("verify: layer 31 never rang (an illegal memory access was encountered)")
 
@@ -1421,7 +1442,7 @@ class DoneLineEngine(MockEngine):
         super().__init__(*a, **kw)
         self.done_lines = list(done_lines)
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         try:
             yield from super().generate(ids, max_new, sampling, cancel, embeddings)
         finally:
@@ -1698,20 +1719,15 @@ class LoadProgress(unittest.TestCase):
 
     def test_parse(self):
         from serve.engine.progress import engine_warning, load_progress, load_total
-        self.assertEqual(load_progress("basalt load: cuda0 10 100"), ("cuda0", 10, 100, False))
-        self.assertEqual(load_progress("basalt load: copy cuda1 10 100"), ("cuda1", 10, 100, True))
+        self.assertEqual(load_progress("basalt load: weights 10 100"), ("weights", 10, 100))
+        self.assertEqual(load_progress("basalt load: ngram 1073741824 3221225472"), ("ngram", 1 << 30, 3 << 30))
         self.assertIsNone(load_progress("basalt load: total 100"))
-        self.assertIsNone(load_progress("basalt load: cuda0 ten 100"))
+        self.assertIsNone(load_progress("basalt load: weights ten 100"))
+        self.assertIsNone(load_progress("basalt load: cuda0 10 100"))        # no per-device lines any more
         self.assertIsNone(load_progress("basalt generate: loaded 3 GiB"))
-        from serve.engine.progress import load_plan
-        self.assertEqual(load_plan("basalt load: plan cuda0 100"), ("cuda0", 100, False))
-        self.assertEqual(load_plan("basalt load: plan copy cuda1 100"), ("cuda1", 100, True))
-        self.assertIsNone(load_plan("basalt load: plan cuda0 x"))
-        self.assertIsNone(load_plan("basalt load: cuda0 1 2"))
-        self.assertIsNone(load_progress("basalt load: plan cuda0 100"))
         self.assertEqual(load_total("basalt load: total 4096"), 4096)
         self.assertIsNone(load_total("basalt load: total many"))
-        self.assertIsNone(load_total("basalt load: cuda0 1 2"))
+        self.assertIsNone(load_total("basalt load: weights 1 2"))
         self.assertEqual(engine_warning("basalt warning: model 60.0 GiB, free 40.0 GiB"), "model 60.0 GiB, free 40.0 GiB")
         self.assertIsNone(engine_warning("basalt warning: "))
         self.assertIsNone(engine_warning("basalt generate: WARNING: x"))
@@ -1721,91 +1737,57 @@ class LoadProgress(unittest.TestCase):
         out = io.StringIO()
         bars = LoadBars(out)
         bars.set_total(100 << 30)
-        bars.set_plan("ram", 100 << 30)
         for d in range(0, 101, 5):
-            bars.update("ram", d << 30, 100 << 30)
+            bars.update("weights", d << 30, 100 << 30)
         self.assertEqual(out.getvalue(), "")
         bars.finish()
         lines = out.getvalue().splitlines()
         self.assertEqual(len(lines), 1)
         self.assertTrue(lines[0].startswith("[server] loaded   100.0GiB "))
-        self.assertTrue(lines[0].endswith("ram=100.0GiB"))
-
-    def test_phases_add_up_to_one_result(self):
-        from serve.engine.progress import LoadBars
-        out = io.StringIO()
-        bars = LoadBars(out, gpus=[2, 3])
-        bars.set_total(5 << 30)
-        for size in (1 << 30, 4 << 30):                                # two phases of one target
-            bars.update("cuda0", 0, size)
-            bars.update("cuda0", size, size)
-        bars.update("cuda1", 0, 2 << 30, copy=True)
-        bars.update("cuda1", 2 << 30, 2 << 30, copy=True)
-        bars.finish()
-        line, = out.getvalue().splitlines()
-        self.assertTrue(line.startswith("[server] loaded   5.0GiB "))
-        self.assertTrue(line.endswith("cuda2=5.0GiB cuda3-copy=2.0GiB"))
 
     def test_unfinished_start_is_not_reported(self):
         from serve.engine.progress import LoadBars
         out = io.StringIO()
         bars = LoadBars(out)
         bars.set_total(4 << 30)
-        bars.update("cuda0", 1 << 30, 4 << 30)
+        bars.update("weights", 1 << 30, 4 << 30)
         bars.finish()
         self.assertEqual(out.getvalue(), "")
 
-    def test_one_bar_per_target_against_its_own_plan(self):
+    def test_one_bar_for_the_whole_model(self):
         from serve.engine.progress import LoadBars
         out = Tty()
         bars = LoadBars(out, gpus=[2, 3])
-        bars.update("cuda0", 1 << 30, 1 << 30)                          # no plan yet: a count
-        self.assertEqual(out.getvalue().splitlines()[-1].split("\x1b[2K")[-1],
-                         "[server] loading weights into cuda2    1.0 GiB")
-        bars.set_plan("cuda0", 4 << 30)
-        bars.set_plan("ram", 2 << 30)
-        bars.set_plan("cuda1", 1 << 30, copy=True)
-        bars.update("cuda0", 0, 3 << 30)                                # the second phase of the target
-        bars.update("cuda0", 2 << 30, 3 << 30)
-        bars.update("ram", 0, 2 << 30)
-        bars.update("cuda1", 0, 1 << 30, copy=True)
-        rows = [r.split("\x1b[2K")[-1] for r in out.getvalue().splitlines()[-3:]]
-        self.assertEqual(rows[0], "[server] loading weights into cuda2      [" + "=" * 18 + ">" + " " * 5 + "]   3.0/4.0 GiB")
-        self.assertEqual(rows[1], "[server] loading weights into system ram [>" + " " * 23 + "]   0.0/2.0 GiB")
-        self.assertEqual(rows[2], "[server] copying experts to cuda3        [>" + " " * 23 + "]   0.0/1.0 GiB")
-        self.assertEqual(len({r.index("[", 8) for r in rows}), 1)       # the bars line up
+        bars.update("weights", 1 << 30, 0)                              # no total yet: a count
+        self.assertEqual(out.getvalue().splitlines()[-1].split("\x1b[2K")[-1], "[server] loading model weights    1.0 GiB")
+        bars.update("weights", 3 << 30, 4 << 30)
+        self.assertEqual(len(bars.lines()), 1)
+        self.assertEqual(bars.lines()[0], "[server] loading model weights [" + "=" * 18 + ">" + " " * 5 + "]   3.0/4.0 GiB")
         bars.say("[server] warning: x")
-        self.assertIn("\x1b[1A\x1b[2K\x1b[1A\x1b[2K\x1b[1A\x1b[2K[server] warning: x\n", out.getvalue())
+        self.assertIn("\x1b[1A\x1b[2K[server] warning: x\n", out.getvalue())
 
-    def test_bars_follow_the_order_targets_start_loading(self):
+    def test_a_total_that_grows_or_shrinks_moves_the_bar(self):
         from serve.engine.progress import LoadBars
-        out = Tty()
-        bars = LoadBars(out, gpus=[2, 3])
-        bars.set_plan("cuda0", 1 << 30)
-        bars.set_plan("ram", 2 << 30)
-        bars.update("cuda0", 1 << 30, 1 << 30)
-        bars.set_plan("cuda1", 1 << 30)
-        self.assertEqual([r.split(" [")[0].split()[-1] for r in bars.lines()], ["cuda2"])   # ram waits unseen
-        bars.update("cuda1", 0, 1 << 30)                                # planned after ram, loads before it
-        bars.update("ram", 0, 2 << 30)
-        self.assertEqual([r.split(" [")[0].split()[-1] for r in bars.lines()], ["cuda2", "cuda3", "ram"])
+        bars = LoadBars(io.StringIO())
+        bars.update("weights", 2 << 30, 4 << 30)
+        bars.update("weights", 3 << 30, 8 << 30)                        # a stage's share was added
+        self.assertEqual(bars.progress(), {"percent": 37, "gib": 3.0})
+        bars.update("weights", 4 << 30, 4 << 30)                        # a part was left on the file
+        self.assertEqual(bars.progress()["gib"], 4.0)
 
     def test_the_ngram_table_lock_is_its_own_row_outside_the_total(self):
-        from serve.engine.progress import LoadBars, load_progress
-        self.assertEqual(load_progress("basalt load: ngram 1073741824 3221225472"), ("ngram", 1 << 30, 3 << 30, False))
+        from serve.engine.progress import LoadBars
         out = Tty()
         bars = LoadBars(out, gpus=[2, 3])
         bars.set_total(2 << 30)
-        bars.set_plan("cuda0", 2 << 30)
-        bars.update("cuda0", 2 << 30, 2 << 30)
-        bars.update("ngram", 1 << 30, 3 << 30)                          # no plan line: the total is the plan
+        bars.update("weights", 2 << 30, 2 << 30)
+        bars.update("ngram", 1 << 30, 3 << 30)
         rows = [r.split("\x1b[2K")[-1] for r in out.getvalue().splitlines()[-2:]]
-        self.assertEqual(rows[0], "[server] loading weights into cuda2".ljust(49) + " [" + "=" * 24 + "]   2.0/2.0 GiB")
+        self.assertEqual(rows[0], "[server] loading model weights".ljust(49) + " [" + "=" * 24 + "]   2.0/2.0 GiB")
         self.assertEqual(rows[1], "[server] loading the n-gram table into system ram [" + "=" * 8 + ">" + " " * 15 + "]   1.0/3.0 GiB")
         bars.update("ngram", 3 << 30, 3 << 30)
         bars.finish()
         self.assertIn("[server] loaded   2.0GiB ", out.getvalue())     # the table is not part of the loaded bytes
-        self.assertIn("cuda2=2.0GiB", out.getvalue())
 
     @staticmethod
     def _screen(raw: str) -> list[str]:
@@ -1824,22 +1806,19 @@ class LoadProgress(unittest.TestCase):
         return [x for x in rows if x]
 
     def _ple_ram_start(self, out, foreign):
-        """The line sequence of a start with the n-gram table in RAM: the table rows come while cuda0 is loading."""
+        """The line sequence of a start with the n-gram table in RAM: the table row comes while the weights load."""
         from serve.engine import progress
         from serve.engine.progress import LoadBars
         G = 1 << 30
         bars = progress._active = LoadBars(out, gpus=[0, 1])
         try:
             bars.set_total(40 * G)
-            bars.set_plan("cuda0", 30 * G)
-            bars.set_plan("ram", 10 * G)
             for k in range(1, 6):
-                bars.update("cuda0", 5 * G * k, 30 * G)
+                bars.update("weights", 5 * G * k, 40 * G)
             for k in range(0, 4):
                 bars.update("ngram", 18 * G * k // 3 * 1, 18 * G)
-                bars.update("cuda0", (25 + k) * G, 30 * G)
-            bars.update("cuda0", 30 * G, 30 * G)
-            bars.update("ram", 10 * G, 10 * G)
+                bars.update("weights", (25 + k) * G, 40 * G)
+            bars.update("weights", 40 * G, 40 * G)
             bars.update("ngram", 18 * G, 18 * G)
             if foreign:
                 progress.server_line("[server] auto flags: spec 7")
@@ -1860,12 +1839,11 @@ class LoadProgress(unittest.TestCase):
         out = Tty()
         from serve.engine.progress import LoadBars
         bars = LoadBars(out)
-        bars.set_plan("cuda0", 4 << 30)
-        bars.update("cuda0", 3 << 30, 4 << 30)
+        bars.update("weights", 3 << 30, 4 << 30)
         bars.update("ngram", 1 << 30, 3 << 30)
         shown = self._screen(out.getvalue())
         self.assertEqual([x.split(" [")[0].rstrip() for x in shown],
-                         ["[server] loading weights into cuda0", "[server] loading the n-gram table into system ram"])
+                         ["[server] loading model weights", "[server] loading the n-gram table into system ram"])
 
     def test_off_a_terminal_only_the_result_line_prints(self):
         out = io.StringIO()
@@ -1888,7 +1866,7 @@ class LoadProgress(unittest.TestCase):
         bars = LoadBars(out, gpus=[2, 3])
         bars.set_total(2 << 30)
         bars.set_kv("cuda0", 4 << 30, 262144)
-        bars.update("cuda0", 2 << 30, 2 << 30)
+        bars.update("weights", 2 << 30, 2 << 30)
         bars.finish()
         first, second = out.getvalue().splitlines()
         self.assertTrue(first.startswith("[server] loaded   2.0GiB "))   # the allocation is not in the total
@@ -1917,41 +1895,19 @@ class LoadProgress(unittest.TestCase):
         slots.set_kv("cuda0", 1 << 29, 262144, "slot", 4 << 30)
         self.assertEqual(slots.kv_lines(), ["[server] kv       1.0/8.0GiB cuda0 elastic slots=2"])
 
-    def test_a_target_planned_empty_shows_nothing(self):
-        from serve.engine.progress import LoadBars
-        out = Tty()
-        bars = LoadBars(out)
-        bars.set_plan("cuda0", 1 << 30)
-        bars.set_plan("ram", 0)
-        bars.update("cuda0", 0, 1 << 30)
-        bars.update("ram", 0, 0)
-        self.assertEqual(len(bars.lines()), 1)
-
-    def test_a_lowered_total_ends_at_full(self):
-        from serve.engine.progress import LoadBars
-        out = io.StringIO()
-        bars = LoadBars(out)
-        bars.set_total(6 << 30)
-        bars.update("cuda0", 0, 4 << 30)
-        bars.update("cuda0", 4 << 30, 4 << 30)
-        bars.set_total(4 << 30)                                         # the engine left 2 GiB on the file
-        bars.finish()
-        self.assertTrue(out.getvalue().startswith("[server] loaded   4.0GiB "))
-
     def test_names_follow_the_picked_cards(self):
         from serve.engine.progress import LoadBars
-        self.assertEqual(LoadBars(gpus=[2, 3]).name("cuda1"), "cuda3")
-        self.assertEqual(LoadBars().name("cuda1"), "cuda1")
-        self.assertEqual(LoadBars().name("ram"), "system ram")
+        self.assertEqual(LoadBars(gpus=[2, 3]).key("cuda1"), "cuda3")
+        self.assertEqual(LoadBars().key("cuda1"), "cuda1")
 
     def test_narrator_shows_warnings_and_the_result(self):
         from serve.engine.progress import narrate_start
         d = tempfile.mkdtemp()
         log = Path(d) / "engine.log"
-        log.write_text("basalt load: total 200\nbasalt load: plan cuda0 100\nbasalt load: plan ram 100\nbasalt load: plan copy cuda1 100\nbasalt warning: model 1.0 GiB, free VRAM + RAM 0.5 GiB: slow\n"
-                       "basalt load: cuda0 0 100\nbasalt generate: expert arena: resident, 31.64 GiB\n"
-                       "basalt load: cuda0 100 100\nbasalt load: ram 0 100\nbasalt load: ram 100 100\n"
-                       "basalt load: copy cuda1 100 100\nbasalt generate: session is up (engine 1)\n", encoding="utf-8")
+        log.write_text("basalt load: total 200\nbasalt warning: model 1.0 GiB, free VRAM + RAM 0.5 GiB: slow\n"
+                       "basalt load: weights 0 200\nbasalt generate: expert arena: resident, 31.64 GiB\n"
+                       "basalt load: weights 100 200\nbasalt load: weights 200 200\n"
+                       "basalt generate: session is up (engine 1)\n", encoding="utf-8")
         done, out = threading.Event(), io.StringIO()
         with contextlib.redirect_stdout(out):
             t = threading.Thread(target=narrate_start, args=(str(log), 0, done))
@@ -1963,7 +1919,6 @@ class LoadProgress(unittest.TestCase):
         self.assertEqual(lines[0], "[server] warning: model 1.0 GiB, free VRAM + RAM 0.5 GiB: slow")
         self.assertEqual(len(lines), 2)
         self.assertTrue(lines[1].startswith("[server] loaded   0.0GiB "))
-        self.assertTrue(lines[1].endswith("cuda0=0.0GiB ram=0.0GiB cuda1-copy=0.0GiB"))
 
     def test_narrator_shows_the_ram_floor_line(self):
         from serve.engine.progress import engine_ram_floor, narrate_start
@@ -1983,11 +1938,13 @@ class LoadProgress(unittest.TestCase):
             t.join(5)
         self.assertEqual(out.getvalue().splitlines()[0], "[server] ram      floor " + text)
 
-    def test_an_older_engine_without_a_total_counts_bytes(self):
-        from serve.engine.progress import narrate_start
+    def test_planning_is_said_before_the_bar(self):
+        from serve.engine.progress import load_planning, narrate_start
+        self.assertTrue(load_planning("basalt load: planning"))
+        self.assertFalse(load_planning("basalt load: total 4096"))
         d = tempfile.mkdtemp()
         log = Path(d) / "engine.log"
-        log.write_text("basalt load: cuda0 0 100\nbasalt load: cuda0 100 100\n", encoding="utf-8")
+        log.write_text("basalt load: planning\nbasalt load: total 4096\nbasalt load: weights 0 4096\n", encoding="utf-8")
         done, out = threading.Event(), Tty()
         t = threading.Thread(target=narrate_start, args=(str(log), 0, done), kwargs={"out": out})
         t.start()
@@ -1995,7 +1952,22 @@ class LoadProgress(unittest.TestCase):
         done.set()
         t.join(5)
         text = out.getvalue()
-        self.assertIn("[server] loading weights into cuda0    0.0 GiB", text)
+        self.assertIn("[server] planning weight allocation", text)
+        self.assertLess(text.index("planning weight allocation"), text.index("loading model weights"))
+
+    def test_an_engine_without_a_total_counts_bytes(self):
+        from serve.engine.progress import narrate_start
+        d = tempfile.mkdtemp()
+        log = Path(d) / "engine.log"
+        log.write_text("basalt load: weights 0 0\nbasalt load: weights 100 0\n", encoding="utf-8")
+        done, out = threading.Event(), Tty()
+        t = threading.Thread(target=narrate_start, args=(str(log), 0, done), kwargs={"out": out})
+        t.start()
+        time.sleep(0.6)
+        done.set()
+        t.join(5)
+        text = out.getvalue()
+        self.assertIn("[server] loading model weights    0.0 GiB", text)
         self.assertNotIn("[=", text)
 
 
@@ -2247,7 +2219,7 @@ class LiveRate(unittest.TestCase):
         class HalfDead(MockEngine):
             last = {"generated": 99, "prompt_tokens": 9, "prompt_ms": 10.0, "decode_ms": 100.0, "finish": "stop"}
 
-            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
                 for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
                     if i == 3:
                         raise EngineDied("the engine stopped unexpectedly (exit code -9)")
@@ -2490,7 +2462,7 @@ class ClockedEngine(MockEngine):
     """The mock engine with ProcessEngine's clock and a conversation cache holding the first REUSED tokens."""
     REUSED = 5
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         n = 0
         try:
             for t in super().generate(ids, max_new, sampling, cancel, embeddings):
@@ -2620,6 +2592,15 @@ class UsageAndStatus(unittest.TestCase):
         self.assertGreaterEqual(s["activity"]["requests"], 1)
         self.assertEqual(s["last_timings"]["cache_n"], ClockedEngine.REUSED)
         self.assertIn("at", s["last_timings"])
+        self.assertIsNone(s["context"]["elastic_kv_ceiling"])             # an engine without an elastic KV
+
+    def test_v1_status_elastic_kv_ceiling(self):
+        """The ceiling is the engine's latest INFO elastic_kv_ceiling, as it moves."""
+        self.assertFalse(hasattr(self.engine, "info"))                    # the mock reports no facts
+        self.addCleanup(delattr, self.engine, "info")
+        for cells in (180224, 179968):
+            self.engine.info = {"elastic_kv_ceiling": cells}
+            self.assertEqual(json.loads(self.request("/v1/status")[1])["context"]["elastic_kv_ceiling"], cells)
 
     def test_no_clock(self):
         """An engine without a clock (MockEngine): no timings, nothing cached."""
@@ -2799,11 +2780,18 @@ class ThinkingEngine(MockEngine):
     def __init__(self, tok):
         super().__init__(tok, "x", max_context=CTX)
         self.prompts = []
+        self.caps = []          # each pass's max_new
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         self.prompts.append(list(ids))
-        done = self.tok.decode(ids).endswith("</think>\n\n")
-        text = self.ANSWER if done else self.THOUGHT + ("" if self.end_in_thought else "</think>\n\n" + self.ANSWER)
+        self.caps.append(max_new)
+        text = self.tok.decode(ids)
+        if text.endswith("</think>\n\n"):
+            text = self.ANSWER
+        else:   # a pass that continues an earlier one picks up where its prompt ends
+            full = self.THOUGHT + ("" if self.end_in_thought else "</think>\n\n" + self.ANSWER)
+            said = text.split("<think>\n")[-1] if "<think>\n" in text else ""
+            text = full[len(said):] if full.startswith(said) else full
         for t in (self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
             if cancel.is_set():
                 return
@@ -2815,7 +2803,7 @@ class CachingThinkingEngine(ThinkingEngine):
     the previous pass's stream (a continued request finds its own prompt and tokens there)."""
     FIRST = 3
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
         reused = self.FIRST if not self.prompts else len(self.prompts[-1])
         n = 0
         try:
@@ -2861,7 +2849,17 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(code, 200, b)
         msg = b["choices"][0]["message"]
         self.assertEqual((msg["reasoning_content"], msg["content"]), (ThinkingEngine.THOUGHT, ThinkingEngine.ANSWER))
-        self.assertEqual(len(self.engine.prompts), 1)
+        self.assert_one_reply()
+
+    def assert_one_reply(self):
+        """Every pass after the first (the first stops at the thinking budget) extends the one before with exactly what
+        it wrote: nothing inserted, so the reply is the one a single pass gives."""
+        from serve.service import REASONING_CLOSE
+        ps = self.engine.prompts
+        for a, b in zip(ps, ps[1:]):
+            said = self.tok.decode(b[len(a):])
+            self.assertEqual(b[:len(a)], a)
+            self.assertNotIn(REASONING_CLOSE, said)          # the server closed nothing
 
     def test_cached_tokens_of_a_wrapped_up_request_come_from_its_first_pass(self):
         self.engine = CachingThinkingEngine(self.tok)
@@ -2887,6 +2885,22 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(second, first + self.tok.encode(ThinkingEngine.THOUGHT[:20]) + extra)   # a prefix + more
         self.assertEqual(b["usage"]["completion_tokens"], 20 + len(extra) + len(ThinkingEngine.ANSWER) + 1)
         self.assertEqual(b["usage"]["prompt_tokens"], len(first))
+
+    def test_the_budget_caps_the_engine_pass(self):
+        """The first pass asks for the budget's tokens only, so the engine stops on its last one and the next pass
+        extends what it holds (an overshoot would be read again through the prompt path, which rounds differently)."""
+        code, b = self.openai(reasoning_budget_tokens=20)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(self.engine.caps[0], 20)
+
+    def test_a_thinking_shorter_than_the_budget_answers_as_one_reply(self):
+        """The thinking ends inside the capped pass: the answer goes on in a further pass, unchanged."""
+        code, b = self.openai(reasoning_budget_tokens=len(ThinkingEngine.THOUGHT) + 5)
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual((msg["reasoning_content"], msg["content"]), (ThinkingEngine.THOUGHT, ThinkingEngine.ANSWER))
+        self.assertEqual(self.engine.caps[0], len(ThinkingEngine.THOUGHT) + 5)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
 
     def test_a_token_repeated_in_the_thinking_ends_it(self):
         """256 of one token in a row inside the thinking: the thinking is ended and the model answers."""
@@ -2921,6 +2935,7 @@ class ThinkingBudget(unittest.TestCase):
 
     def test_a_looped_thinking_that_fills_the_cap_is_length(self):
         """No room left after the end of the thinking: finish_reason stays "length"."""
+        self.svc.answer_room = 0
         self.engine.THOUGHT = "0" * 400
         code, b = self.openai(max_tokens=260)
         self.assertEqual(code, 200, b)
@@ -2966,18 +2981,30 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(msg["reasoning_content"], self.engine.THOUGHT[:512] + REASONING_WRAP_UP.split("</think>")[0])
         self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
 
-    def test_answer_room_off_and_below_its_cap(self):
+    def test_answer_room_zero_reserves_nothing(self):
         self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
-        self.svc.answer_room = False                                   # --no-answer-room: thinks it all out
+        self.svc.answer_room = 0
         code, b = self.openai(max_tokens=1024)
         self.assertEqual(code, 200, b)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], self.engine.THOUGHT)
-        self.svc.answer_room = True                                    # below max_tokens 1024: left as it was
-        self.engine.THOUGHT = ThinkingEngine.THOUGHT
-        code, b = self.openai(max_tokens=400)
+
+    def test_answer_room_auto_halves_small_caps_without_a_budget(self):
+        from serve.service import REASONING_WRAP_UP
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
+        for cap in (200, 400, 700):
+            with self.subTest(cap=cap):
+                code, b = self.openai(max_tokens=cap)
+                self.assertEqual(code, 200, b)
+                msg = b["choices"][0]["message"]
+                self.assertEqual(msg["reasoning_content"], self.engine.THOUGHT[:cap // 2] + REASONING_WRAP_UP.split("</think>")[0])
+                self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
+
+    def test_answer_room_fixed_reserve_lets_the_model_think_more(self):
+        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
+        self.svc.answer_room = 100                                     # auto would keep 512 at this cap
+        code, b = self.openai(max_tokens=1024)
         self.assertEqual(code, 200, b)
-        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
-        self.assertEqual(len(self.engine.prompts), 2)                  # one pass each, no wrap-up
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], self.engine.THOUGHT)   # 924 allowed, 736 used
 
     def test_answer_room_preserves_explicit_opt_outs_and_budget_precedence(self):
         self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
@@ -3014,7 +3041,7 @@ class ThinkingBudget(unittest.TestCase):
 
         effective_cap = 1024
 
-        def clipped(ids, max_new, sampling, cancel, embeddings=None):
+        def clipped(ids, max_new, sampling, cancel, embeddings=None, session=None):
             if isinstance(ids, PromptText):
                 yield None                              # waiting for the engine's prompt count
                 ids.set_counted(len(ids.ids()), effective_cap)
@@ -3033,8 +3060,9 @@ class ThinkingBudget(unittest.TestCase):
         effective_cap = 400
         code, b = self.openai(max_tokens=8192)
         self.assertEqual(code, 200, b)
-        self.assertEqual(b["choices"][0]["message"]["reasoning_content"], self.engine.THOUGHT[:400])
-        self.assertEqual(b["choices"][0]["finish_reason"], "length")
+        self.assertEqual(b["choices"][0]["message"]["reasoning_content"],
+                         self.engine.THOUGHT[:200] + REASONING_WRAP_UP.split("</think>")[0])
+        self.assertEqual(b["choices"][0]["message"]["content"], ThinkingEngine.ANSWER)
 
     def test_answer_room_reserves_a_quarter_of_an_8192_token_cap(self):
         from serve.service import REASONING_WRAP_UP
@@ -3103,7 +3131,7 @@ class ThinkingBudget(unittest.TestCase):
     def test_a_budget_the_thinking_stays_under(self):
         code, b = self.openai(reasoning_budget_tokens=10_000)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
-        self.assertEqual(len(self.engine.prompts), 1)
+        self.assert_one_reply()
 
     def test_the_config_default_and_a_request_that_turns_it_off(self):
         self.svc.reasoning_budget_tokens = 20                          # what --reasoning-budget-tokens sets
@@ -3184,7 +3212,7 @@ class StatusHandover(unittest.TestCase):
         class Engine(MockEngine):
             calls = 0
 
-            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
                 Engine.calls += 1
                 me = Engine.calls
                 for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):

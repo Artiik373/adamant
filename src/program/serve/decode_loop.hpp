@@ -5,6 +5,7 @@
 #pragma once
 
 #include "request.hpp"
+#include "logprobs.hpp"
 #include "reply_rows.hpp"
 
 namespace basalt::program::serve {
@@ -20,6 +21,7 @@ Flow Request::decode_loop(B& b) {
     produced_n = 0;
     draft_offered = 0;
     draft_accepted = 0;
+    windows = 0;
     window = std::vector<int32_t>((size_t) b.max_window());
     outv = std::vector<int32_t>((size_t) b.max_window());
     consumed.reserve((size_t) (n + max_new + b.max_window()));
@@ -31,6 +33,8 @@ Flow Request::decode_loop(B& b) {
     if (cancelled) finish = "cancel";
 
     const std::vector<int64_t>& eos_ids = runtime_.o.eos_ids;
+    std::vector<float> lp_rows;             // logprobs=K: the picks' rows (row_logprobs)
+    std::vector<std::string> lp_fields;     // and each pick's P line fields, sent ahead of its T line
     while (!cancelled && produced_n < max_new && (!in_slot || solo_req)) {   // (a batch slot's first token comes from the batch window)
         int T = 1;
         if constexpr (kSpec) T = b.draft_window();
@@ -85,21 +89,39 @@ Flow Request::decode_loop(B& b) {
             a = b.accept_drafts(T);
         }
         if (gguard != nullptr && gguard->on()) {
-            // the first sampled token the grammar refuses is drawn again under the grammar's mask, and the window ends there
-            const int miss = gguard->scan(outv.data(), a + 1);
+            // the first generated token the grammar refuses is drawn again under the grammar's mask, and the window
+            // ends there; with no token allowed at all the reply ends after this window, as an error
+            const int miss = gguard->scan(outv.data(), a + 1, e0);
             if (miss >= 0) {
-                gguard->mask_bias(req_bias, grammar_bias);
                 int32_t gtok = 0;
-                if (!b.resample_row(miss, p, grammar_bias, gtok, runtime_.err)) {
-                    std::printf("ERR %s\n", runtime_.err.c_str());
+                const basalt::program::grammar::Redraw verdict = gguard->redraw(
+                    req_bias,
+                    [&](const std::vector<float>& bias, int32_t& t) { return b.resample_row(miss, p, bias, t, runtime_.err); },
+                    [&](std::vector<float>& lg) {
+                        lg.resize((size_t) runtime_.n_vocab);
+                        return b.copy_logits(miss, lg.data());
+                    },
+                    gtok);
+                if (verdict == basalt::program::grammar::Redraw::failed) {
+                    std::printf("ERR %s\n", runtime_.err.empty() ? "the masked draw failed" : runtime_.err.c_str());
                     return Flow::error;
                 }
-                outv[(size_t) miss] = gtok;
+                if (verdict == basalt::program::grammar::Redraw::dead) grammar_dead = true;
+                else outv[(size_t) miss] = gtok;
                 a = miss;
-                if (!gguard->take(gtok))
-                    basalt::log::info("basalt grammar", "the masked draw at row %d of %d was token %d", miss, T, (int) gtok);
                 ++grammar_resamples;
             }
+        }
+        if (req_logprobs >= 0 && ppl == nullptr) {   // the picks are final: read their rows before the commit
+            constexpr int S = basalt::kernels::kLogprobStride;
+            lp_rows.resize((size_t) (a + 1 - e0) * S);
+            lp_fields.assign((size_t) a + 1, std::string());
+            if (!b.row_logprobs(e0, a + 1 - e0, outv.data() + e0, req_logprobs, lp_rows.data())) {
+                std::printf("ERR logprobs: the head logits read failed\n");
+                return Flow::error;
+            }
+            for (int i = e0; i <= a; ++i)
+                lp_fields[(size_t) i] = logprob_fields(lp_rows.data() + (size_t) (i - e0) * S, outv[(size_t) i], req_logprobs);
         }
         if (ppl != nullptr) {   // every row scored and committed
             a = T - 1;
@@ -135,6 +157,7 @@ Flow Request::decode_loop(B& b) {
         for (int i = 0; i < keep; ++i) consumed.push_back(window[(size_t) i]);
         draft_offered += T - 1 - e0;
         draft_accepted += a - e0;
+        ++windows;
         first_window = false;
         bool commit_ok = true, after_ran = false, eos = false;
         std::string cerr;
@@ -143,6 +166,7 @@ Flow Request::decode_loop(B& b) {
             commit_ok = hold ? true : b.commit(keep, cerr, 1);
             if (!hold) tier.after_commit();
             for (int i = e0; i <= a && produced_n < max_new && !eos; ++i) {
+                if (req_logprobs >= 0 && ppl == nullptr) std::printf("P%s\n", lp_fields[(size_t) i].c_str());
                 std::printf("T %d\n", (int) outv[(size_t) i]);
                 basalt::core::progress_beat();
                 ++produced_n;
@@ -180,6 +204,7 @@ Flow Request::decode_loop(B& b) {
         }
         b.mark_loop_end();
         if (eos) { finish = "stop"; break; }
+        if (grammar_dead) { finish = "error"; break; }
         b.shed_low();
         runtime_.ram_balance(false);
         if (runtime_.halted()) { finish = "cancel"; break; }

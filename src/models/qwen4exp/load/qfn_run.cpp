@@ -95,7 +95,9 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     bool split_alike = true;
     for (size_t i = 1; i < chosen_cards.size(); ++i)
         split_alike = split_alike && basalt::program::cards_alike(chosen_cards[0], chosen_cards[i]);
-    const int split_cap = o.peer_devices.size() <= 1 ? 2 : split_alike ? (int) o.peer_devices.size() + 1 : 1;
+    int split_cap = 0;
+    auto set_split_cap = [&]() { split_cap = o.peer_devices.size() <= 1 ? 2 : split_alike ? (int) o.peer_devices.size() + 1 : 1; };
+    set_split_cap();
     basalt::core::PeerExperts::set_min_scratch((size_t) basalt::kernels::moe_hit_grouped_scratch_bytes(basalt::kernels::cpu::MAXT * 10, basalt::kernels::cpu::H, basalt::kernels::cpu::FF));
     basalt::core::set_peer_portable(o.peer_device >= 1 || !o.layer_split.empty());   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     // Chunks below this take the routed-only path with the peer card computing its experts' rows; from it on
@@ -103,8 +105,9 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     // plus the time to move the experts the primary lacks over its link; with --peer-exclusive that includes the
     // peer-only experts, staged through the host, so streaming loses until later.
     auto set_stream_all_min = [&]() {
-        if (o.serve && o.peer_device >= 1 && !o.no_peer_prefill && peer_streamed_share)
-            basalt::prefill::Prefill::set_stream_all_min(o.peer_exclusive ? 4096 : 2560);
+        basalt::prefill::Prefill::set_stream_all_min(
+            o.serve && o.peer_device >= 1 && !o.no_peer_prefill && peer_streamed_share
+                ? (o.peer_exclusive ? 4096 : 2560) : basalt::prefill::Prefill::kStreamAllMinDefault);
     };
     set_stream_all_min();
     if (o.serve && o.conversation_cache_disk_mib > 0 && o.conversation_cache_dir.empty()) {
@@ -118,8 +121,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
     // the next visible ones); "auto" places the K from each GPU's free VRAM once the weights are in (below).  KV
     // streaming and images (the server's GPU encoder) run across a split, also with parking and --batch.  Across
-    // GPUs, not supported: control vectors and lending cache slots to the
-    // prompt path (each stage's prompt path has its own buffers).
+    // GPUs, not supported: lending cache slots to the prompt path (each stage's prompt path has its own buffers).
     std::vector<int64_t> split_at;
     std::vector<int> split_devs;
     bool split_auto = false, split_same = false;
@@ -216,7 +218,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
         }
     }
     basalt::kernels::RopeScaling rope_cfg;
-    if (const auto code = cli::validate_generation_options(o, multi_gpu, vram_floor_mib(), rope_cfg)) return *code;
+    if (const auto code = cli::validate_generation_options(o, multi_gpu, vram_floor_mib())) return *code;
 
     // **BEFORE ANYTHING ELSE.**  The CPU expert kernel is AVX-512 (VNNI + VBMI), so on a CPU without those features it
     // does not fail - it executes an illegal instruction at some unpredictable token.  Refusing at second zero is the
@@ -327,6 +329,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     context.peer_streamed_share = &peer_streamed_share;
     context.split_want = &split_want;
     context.split_cap = &split_cap;
+    context.set_split_cap = set_split_cap;
     context.set_stream_all_min = set_stream_all_min;
     context.split_at = &split_at;
     context.split_devs = &split_devs;
