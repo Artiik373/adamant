@@ -1,6 +1,6 @@
 // src/models/hy4/adapter.cpp - the Hy4-flash adapter and its serving: one request at a time over the --serve line
 // protocol's solo subset (GEN, STOP, VRAM, QUIT). A request reuses the prompt prefix the engine already holds; the
-// prompt runs in windows of kMaxT, decode windows carry the DFly2 drafts while the product of their accept chances
+// prompt runs in windows of kMaxP, decode windows carry the DFly2 drafts while the product of their accept chances
 // stays at kDflyMin or above, and each row's pick (greedy, or sampled on the host) accepts drafts up to the first
 // that differs or falls below the relaxed-drafting threshold.
 #include "models/hy4/adapter.hpp"
@@ -204,9 +204,9 @@ private:
         max_new = std::min<int64_t>(max_new, o_.max_context - n);
         const bool greedy = s.temperature <= 0;
         std::mt19937_64 rng(s.seeded ? s.seed : std::random_device{}());
-        if (!greedy) logits_.resize((size_t) kMaxT * kVocab);
+        if (!greedy) logits_.resize((size_t) kMaxP * kVocab);
         std::string err;
-        int32_t picks[kMaxT];
+        int32_t picks[kMaxP];
 
         // the prompt: the held prefix stays, at least the last token runs again
         int64_t reuse = 0;
@@ -218,7 +218,7 @@ private:
         int32_t next = -1;
         bool stopped = false;
         while (pos < n) {
-            const int rows = (int) std::min<int64_t>(kMaxT, n - pos);
+            const int rows = (int) std::min<int64_t>(kMaxP, n - pos);
             const bool last = pos + rows == n;
             if (!eng_.step_window(ids.data() + pos, rows, pos, picks, last && !greedy ? logits_.data() : nullptr, err))
                 return fail(err);

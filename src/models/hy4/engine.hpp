@@ -34,9 +34,10 @@ public:
     Engine& operator=(const Engine&) = delete;
 
     bool load(const std::string& pack, const EngineOptions& o, std::string& err);
-    /// Runs tokens[0..n) (n <= kMaxT) at positions pos .. pos + n - 1. `pos` may be below the positions run so far:
+    /// Runs tokens[0..n) (n <= kMaxP) at positions pos .. pos + n - 1. `pos` may be below the positions run so far:
     /// the later ones are dropped (a rejected draft). picks[t]: the greedy next token after tokens[t]; `logits`
-    /// ([n][kVocab] floats, host) optional.
+    /// ([n][kVocab] floats, host) optional. A window wider than kMaxT (a prompt's) gives its last row only: the
+    /// other picks are -1 and their logits rows are left as they were.
     bool step_window(const int32_t* tokens, int n, int64_t pos, int32_t* picks, float* logits, std::string& err);
     /// step_window of one token; returns the greedy next token, -1 on failure.
     int32_t step(int32_t token, int64_t pos, float* logits, std::string& err);
