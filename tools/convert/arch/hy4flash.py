@@ -21,6 +21,8 @@ ENGRAM_TENSOR = "per_layer_token_embd.weight"
 ENGRAM_SECTION = "engram"
 ENGRAM_LAYERS = [1, 11, 21, 31]
 F8_E4M3_RAW = 43              # llama.cpp's F8_E4M3: one E4M3 code per value, no scale
+Q4_0 = 2                      # ggml's Q4_0: 32 values in 18 bytes (fp16 scale, 16 bytes of nibbles)
+ENGRAM_ROW = {F8_E4M3_RAW: ("F8_E4M3_RAW", F8_E4M3_RAW, lambda n: n), Q4_0: ("Q4_0", Q4_0, lambda n: n // 32 * 18)}   # name, type_id, row bytes
 P = "hy_v4_flash."
 # GGUF keys of the Engram hash and row layout, copied to meta.engram (the token map stays in gguf_kv)
 ENGRAM_KEYS = (
@@ -41,8 +43,8 @@ class Hy4Flash(Arch):
     projector_type = "hy_v4_flash"
     needs_hf_dir = True
     sampling_kv = {}
-    engram_type = F8_E4M3_RAW     # the source table's type; the BF16 GGUF's is BF16 (hy4flash_bf16.py rounds it)
-    needs_nextn = True            # the Q4_K_M GGUF keeps llama.cpp's next-n block (the BF16 GGUF has none)
+    engram_types = (F8_E4M3_RAW, Q4_0)   # the source table's types kept as they are; the BF16 GGUF's is rounded (hy4flash_bf16.py)
+    needs_nextn = False           # AngelSlim's Q4_K_M GGUF keeps llama.cpp's next-n block, others have none
 
     def mtp_layers(self, kv):
         n = int(kv[P + "block_count"])
@@ -85,8 +87,10 @@ class Hy4Flash(Arch):
         if t is None:
             raise ConvertError(f"the model has no {ENGRAM_TENSOR} (the Engram table)")
         width = int(kv.get(P + "embedding_length_per_layer_input", 0))
-        if t.type_id != self.engram_type or len(t.shape) != 2 or int(t.shape[0]) != width:
-            raise ConvertError(f"{ENGRAM_TENSOR} is {t.type_name} {list(t.shape)}; expected rows of {width} values of type {self.engram_type}")
+        if t.type_id not in self.engram_types or len(t.shape) != 2 or int(t.shape[0]) != width or \
+                (t.type_id == Q4_0 and width % 32 != 0):
+            raise ConvertError(f"{ENGRAM_TENSOR} is {t.type_name} {list(t.shape)}; expected rows of {width} values of type "
+                               f"{' or '.join(str(x) for x in self.engram_types)}")
         sizes = kv.get(P + "ple.head_vocab_sizes")
         offs = kv.get(P + "ple.head_offsets")
         if not sizes or not offs or len(sizes) != len(offs):
@@ -104,11 +108,13 @@ class Hy4Flash(Arch):
     def meta_extra(self, kv, tensors, own):
         t = own[ENGRAM_TENSOR]
         width = int(t.shape[0])
+        tid = t.type_id if t.type_id in ENGRAM_ROW else F8_E4M3_RAW   # a BF16 table is rounded to E4M3 (hy4flash_bf16.py)
+        name, _, row = ENGRAM_ROW[tid]
         return {
             "arch": self.name,
             "geometry": {k[len(P):]: v for k, v in kv.items() if k.startswith(P) and k[len(P):] not in NOT_GEOMETRY},
-            "engram": {"section": ENGRAM_SECTION, "tensor": ENGRAM_TENSOR, "type": "F8_E4M3_RAW", "type_id": F8_E4M3_RAW,
-                       "rows": int(t.shape[1]), "row_values": width, "row_bytes": width, "bytes": int(t.shape[1]) * width,
+            "engram": {"section": ENGRAM_SECTION, "tensor": ENGRAM_TENSOR, "type": name, "type_id": tid,
+                       "rows": int(t.shape[1]), "row_values": width, "row_bytes": row(width), "bytes": int(t.shape[1]) * row(width),
                        **{k: kv[P + k] for k in ENGRAM_KEYS if P + k in kv},
                        "token_map": "gguf_kv:" + P + "engram.token_map"},
             "vision": None,

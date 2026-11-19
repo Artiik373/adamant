@@ -271,14 +271,14 @@ class Experts:
     """The `experts` section and its `experts.layout`; each role is resolved by name in the shard that holds it."""
 
     def __init__(self, model: SourceModel, layers=None):
-        """`layers`: the layer ids that hold routed experts (default 0 .. the last layer with expert tensors); the
+        """`layers`: the layer ids that hold routed experts (default: every layer with expert tensors); the
             layout lists exactly these, by layer id."""
         T = {n: w[1] for n, w in model.where.items()}
         exps = [n for n in T if n.startswith("blk.") and n.endswith("_exps.weight")]
         if not exps:
             raise ConvertError("the model has no expert tensors (blk.N.ffn_{gate,up,down}_exps.weight)")
         self.model = model
-        self.layers = list(layers) if layers is not None else list(range(1 + max(int(n.split(".")[1]) for n in exps)))
+        self.layers = list(layers) if layers is not None else sorted({int(n.split(".")[1]) for n in exps})
         if not self.layers:
             raise ConvertError("no layer holds routed experts")
         self.n_layers = len(self.layers)

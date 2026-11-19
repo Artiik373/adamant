@@ -1,10 +1,11 @@
-// src/models/hy4flash/engram.hpp - the Engram row lookup of Hy4-flash: the n-gram hash and the F8_E4M3 rows as floats.
+// src/models/hy4flash/engram.hpp - the Engram row lookup of Hy4-flash: the n-gram hash and the rows (F8_E4M3 or Q4_0) as floats.
 #pragma once
 
 #include "models/hy4flash/pack.hpp"
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 namespace basalt::models::hy4flash {
 
@@ -47,6 +48,32 @@ inline float e4m3_to_f32(uint8_t b) {
     if (e == 15 && m == 7) return NAN;
     const float v = e ? std::ldexp(1.f + (float) m / 8.f, e - 7) : std::ldexp((float) m, -9);
     return (b & 0x80) ? -v : v;
+}
+
+/// One fp16 as a float.
+inline float f16_to_f32(uint16_t h) {
+    const int e = (h >> 10) & 31, m = h & 1023;
+    float v = e == 0 ? std::ldexp((float) m, -24) : e == 31 ? (m ? NAN : INFINITY) : std::ldexp(1.f + (float) m / 1024.f, e - 15);
+    return (h & 0x8000) ? -v : v;
+}
+
+/// The p.row_values values of one table row `src` (p.row_bytes bytes) into `row`: an E4M3 code each (`lut`, 256 floats), or
+/// ggml's Q4_0 blocks (fp16 d, 16 bytes of nibbles: value i is the low nibble of byte i, value i + 16 the high one, (q - 8) d).
+inline void engram_row(const EngramInfo& p, const float* lut, const uint8_t* src, float* row) {
+    if (p.type != 2) {
+        for (int d = 0; d < p.row_values; ++d) row[d] = lut[src[d]];
+        return;
+    }
+    for (int b = 0; b < p.row_values / 32; ++b) {
+        const uint8_t* blk = src + b * 18;
+        uint16_t h;
+        std::memcpy(&h, blk, 2);
+        const float d = f16_to_f32(h);
+        for (int i = 0; i < 16; ++i) {
+            row[b * 32 + i] = (float) ((blk[2 + i] & 15) - 8) * d;
+            row[b * 32 + i + 16] = (float) ((blk[2 + i] >> 4) - 8) * d;
+        }
+    }
 }
 
 }  // namespace basalt::models::hy4flash

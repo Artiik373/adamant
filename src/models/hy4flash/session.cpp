@@ -73,6 +73,7 @@ constexpr uint64_t kModuleRoom = 7ull << 27;   // kernel modules still to load w
 constexpr uint64_t kPromptRoom = 5ull << 29;   // the prompt path's workspaces beside the homes
 constexpr int kLookupK = core::ExpertTier::kMaxK;
 constexpr int kTypeNvfp4 = 40;                 // ggml's NVFP4: blobs end in the FP32 scales {s_gate, s_up, s_down, 0}
+constexpr int kTypeBf16 = 30;
 
 // One group's GPU plan for the grouped expert kernel, uploaded with a single copy.
 struct WindowPlan {
@@ -252,6 +253,10 @@ public:
         if (!make_bufs(dec_, kMaxWindow, err)) return false;
         use(dec_);
         // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
+        if (m_.dfly() && m_.tensor("output.weight")->type != kTypeBf16) {
+            err = "the DFly2 drafter reads a BF16 head; this pack's is type " + std::to_string(m_.tensor("output.weight")->type);
+            return false;
+        }
         if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, m_.dfly() ? (const uint16_t*) m_.tensor("output.weight")->ptr : nullptr,
                         [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err))
             return false;
@@ -1474,7 +1479,7 @@ private:
 
     void prefetch_engram(int64_t pos0, int R) {
         const EngramInfo& en = m_.pack().engram;
-        const int n_cols = en.n_cols(), W = en.row_values;
+        const int n_cols = en.n_cols();
         pf_.assign(en.layers.size(), Prefetch());
         for (size_t e = 0; e < en.layers.size(); ++e) {
             Prefetch& p = pf_[e];
@@ -1485,7 +1490,7 @@ private:
                 const int32_t p1 = pos >= 1 ? hist_[(size_t) pos - 1] : -1, p2 = pos >= 2 ? hist_[(size_t) pos - 2] : -1;
                 engram_ids(en, (int) e, hist_[(size_t) pos], p1, p2, pos, false, ids.data() + (size_t) t * n_cols, p.valid[(size_t) t]);
             }
-            p.raw.resize((size_t) R * n_cols * W);
+            p.raw.resize((size_t) R * n_cols * en.row_bytes);
             p.tk = m_.engram_reader().issue(ids.data(), ids.size(), p.raw.data());
             p.issued = true;
         }
@@ -1526,7 +1531,7 @@ private:
                 pf->collected = true;
             }
             for (int t = 0; t < R; ++t) h_evalid_[t] = pf->valid[(size_t) (off + t)];
-            raw = pf->raw.data() + (size_t) off * n_cols * W;
+            raw = pf->raw.data() + (size_t) off * n_cols * en.row_bytes;
         } else {
             std::vector<uint32_t> ids((size_t) R * n_cols);
             for (int t = 0; t < R; ++t) {
@@ -1536,7 +1541,7 @@ private:
                 engram_ids(en, e, tokens[t], p1, p2, pos, false, ids.data() + (size_t) t * n_cols, valid);
                 h_evalid_[t] = valid;
             }
-            own_raw.resize((size_t) R * n_cols * W);
+            own_raw.resize((size_t) R * n_cols * en.row_bytes);
             ngram::PleReader& rd = m_.engram_reader();
             const ngram::PleReader::Ticket tk = rd.issue(ids.data(), ids.size(), own_raw.data());
             if (!rd.collect(tk, err)) return false;
@@ -1553,12 +1558,9 @@ private:
             const float valid = h_evalid_[t];
             for (int c = 0; c < n_cols; ++c) {
                 float* row = h_erows_ + ((size_t) t * n_cols + c) * W;
-                const uint8_t* src = raw + ((size_t) t * n_cols + c) * W;
+                engram_row(en, lut.data(), raw + ((size_t) t * n_cols + c) * en.row_bytes, row);
                 float ss = 0.f;
-                for (int d = 0; d < W; ++d) {
-                    row[d] = lut[src[d]];
-                    ss += row[d] * row[d];
-                }
+                for (int d = 0; d < W; ++d) ss += row[d] * row[d];
                 const float r = 1.0f / std::sqrt(ss / (float) W + 1.1920929e-07f);
                 for (int d = 0; d < W; ++d) row[d] = row[d] * r * nrm[(size_t) c * W + d] * valid;
             }
@@ -2305,7 +2307,10 @@ private:
             bk::rms_norm_rows(cur_, (const float*) m_.tensor("output_norm.weight")->ptr, fin_, head_rows, E, g_.rms_eps, stream_);
             dfly_.hidden(R - head_rows, head_rows, fin_, stream_);   // DFLY HOOK
             const DevTensor* head = m_.tensor("output.weight");
-            bk::bf16_gemv_fp32_mmvf_multi(fin_, E, (const uint16_t*) head->ptr, logits_, g_.n_vocab, E, g_.n_vocab, head_rows, stream_);
+            if (head->type == kTypeBf16)
+                bk::bf16_gemv_fp32_mmvf_multi(fin_, E, (const uint16_t*) head->ptr, logits_, g_.n_vocab, E, g_.n_vocab, head_rows, stream_);
+            else
+                gemm(head, fin_, logits_, E, g_.n_vocab, head_rows);
             if (!m_.diag_dump().empty()) {
                 dump("result_norm", fin_, (int64_t) head_rows * E);
                 dump("result_output", logits_, (int64_t) head_rows * g_.n_vocab);

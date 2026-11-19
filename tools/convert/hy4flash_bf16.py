@@ -50,8 +50,7 @@ Q6K_TARGETS = re.compile(r"blk\.\d+\.(attn_q_a|attn_q_b|attn_kv_a_mqa|attn_gate|
 
 class Hy4FlashBf16(Hy4Flash):
     """Hy4Flash for the BF16 GGUF: a BF16 Engram table, no next-n block, the head stored as BF16."""
-    engram_type = TYPE_ID["BF16"]
-    needs_nextn = False
+    engram_types = (TYPE_ID["BF16"],)
     form_table = {"output.weight": "BF16"}
 
 
