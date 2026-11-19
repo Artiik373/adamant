@@ -92,8 +92,9 @@ __device__ __forceinline__ void fx_mma(float (&c)[4], const uint32_t (&a)[4], ui
 // integers, exact in fp16), and the A fragment holds the pass's entries as fp16 pairs hi + lo (rows 0..7 the hi parts,
 // rows 8..15 the lo parts), so the products are exact, the sums are fp32 and an entry costs no decode of its own.
 //   NC: the output columns (n); with a known rate (KA > 0) the tile addresses are then constants off one base.
+//   The second launch bound is the CTAs a multiprocessor's shared memory holds, so the register cap is no tighter.
 template <int KBW, int KPW, int NS, int NC, bool FROM_Q81, int KA, bool HALF>
-__global__ void __launch_bounds__(KBW * NS * 32, KBW * NS >= 20 ? 2 : 4)
+__global__ void __launch_bounds__(KBW * NS * 32, KBW * NS >= 20 ? 2 : KBW * NS >= 12 ? 3 : 4)
 exl3_proj_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
                     const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_src,
                     const int32_t* __restrict__ out_rows, const Q81* __restrict__ xq, const float* __restrict__ xf,
