@@ -432,7 +432,12 @@ bool DflyRunner::finish(int32_t* ids, float* conf, void* stream, std::string& er
             bk::swiglu_scaled(p.hg, p.hu, nullptr, nullptr, p.hh, 1, d.hc_ffn, d.hc_ffn, st);
             p.mm(w.hc_down, p.hh, d.hc_ffn, p.hd, E, d.hc_ffn, E, 1, st);
             add_vectors(zrow, p.hd, p.hcout, E, st);
-            bk::bf16_gemv_fp32_mmvf(p.hcout, p.env.head, p.logits, E, d.vocab, st);
+            if (p.env.head_type == 30) {
+                bk::bf16_gemv_fp32_mmvf(p.hcout, (const uint16_t*) p.env.head, p.logits, E, d.vocab, st);
+            } else {
+                bk::native_quantize_q8_1(p.hcout, p.act_q8, E, 1, st);
+                bk::native_mmvq(p.env.head_type, p.env.head, p.act_q8, p.logits, E, d.vocab, 1, st);
+            }
             bk::sample_tokens(p.logits, 1, d.vocab, nullptr, 0, sp, p.pick, st);
             f32_gemm_rows(p.hcout, w.conf_w, 1, E, 1.0f, 1, p.craw, st);
             cudaMemcpyAsync(p.h_tok, p.pick, 4, cudaMemcpyDeviceToHost, st);
@@ -460,12 +465,13 @@ bool DflyRunner::finish(int32_t* ids, float* conf, void* stream, std::string& er
 
 DflyHook::~DflyHook() = default;
 
-bool DflyHook::init(const DflyWeights* w, int sel_cap, int64_t ctx, const uint16_t* head, std::function<bool(int32_t, float*)> embed,
+bool DflyHook::init(const DflyWeights* w, int sel_cap, int64_t ctx, const void* head, int head_type, std::function<bool(int32_t, float*)> embed,
                     const std::string& dump, bool fp8, std::string& err) {
     if (!w) return true;
     fp8_ = fp8;
     dump_ = dump;
     head_ = head;
+    head_type_ = head_type;
     embed_ = embed;
     w_ = w;
     ctx_ = ctx;
@@ -474,6 +480,7 @@ bool DflyHook::init(const DflyWeights* w, int sel_cap, int64_t ctx, const uint16
     DflyRunner::Env env;
     env.w = w;
     env.head = head;
+    env.head_type = head_type;
     env.embed = std::move(embed);
     env.sel_cap = sel_cap;
     env.fp8 = fp8;
@@ -538,9 +545,12 @@ model::Result DflyHook::draft_end(int32_t* ids, float* conf, int max_n, int& n, 
         wr("anchor_emb.f32", a.data(), a.size() * 4);
         wr("mask_emb.f32", m.data(), m.size() * 4);
         wr("tok.i32", tok, (size_t) made * 4);
-        std::vector<uint16_t> row((size_t) w_->dims.E);
-        cudaMemcpy(row.data(), head_ + (size_t) tok[0] * w_->dims.E, (size_t) w_->dims.E * 2, cudaMemcpyDeviceToHost);
-        wr("head_row0.bf16", row.data(), row.size() * 2);
+        if (head_type_ == 30) {   // the head row of the first draft, as the reference dumps it
+            std::vector<uint16_t> row((size_t) w_->dims.E);
+            cudaMemcpy(row.data(), (const uint16_t*) head_ + (size_t) tok[0] * w_->dims.E, (size_t) w_->dims.E * 2,
+                       cudaMemcpyDeviceToHost);
+            wr("head_row0.bf16", row.data(), row.size() * 2);
+        }
         dump_pos_ = -1;
     }
     n = std::min(max_n, made);

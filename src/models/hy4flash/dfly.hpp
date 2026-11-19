@@ -148,7 +148,8 @@ public:
     struct Env {
         const DflyWeights* w = nullptr;
         int device = 0;
-        const uint16_t* head = nullptr;                          ///< the target's output matrix, BF16 [vocab][E]
+        const void* head = nullptr;                              ///< the target's output matrix [vocab][E]
+        int head_type = 30;                                      ///< its ggml type: BF16, or a type native_mmvq takes
         std::function<bool(int32_t, float*)> embed;              ///< a token's embedding row (E floats, host)
         int sel_cap = 2056;                                      ///< cells of a selection
         bool fp8 = false;                                        ///< the target's caches hold --kv fp8 rows (kFp8RowBytes)
@@ -184,7 +185,7 @@ public:
     /// `dump` (--diag-dump's directory, may be empty): each block's inputs (the source row's hidden state, the cache rows it attends)
     /// are written there for the first few blocks, to compare with a reference.
     /// `fp8`: the target's sparse caches hold --kv fp8 rows.
-    bool init(const DflyWeights* w, int sel_cap, int64_t ctx, const uint16_t* head, std::function<bool(int32_t, float*)> embed,
+    bool init(const DflyWeights* w, int sel_cap, int64_t ctx, const void* head, int head_type, std::function<bool(int32_t, float*)> embed,
               const std::string& dump, bool fp8, std::string& err);
     bool on() const { return runner_ != nullptr; }
     void begin_window(int64_t pos0) { if (tap_) tap_->begin_window(pos0); }
@@ -210,7 +211,8 @@ private:
     int row0_ = -1, pending_ = 0, dumped_ = 0, dump_n_ = 0;
     int64_t dump_pos_ = -1;
     int32_t dump_anchor_ = 0;
-    const uint16_t* head_ = nullptr;
+    const void* head_ = nullptr;
+    int head_type_ = 30;
     std::function<bool(int32_t, float*)> embed_;
     std::string dump_;
     int64_t ctx_ = 0;

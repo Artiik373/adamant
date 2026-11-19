@@ -253,11 +253,8 @@ public:
         if (!make_bufs(dec_, kMaxWindow, err)) return false;
         use(dec_);
         // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
-        if (m_.dfly() && m_.tensor("output.weight")->type != kTypeBf16) {
-            err = "the DFly2 drafter reads a BF16 head; this pack's is type " + std::to_string(m_.tensor("output.weight")->type);
-            return false;
-        }
-        if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, m_.dfly() ? (const uint16_t*) m_.tensor("output.weight")->ptr : nullptr,
+        if (!dfly_.init(m_.dfly(), (int) (g_.idx_top_k + g_.idx_pool), ctx, m_.dfly() ? m_.tensor("output.weight")->ptr : nullptr,
+                        m_.tensor("output.weight")->type,
                         [this](int32_t t, float* o) { return m_.embedding_row(t, o); }, m_.diag_dump(), fp8(), err))
             return false;
         return true;
