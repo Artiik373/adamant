@@ -62,11 +62,30 @@ def sampling_defaults(meta: dict) -> dict:
 TOKENIZER_SECTIONS = ("vocab.json", "merges.txt", "token_type.json", "tokenizer.json", "chat_template.jinja")
 
 
-def tokenizer_files(mf: ModelFile) -> dict[str, bytes]:
-    """The `tokenizer/*` sections the server reads, by file name (those a pack lacks are absent)."""
-    if "tokenizer/vocab.json" not in mf.sections:
+def hf_tokenizer_files(tokenizer_json: bytes, pre: str) -> dict[str, bytes]:
+    """vocab.json, merges.txt and token_type.json from a Hugging Face BPE tokenizer.json: its special added tokens are
+    control tokens (type 3), the others user-defined (type 4). The tokenizer.json becomes `{"pre": pre}`."""
+    j = json.loads(tokenizer_json)
+    vocab = dict(j["model"]["vocab"])
+    vocab.update({t["content"]: t["id"] for t in j.get("added_tokens", [])})
+    types = [1] * (max(vocab.values()) + 1)
+    for t in j.get("added_tokens", []):
+        types[t["id"]] = 3 if t.get("special") else 4
+    merges = [m if isinstance(m, str) else " ".join(m) for m in j["model"]["merges"]]
+    return {"vocab.json": json.dumps(vocab, ensure_ascii=False).encode("utf-8"),
+            "merges.txt": "\n".join(merges).encode("utf-8"), "token_type.json": json.dumps(types).encode(),
+            "tokenizer.json": json.dumps({"pre": pre}).encode()}
+
+
+def tokenizer_files(mf: ModelFile, arch: str | None = None) -> dict[str, bytes]:
+    """The `tokenizer/*` sections the server reads, by file name (those a pack lacks are absent). A pack with only a
+    tokenizer.json gets the other files derived from it, its pre-tokenizer named by `arch`."""
+    files = {n: mf.read("tokenizer/" + n) for n in TOKENIZER_SECTIONS if "tokenizer/" + n in mf.sections}
+    if "vocab.json" not in files and "tokenizer.json" in files:
+        files.update(hf_tokenizer_files(files["tokenizer.json"], arch or ""))
+    if "vocab.json" not in files:
         raise ValueError(f"{mf.path}: no tokenizer sections")
-    return {n: mf.read("tokenizer/" + n) for n in TOKENIZER_SECTIONS if "tokenizer/" + n in mf.sections}
+    return files
 
 
 def vision_config(mf: ModelFile, engine_bin: str, sidecar: bool = True) -> dict:
@@ -107,8 +126,9 @@ def model_config(spec: ModelSpec, engine_bin: str) -> dict:
     cdir.mkdir(parents=True, exist_ok=True)
     cfg = {"engine_bin": os.path.abspath(engine_bin), "args": args, "model_name": spec.alias or meta.get("name") or "basalt",
            "sampling": sampling_defaults(meta),
-           "arch": (meta.get("gguf_kv") or {}).get("general.architecture"), "log": str(cdir / "engine.log"),
-           "tokenizer": tokenizer_files(mf)}
+           "arch": (meta.get("gguf_kv") or {}).get("general.architecture") or meta.get("arch"),
+           "log": str(cdir / "engine.log")}
+    cfg["tokenizer"] = tokenizer_files(mf, cfg["arch"])
     if vision and dialect_for(cfg["arch"]).in_engine_vision:
         if vision != "dynamic":
             raise ValueError(f"this model's images are encoded in the engine: --vision dynamic, not {vision}")

@@ -36,7 +36,7 @@ std::optional<int> find_model(int argc, char** argv, const model::ModelAdapter*&
         return 2;
     }
     const basalt::core::Json* kv = file.meta().get("gguf_kv");
-    const basalt::core::Json* arch = kv ? kv->get("general.architecture") : nullptr;
+    const basalt::core::Json* arch = kv ? kv->get("general.architecture") : file.meta().get("arch");
     const std::string name = arch && arch->is_string() ? arch->s : std::string();
     adapter = model::find_adapter(name);
     if (adapter == nullptr) {
@@ -52,12 +52,23 @@ void pack_tokens(const model::ModelAdapter& adapter, CommonOptions& o) {
     std::string err;
     std::vector<uint8_t> text;
     basalt::core::Json vocab;
-    if (!file.open(o.model, err) || !file.load_meta(err) || !basalt::core::read_range(file.range("tokenizer/vocab.json"), text, err) ||
-        !basalt::core::parse_json((const char*) text.data(), text.size(), vocab, err)) {
+    // a pack without vocab.json carries the tokenizer.json, whose added tokens hold the special ones
+    bool ok = file.open(o.model, err) && file.load_meta(err);
+    const bool hf = ok && file.find("tokenizer/vocab.json") == nullptr;
+    ok = ok && basalt::core::read_range(file.range(hf ? "tokenizer/tokenizer.json" : "tokenizer/vocab.json"), text, err) &&
+         basalt::core::parse_json((const char*) text.data(), text.size(), vocab, err);
+    if (!ok) {
         basalt::log::warn("basalt", "the pack's vocabulary cannot be read (%s): no end-of-turn or turn token", err.c_str());
         return;
     }
     auto id_of = [&](const std::string& name) -> int64_t {
+        if (hf) {
+            if (const basalt::core::Json* added = vocab.get("added_tokens"))
+                for (const basalt::core::Json& t : added->items)
+                    if (const basalt::core::Json* c = t.get("content"); c != nullptr && c->s == name)
+                        if (const basalt::core::Json* id = t.get("id")) return (int64_t) id->u64();
+            return -1;
+        }
         const basalt::core::Json* v = vocab.get(name);
         return v != nullptr ? (int64_t) v->u64() : -1;
     };

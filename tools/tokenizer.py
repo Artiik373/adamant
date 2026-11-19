@@ -45,7 +45,12 @@ QWEN35_PATTERN = (
 
 # Pre-tokenizers made of several regexes applied in turn, each one splitting the pieces the previous left; text a regex
 # does not match stays a piece for the next. Keyed by the GGUF's tokenizer.ggml.pre.
-PRE_PATTERNS: dict[str, list[str]] = {}
+PRE_PATTERNS: dict[str, list[str]] = {
+    # Hy4-flash's tokenizer.json: three Isolated splits, then the byte-level map
+    "hy4": [r"\p{N}{1,3}", r"[一-龥぀-ゟ゠-ヿ]+",
+            r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
+            r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"],
+}
 
 
 class Tokenizer:

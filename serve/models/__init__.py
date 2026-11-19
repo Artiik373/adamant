@@ -48,4 +48,7 @@ def dialect_for(arch: str | None) -> Dialect:
     if arch in ("qwen4exp", None):
         from serve.models.qwen4exp import Qwen4Exp
         return Qwen4Exp()
+    if arch == "hy4":
+        from serve.models.hy4 import Hy4
+        return Hy4()
     raise ValueError(f"no dialect for architecture {arch!r}")
