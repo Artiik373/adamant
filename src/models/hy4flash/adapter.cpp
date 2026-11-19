@@ -62,6 +62,14 @@ public:
             o.kv = args.next("--kv");
             return true;
         }
+        if (a == "--expert-profile-save") {
+            o.expert_profile_save = args.next("--expert-profile-save");
+            return true;
+        }
+        if (a == "--expert-profile-save-every") {
+            o.expert_profile_save_min = std::atof(args.next("--expert-profile-save-every"));
+            return true;
+        }
         return dfly_parse_flag(a, args, o);
     }
 

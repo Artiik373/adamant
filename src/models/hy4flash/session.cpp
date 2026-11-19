@@ -454,7 +454,10 @@ public:
         lent_ = false;
     }
 
-    void end_prompt() override { release_prompt(); }
+    void end_prompt() override {
+        release_prompt();
+        m_.save_profile("periodic", false);   // once a request's prompt gave its lent slots back, every --expert-profile-save-every minutes
+    }
 
     // The decode tier hits of the turn so far: the first kEarlyTokens tokens after a prompt and the rest, logged when the next
     // prompt starts (a turn that starts cold shows a low first share).
@@ -2086,6 +2089,7 @@ private:
                     err = "the router picked expert " + std::to_string(e);
                     return false;
                 }
+                m_.count_route(tl, e);
                 int u = 0;
                 while (u < nu && uniq[u] != e) ++u;
                 if (u == nu) {

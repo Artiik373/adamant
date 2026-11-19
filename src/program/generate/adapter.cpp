@@ -362,6 +362,8 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.sessions = std::max(o.batch, 1);
         lreq.vision = o.vision;
         lreq.expert_profile = o.expert_profile;
+        lreq.expert_profile_save = o.expert_profile_save;
+        lreq.expert_profile_save_min = o.expert_profile_save_min;
         const std::string key = profile_key(model_file.meta());
         {   // what the engine ships for this pack must be there; --expert-profile stands in for the main one
             std::vector<std::string> need;

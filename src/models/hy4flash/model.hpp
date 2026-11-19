@@ -9,6 +9,8 @@
 #include "models/hy4flash/pack.hpp"
 #include "models/hy4flash/vision_encoder.hpp"   // [vision]
 
+#include <atomic>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <string>
@@ -76,6 +78,12 @@ public:
     const std::string& diag_dump() const { return diag_dump_; }
     /// [vision] The image encoder: staged with --vision, else it refuses pictures. One per model; ENC runs between requests.
     ImageEncoder& encoder() const { return vis_; }
+    /// --expert-profile-save: a decode row's routing to expert `e` of tier layer `tl` (nothing without the flag).
+    void count_route(int tl, int e) const {
+        if (!heat_.empty()) heat_[(size_t) tl * (size_t) pack_.geo.n_expert + (size_t) e].fetch_add(1, std::memory_order_relaxed);
+    }
+    /// Saves the learned placement when --expert-profile-save is set and `due` (or its interval has passed). `why`: for the log.
+    void save_profile(const char* why, bool due) const;
 
 private:
     Pack pack_;
@@ -89,6 +97,10 @@ private:
     std::vector<uint8_t> embd_;
     std::string diag_dump_;
     std::unique_ptr<ngram::PleReader> engram_;
+    // --expert-profile-save: the routing counted [tier layer][expert], the ranking the start placed from, the last save
+    mutable std::vector<std::atomic<uint32_t>> heat_;
+    std::vector<std::pair<int32_t, int32_t>> profile_prior_;
+    mutable std::chrono::steady_clock::time_point profile_saved_at_;
     int device_ = 0, fd_ = -1;
     bool fp8_ = false, f32_ = false;
     int diag_rows_ = 0;

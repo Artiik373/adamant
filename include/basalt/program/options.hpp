@@ -62,6 +62,12 @@ struct CommonOptions {
     /// or the --expert-profile-save file a start places from; empty means none.  A profile decides residency by routing
     /// frequency instead of by first use.
     std::string expert_profile;
+    /// --expert-profile-save: where a model that learns its expert placement saves it, as a profile (the resident experts
+    /// first, then the routing counted since the start; the format of data/profiles); every `expert_profile_save_min`
+    /// minutes between requests and at exit.  A start with the same file places from it.  Empty (the default): nothing is
+    /// counted or written.
+    std::string expert_profile_save;
+    double expert_profile_save_min = 10.0;
     /// `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session and the KV state, minus
     /// this reserve for the graphs, the hit scratch and the head.
     int vram_reserve_mib = 700;

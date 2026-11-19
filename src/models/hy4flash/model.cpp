@@ -4,6 +4,7 @@
 
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/ggml/ggml.h"
+#include "basalt/core/expert_cache.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/log.hpp"
 #include "basalt/platform/file.hpp"
@@ -51,9 +52,36 @@ size_t Hy4Model::expert_stride() const {
 }
 
 Hy4Model::~Hy4Model() {
+    save_profile("exit", true);
     for (auto& [name, t] : dev_)
         if (t.ptr) cudaFree(t.ptr);
     if (fd_ >= 0) platform::close_fd(fd_);
+}
+
+void Hy4Model::save_profile(const char* why, bool due) const {
+    const core::ExpertTier* tier = shared_tier_.tier.get();
+    if (heat_.empty() || tier == nullptr) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (!due && (flags_.expert_profile_save_min <= 0 ||
+                 now - profile_saved_at_ < std::chrono::duration<double>(flags_.expert_profile_save_min * 60.0)))
+        return;
+    const Geometry& g = pack_.geo;
+    const int64_t nl = g.n_layers - g.n_dense, ne = g.n_expert;
+    std::vector<uint8_t> resident((size_t) (nl * ne), 0);
+    std::vector<double> heat((size_t) (nl * ne), 0.0);
+    for (int64_t l = 0; l < nl; ++l)
+        for (int64_t e = 0; e < ne; ++e) {
+            const size_t i = (size_t) (l * ne + e);
+            resident[i] = tier->locate((int) l, (int) e).dev != nullptr;
+            heat[i] = (double) heat_[i].load(std::memory_order_relaxed);
+        }
+    std::string err;
+    const auto ranked = core::rank_learned_profile(nl, ne, resident, heat, profile_prior_);
+    if (core::write_expert_profile(flags_.expert_profile_save, nl, ne, ranked, err))
+        basalt::log::info("basalt hy4flash", "expert profile saved to %s (%s)", flags_.expert_profile_save.c_str(), why);
+    else
+        basalt::log::warn("basalt hy4flash", "the expert profile was not saved: %s", err.c_str());
+    profile_saved_at_ = now;
 }
 
 const DevTensor* Hy4Model::tensor(const std::string& name) const {
@@ -202,6 +230,30 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     // queued in the start's plan
     flags_ = req;
     path_ = path;
+    if (!flags_.expert_profile_save.empty()) {   // an earlier run's learned placement, when it is this model's shape
+        const Geometry& g = pack_.geo;
+        const int64_t nl = g.n_layers - g.n_dense;
+        std::vector<std::pair<int32_t, int32_t>> ranked;
+        int64_t slots = 0;
+        uint64_t bytes = 0;
+        std::string perr;
+        if (platform::file_size(flags_.expert_profile_save, bytes) && bytes > 0) {
+            if (core::read_expert_profile(core::FileRange(flags_.expert_profile_save), nl, g.n_expert, ranked, slots, perr))
+                flags_.expert_profile = flags_.expert_profile_save;
+            else
+                basalt::log::warn("basalt hy4flash", "%s not used (%s): the engine's profile instead",
+                                  flags_.expert_profile_save.c_str(), perr.c_str());
+        }
+        profile_prior_.clear();
+        if (!flags_.expert_profile.empty() &&
+            !core::read_expert_profile(core::FileRange(flags_.expert_profile), nl, g.n_expert, profile_prior_, slots, perr))
+            profile_prior_.clear();
+        heat_ = std::vector<std::atomic<uint32_t>>((size_t) (nl * g.n_expert));
+        profile_saved_at_ = std::chrono::steady_clock::now();
+        basalt::log::info("basalt hy4flash", "expert profile: placed from %s, the learned one saved to %s",
+                          flags_.expert_profile.empty() ? "the pack's order" : flags_.expert_profile.c_str(),
+                          flags_.expert_profile_save.c_str());
+    }
     std::vector<int> peers = req.peer_devices;
     if (peers.size() > (size_t) kMaxSecondCards) {
         basalt::log::warn("basalt hy4flash", "%zu second cards given, %d hold experts; later cards idle", peers.size(), kMaxSecondCards);

@@ -48,11 +48,6 @@ struct Options : CommonOptions {
     bool peer_exclusive = false;
     /// --no-peer-prefill: the prompt path stays on the primary, the peer computes none of its rows
     bool no_peer_prefill = false;
-    /// --serve (opt-in): where to save what the adaptive tier learned, as a profile (the resident experts first,
-    /// then the routing counted since the start; the format of data/profiles); on QUIT and every
-    /// `expert_profile_save_min` minutes between requests.  Empty (the default): nothing is counted or written.
-    std::string expert_profile_save;
-    double expert_profile_save_min = 10.0;
     /// Capture each layer as THREE graphs and time them from outside the capture, which is the only
     /// valid way to get a per-stage table on the real graph.  Prints and exits; it is a measurement, not a run.
     bool gpu_stages = false;
