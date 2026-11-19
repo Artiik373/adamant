@@ -104,6 +104,7 @@ struct Bufs {
     int32_t *icells = nullptr, *meta_d = nullptr, *meta_h = nullptr, *ids = nullptr, *pair_map = nullptr, *pair_ident = nullptr,
             *mmq_ident = nullptr;
     void* mmq_xq = nullptr;
+    void* xqn = nullptr;   // gemm_n's quantized input, a block of A rows after another
     void release() {
         for (void* p : dev) cudaFree(p);
         for (void* p : host) cudaFreeHost(p);
@@ -319,7 +320,9 @@ public:
         b.pair_map = (int32_t*) f((int64_t) R * g_.n_used); b.pair_ident = (int32_t*) f((int64_t) R * g_.n_used);
         b.mmq_ident = (int32_t*) f(A);
         b.h_erows = pin((int64_t) A * g_.n_embd); b.h_e = pin((int64_t) R * E); b.h_evalid = pin(A);
+        const size_t xqn_bytes = (size_t) b.steps * basalt::prefill::mmq::q8_bytes(A, E);
         if (count) {
+            f((int64_t) (xqn_bytes + 3) / 4);
             f((int64_t) (std::max(basalt::prefill::mmq::q8_bytes(A, 16384), basalt::prefill::mmq::q8_bytes((int64_t) A * max_heads_, std::max(g_.kv_lora, g_.qk_dim))) + 3) / 4);
             b = Bufs();
             return true;
@@ -330,6 +333,11 @@ public:
             else {
                 b.dev.push_back(q);
                 b.mmq_xq = q;
+            }
+            if (ok && cudaMalloc(&q, xqn_bytes) != cudaSuccess) ok = false;
+            else if (ok) {
+                b.dev.push_back(q);
+                b.xqn = q;
             }
         }
         if (!ok) {
@@ -356,7 +364,7 @@ public:
         olat_ = b.olat; vout_ = b.vout; gate_ = b.gate; ik_ = b.ik; ikn_ = b.ikn; ivt_ = b.ivt; igt_ = b.igt; iq_ = b.iq; iw_ = b.iw;
         icells_ = b.icells; meta_d_ = b.meta_d; meta_h_ = b.meta_h; gu_ = b.gu; h_ = b.h; rlog_ = b.rlog; rw_ = b.rw; ids_ = b.ids;
         xlat_ = b.xlat; lat_out_ = b.lat_out; moe_out_ = b.moe_out; sh_ = b.sh; erows_ = b.erows; ekv_ = b.ekv; evalid_ = b.evalid;
-        pair_rows_ = b.pair_rows; pair_map_ = b.pair_map; pair_ident_ = b.pair_ident; mmq_ident_ = b.mmq_ident; mmq_xq_ = b.mmq_xq;
+        pair_rows_ = b.pair_rows; pair_map_ = b.pair_map; pair_ident_ = b.pair_ident; mmq_ident_ = b.mmq_ident; mmq_xq_ = b.mmq_xq; xqn_ = b.xqn; xqn_type_ = -1;
         h_erows_ = b.h_erows; h_e_ = b.h_e; h_evalid_ = b.h_evalid;
     }
 
@@ -849,13 +857,16 @@ private:
     }
 
     // y[r] = W x[r] for R rows, 8 at a time: a row's product does not depend on the rows beside it
-    void gemm(const DevTensor* w, const float* x, float* y, int n_in, int n_out, int R) {
+    // `xq`: x already quantized for w's type, a block of arows_ rows after another (gemm_n's), else quantized here
+    void gemm(const DevTensor* w, const float* x, float* y, int n_in, int n_out, int R, const uint8_t* xq = nullptr) {
         namespace mmq = basalt::prefill::mmq;
         if (R > kMaxWindow && mmq::built() && mmq::fits(w->type, n_out)) {   // a chunk: the tensor-core MMQ product, arows_ rows a time
             if (loaded_.insert({w->type, n_out}).second) mmq::load(w->type, n_out);
+            const size_t blk = mmq::q8_bytes(arows_, n_in);
             for (int r0 = 0; r0 < R; r0 += arows_) {
                 const int nb = std::min(arows_, R - r0);
-                mmq::quantize(x + (size_t) r0 * n_in, nullptr, mmq_xq_, w->type, n_in, n_in, nb, stream_);
+                const void* xqb = xq ? (const void*) (xq + (size_t) (r0 / arows_) * blk) : mmq_xq_;
+                if (!xq) mmq::quantize(x + (size_t) r0 * n_in, nullptr, mmq_xq_, w->type, n_in, n_in, nb, stream_);
                 mmq::Product p;
                 p.w = w->ptr;
                 p.type = w->type;
@@ -863,7 +874,7 @@ private:
                 p.w_cols = n_in;
                 p.expert_bytes = mmq::matrix_bytes(w->type, n_out, n_in);
                 p.n = 1;
-                p.xq = mmq_xq_;
+                p.xq = xqb;
                 p.bounds = bounds_tab_ + 2 * nb;
                 p.ids = mmq_ident_;
                 p.total_rows = nb;
@@ -912,9 +923,22 @@ private:
     // A window's normed input xn_ quantized once for the products that read it (gemm quantizes per call): the same kernels and
     // bits, fewer launches. A chunk keeps gemm.
     void quant_n(int R) {
+        xqn_type_ = -1;   // xn_ is new: a chunk quantizes it again at its first product
         if (R <= kMaxWindow) bk::native_quantize_q8_1(xn_, xq_n_, g_.n_embd, R, stream_);
     }
     void gemm_n(const DevTensor* w, float* y, int n_out, int R) {
+        namespace mmq = basalt::prefill::mmq;
+        if (R > kMaxWindow && xqn_ && mmq::built() && mmq::fits(w->type, n_out)) {
+            const int E = g_.n_embd;
+            if (xqn_type_ != w->type) {   // the quantized rows depend on the weight's type (its MMQ layout)
+                const size_t blk = mmq::q8_bytes(arows_, E);
+                for (int r0 = 0; r0 < R; r0 += arows_)
+                    mmq::quantize(xn_ + (size_t) r0 * E, nullptr, (uint8_t*) xqn_ + (size_t) (r0 / arows_) * blk, w->type, E, E,
+                                  std::min(arows_, R - r0), stream_);
+                xqn_type_ = w->type;
+            }
+            return gemm(w, xn_, y, E, n_out, R, (const uint8_t*) xqn_);
+        }
         if (R > kMaxWindow) return gemm(w, xn_, y, g_.n_embd, n_out, R);
         bk::native_mmvq(w->type, w->ptr, xq_n_, y, g_.n_embd, n_out, R, stream_);
     }
@@ -2496,6 +2520,8 @@ private:
     void *mmq_xq_ = nullptr;
     int32_t *mmq_ident_ = nullptr, *heads_ids_ = nullptr, *heads_bounds_ = nullptr;
     void* xq_n_ = nullptr;   // quant_n
+    void* xqn_ = nullptr;    // gemm_n's chunk rows quantized for the type xqn_type_ (-1: not yet)
+    int xqn_type_ = -1;
     void *q8_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr, *ex_plan_ = nullptr, *ex_plan2_ = nullptr;
     float* ex_rows_ = nullptr;
     float *h_x_ = nullptr, *d_x_ = nullptr, *h_rows_ = nullptr, *d_rows_ = nullptr, *h_e_ = nullptr, *h_erows_ = nullptr, *h_evalid_ = nullptr;
