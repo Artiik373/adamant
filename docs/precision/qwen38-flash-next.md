@@ -39,7 +39,7 @@ build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 
 Decode activations are int8 (q8_1) into every quantized matmul. The hc read stays fp32 (llama.cpp quantizes it to Q8_0).
 
 The n-gram table the gather reads is the IQ4_NL table the download ships, unless `--ple-gguf` names another GGUF: a separate Q8_0
-table then serves the gather, so the rows read are 8-bit rather than 4.5-bit while the rows of the pack are not read at all. A Q5_0 or
+table then serves the gather, so the rows read are 8-bit rather than 4.5-bit while the rows of the pack are not read at all. A Q4_0, Q5_0 or
 a BF16 table reads there too; a BF16 row widens to f32 exactly, so the gather is the checkpoint's own values with no table rounding.
 
 ### Expert tiers
@@ -108,6 +108,12 @@ pack alone gives -0.0059 of that. The Q8_0-dense pack is about 7% slower on pros
 
 UD-IQ1_S, converted as shipped (layer 18: IQ2_S gate, IQ2_XXS up; each half on its own format's kernels, the same bits as
 a uniform layer's rows): PPL 3.4049, KLD 0.2676, top-1 82.76% (100 chunks, T 3, int8 KV, resident experts).
+
+WV-v5 3.5 bpw (Q3_K gate/up, Q4_0 or Q2_0 down, Q4_0 n-gram table, converted with `--compat-bf16`): PPL 2.5922 against base
+2.2918, KLD 0.2776, top-1 85.41% (20 chunks, T 3, int8 KV). The Q4_0 kernels are bitwise equal to their reference paths.
+
+A Q3_K GPU dot sums two weight words in int32 before its float scale (one word before): the rounding of every Q3_K
+expert moves. On WV-v5: KLD 0.2776 against 0.2783, PPL 2.5922 against 2.5972 (20 chunks).
 
 The Q5_0 rows: KLD 0.0943 against 0.0948 on UD-Q3_K_XL, 0.1520 against 0.1517 on UD-Q2_K_XL, tiers auto-sized. The
 device-planned tail runs only when every layer's expert formats are in it, so on these packs the decode rounding moves as well as

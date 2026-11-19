@@ -39,7 +39,7 @@ Flash-Next 在哪里舍入、每种舍入要付出多少代价。方法与参考
 decode 的激活在每个量化 matmul 中都取 int8（q8_1）。hc 读取保持 fp32（llama.cpp 把它量化到 Q8_0）。
 
 gather 读取的 n-gram 表就是下载所带的 IQ4_NL 表，除非 `--ple-gguf` 指明另一个 GGUF：这时另有一张 Q8_0 表服务于
-gather，于是读取的行是 8-bit 而非 4.5-bit，而 pack 自己的行根本不会被读取。Q5_0 或 BF16 表也可以在那里读取；BF16
+gather，于是读取的行是 8-bit 而非 4.5-bit，而 pack 自己的行根本不会被读取。Q4_0、Q5_0 或 BF16 表也可以在那里读取；BF16
 行会精确地扩到 f32，所以 gather 得到的就是 checkpoint 自己的值，没有任何表舍入。
 
 ### 专家层级
@@ -107,6 +107,12 @@ chunk 尺寸下都走整数 MMQ（[Ada](ada.md)）。
 
 UD-IQ1_S，按发布原样转换（第 18 层：IQ2_S gate、IQ2_XXS up；每一半走各自格式的 kernel，位与统一层的行相同）：
 PPL 3.4049，KLD 0.2676，top-1 82.76%（100 个 chunk，T 3，int8 KV，专家常驻）。
+
+WV-v5 3.5 bpw（Q3_K gate/up，Q4_0 或 Q2_0 down，Q4_0 n-gram 表，用 `--compat-bf16` 转换）：PPL 2.5922，基线
+2.2918，KLD 0.2776，top-1 85.41%（20 个 chunk，T 3，int8 KV）。Q4_0 kernel 与其参考路径逐位相同。
+
+Q3_K 的 GPU 点积先在 int32 中累加两个权重字，再乘浮点缩放（此前为一个字）：每个 Q3_K 专家的舍入都会变化。
+在 WV-v5 上：KLD 0.2776 对 0.2783，PPL 2.5922 对 2.5972（20 个 chunk）。
 
 Q5_0 的几行：UD-Q3_K_XL 上 KLD 0.0943 对 0.0948，UD-Q2_K_XL 上 0.1520 对 0.1517，层级自动定容。device-planned
 尾部只有在每层的专家格式都在其中时才运行，所以在这两个 pack 上 decode 的舍入与 prompt 的一起移动。

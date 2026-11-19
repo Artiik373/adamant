@@ -111,7 +111,7 @@ void bf16_dequant_row(const uint8_t* row, float* out160) {
 }
 
 // ---------------------------------------------------------------------------------------------------
-enum class PleFormat { IQ4_NL, Q5_0, Q8_0, BF16 };
+enum class PleFormat { IQ4_NL, Q4_0, Q5_0, Q8_0, BF16 };
 
 struct PleTable::Impl {
     GgufFile* file = nullptr;
@@ -140,6 +140,9 @@ struct PleTable::Impl {
     uint32_t rb = PLE_ROW_BYTES;      // bytes per row
     void decode(const uint8_t* row, float* out160) const {
         switch (fmt) {
+        case PleFormat::Q4_0:
+            for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) basalt::dequantize_q4_0(row + (size_t) b * 18, out160 + b * 32);
+            break;
         case PleFormat::Q5_0:
             for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) basalt::dequantize_q5_0(row + (size_t) b * 22, out160 + b * 32);
             break;
@@ -179,13 +182,14 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    // IQ4_NL, Q5_0, Q8_0 or BF16 rows
+    // IQ4_NL, Q4_0, Q5_0, Q8_0 or BF16 rows
     if (std::strcmp(t->type_name(), "IQ4_NL") == 0) impl_->fmt = PleFormat::IQ4_NL;
+    else if (std::strcmp(t->type_name(), "Q4_0") == 0) impl_->fmt = PleFormat::Q4_0;
     else if (std::strcmp(t->type_name(), "Q5_0") == 0) impl_->fmt = PleFormat::Q5_0;
     else if (std::strcmp(t->type_name(), "Q8_0") == 0) impl_->fmt = PleFormat::Q8_0;
     else if (std::strcmp(t->type_name(), "BF16") == 0) impl_->fmt = PleFormat::BF16;
     else {
-        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL, Q5_0, Q8_0 or BF16";
+        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL, Q4_0, Q5_0, Q8_0 or BF16";
         close();
         return false;
     }
@@ -314,6 +318,7 @@ bool PleTable::locked() const { return impl_->locked; }
 const char* PleTable::format() const {
     switch (impl_->fmt) {
     case PleFormat::Q8_0: return "Q8_0";
+    case PleFormat::Q4_0: return "Q4_0";
     case PleFormat::Q5_0: return "Q5_0";
     case PleFormat::BF16: return "BF16";
     default: return "IQ4_NL";
