@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <climits>
 #include <cmath>
 
 #include <cub/block/block_scan.cuh>
@@ -147,22 +148,20 @@ __global__ void rope_gptj_kernel(float* __restrict__ rows, int n_rows, int strid
 
 // ---- router -----------------------------------------------------------------------------------------------------
 
+// One thread per expert. Each warp takes the top kExpertsUsed of its 32 experts in order, then warp 0 merges the
+// sorted lists: the same picks, in the same order, as a block-wide argmax per pick.
 __global__ void route_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int32_t* __restrict__ ids,
                              float* __restrict__ weights) {
-    __shared__ float key[kExperts];
+    constexpr int kWarps = kExperts / 32;
     __shared__ float score[kExperts];
-    __shared__ float best_v[32];
-    __shared__ int best_i[32];
-    __shared__ float picked_sum;
-    const int t = blockIdx.x, e = threadIdx.x;   // one thread per expert
+    __shared__ float cand_v[kWarps][kExpertsUsed];
+    __shared__ int cand_i[kWarps][kExpertsUsed];
+    const int t = blockIdx.x, e = threadIdx.x, lane = e & 31, warp = e >> 5;
     const float s = sigmoidf_(logits[(size_t) t * kExperts + e]);
     score[e] = s;
-    key[e] = s + (bias != nullptr ? bias[e] : 0.f);
-    if (e == 0) picked_sum = 0.f;
-    __syncthreads();
-    const int lane = e & 31, warp = e >> 5;
+    float key = s + (bias != nullptr ? bias[e] : 0.f);
     for (int k = 0; k < kExpertsUsed; ++k) {
-        float v = key[e];
+        float v = key;
         int id = e;
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) {
@@ -170,21 +169,34 @@ __global__ void route_kernel(const float* __restrict__ logits, const float* __re
             const int oi = __shfl_xor_sync(0xffffffffu, id, o);
             if (ov > v || (ov == v && oi < id)) { v = ov; id = oi; }
         }
-        if (lane == 0) { best_v[warp] = v; best_i[warp] = id; }
-        __syncthreads();
-        if (e == 0) {
-            float bv = best_v[0];
-            int bi = best_i[0];
-            for (int w = 1; w < kExperts / 32; ++w)
-                if (best_v[w] > bv || (best_v[w] == bv && best_i[w] < bi)) { bv = best_v[w]; bi = best_i[w]; }
-            ids[t * kExpertsUsed + k] = bi;
-            weights[t * kExpertsUsed + k] = score[bi];
-            picked_sum += score[bi];
-            key[bi] = -FLT_MAX;
-        }
-        __syncthreads();
+        if (lane == 0) { cand_v[warp][k] = v; cand_i[warp][k] = id; }
+        if (id == e) key = -FLT_MAX;
     }
-    if (e < kExpertsUsed) weights[t * kExpertsUsed + e] *= kRoutedScale / (picked_sum + 1e-20f);
+    __syncthreads();
+    if (warp != 0) return;
+    int next = 0;   // lane l < kWarps: the head of warp l's list
+    float picked_sum = 0.f;
+    for (int k = 0; k < kExpertsUsed; ++k) {
+        const bool live = lane < kWarps && next < kExpertsUsed;
+        float v = live ? cand_v[lane][next] : -FLT_MAX;
+        int id = live ? cand_i[lane][next] : INT_MAX;
+        const int mine = id;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, v, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, id, o);
+            if (ov > v || (ov == v && oi < id)) { v = ov; id = oi; }
+        }
+        if (mine == id && live) ++next;
+        if (lane == 0) {
+            ids[t * kExpertsUsed + k] = id;
+            weights[t * kExpertsUsed + k] = score[id];
+            picked_sum += score[id];
+        }
+    }
+    picked_sum = __shfl_sync(0xffffffffu, picked_sum, 0);
+    __syncwarp();   // lane 0's weights are visible to the warp
+    if (lane < kExpertsUsed) weights[t * kExpertsUsed + lane] *= kRoutedScale / (picked_sum + 1e-20f);
 }
 
 // ---- Engram -----------------------------------------------------------------------------------------------------
@@ -277,11 +289,10 @@ __global__ void mla_absorb_kernel(const float* __restrict__ q, const __half* __r
     for (int d = threadIdx.x; d < kNope; d += blockDim.x) qn[d] = qh[d];
     __syncthreads();
     const __half* wk = kv_b + (size_t) h * kKvbRows * kKvRank;
-    for (int c = threadIdx.x; c < kKvRank; c += blockDim.x) {
-        float s = 0.f;
-        for (int d = 0; d < kNope; ++d) s += qn[d] * __half2float(wk[(size_t) d * kKvRank + c]);
-        q_lat[((size_t) t * heads + h) * kKvRank + c] = s;
-    }
+    const int c = blockIdx.z * blockDim.x + threadIdx.x;   // the z blocks split a head's columns: more CTAs in flight
+    float s = 0.f;
+    for (int d = 0; d < kNope; ++d) s += qn[d] * __half2float(wk[(size_t) d * kKvRank + c]);
+    q_lat[((size_t) t * heads + h) * kKvRank + c] = s;
 }
 
 constexpr int kAttnWarps = 4;
@@ -347,7 +358,8 @@ __global__ void mla_attend_kernel(const float* __restrict__ q_lat, const float* 
     }
 }
 
-constexpr int kOutThreads = 256;
+constexpr int kOutThreads = 128;
+constexpr int kOutRows = 32;   // value rows a CTA; the z blocks split a head's rows, so more CTAs are in flight
 
 __global__ void mla_value_out_kernel(const float* __restrict__ o_lat, const __half* __restrict__ kv_b,
                                      const float* __restrict__ gate, int heads, float* __restrict__ out) {
@@ -357,15 +369,23 @@ __global__ void mla_value_out_kernel(const float* __restrict__ o_lat, const __ha
 #pragma unroll
     for (int i = 0; i < kLatPerLane; ++i) ov[i] = ol[lane + 32 * i];
     const __half* wv = kv_b + ((size_t) h * kKvbRows + kNope) * kKvRank;
-    for (int v = warp; v < kVHead; v += kOutThreads / 32) {
-        const __half* row = wv + (size_t) v * kKvRank;
-        float s = 0.f;
+    constexpr int kStep = kOutThreads / 32;
+    for (int v = blockIdx.z * kOutRows + warp; v < (blockIdx.z + 1) * kOutRows; v += 2 * kStep) {
+        // two rows at a time, each summed in the same order as one alone
+        const __half* r0 = wv + (size_t) v * kKvRank;
+        const __half* r1 = r0 + (size_t) kStep * kKvRank;
+        float s0 = 0.f, s1 = 0.f;
 #pragma unroll
-        for (int i = 0; i < kLatPerLane; ++i) s += ov[i] * __half2float(row[lane + 32 * i]);
-        s = warp_sum(s);
+        for (int i = 0; i < kLatPerLane; ++i) {
+            s0 += ov[i] * __half2float(r0[lane + 32 * i]);
+            s1 += ov[i] * __half2float(r1[lane + 32 * i]);
+        }
+        s0 = warp_sum(s0);
+        s1 = warp_sum(s1);
         if (lane == 0) {
             const size_t o = ((size_t) t * heads + h) * kVHead + v;
-            out[o] = s * sigmoidf_(gate[o]);
+            out[o] = s0 * sigmoidf_(gate[o]);
+            out[o + kStep] = s1 * sigmoidf_(gate[o + kStep]);
         }
     }
 }
@@ -776,7 +796,7 @@ void engram_apply(const float* key, const float* value, const EngramWeights& w, 
 
 void mla_absorb_q(const float* q, const uint16_t* kv_b, int heads, int n_rows, float* q_lat, void* stream) {
     if (n_rows <= 0) return;
-    mla_absorb_kernel<<<dim3(heads, n_rows), 256, 0, (cudaStream_t) stream>>>(
+    mla_absorb_kernel<<<dim3(heads, n_rows, kKvRank / 128), 128, 0, (cudaStream_t) stream>>>(
         q, reinterpret_cast<const __half*>(kv_b), heads, q_lat);
 }
 
@@ -791,7 +811,7 @@ void mla_attend(const float* q_lat, const float* q, const LatentCache& cache, co
 void mla_value_out(const float* o_lat, const uint16_t* kv_b, const float* gate, int heads, int n_rows, float* out,
                    void* stream) {
     if (n_rows <= 0) return;
-    mla_value_out_kernel<<<dim3(heads, n_rows), kOutThreads, 0, (cudaStream_t) stream>>>(
+    mla_value_out_kernel<<<dim3(heads, n_rows, kVHead / kOutRows), kOutThreads, 0, (cudaStream_t) stream>>>(
         o_lat, reinterpret_cast<const __half*>(kv_b), gate, heads, out);
 }
 
