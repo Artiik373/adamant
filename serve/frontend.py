@@ -16,12 +16,26 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import jinja2
+import jinja2.ext
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 
 # ------------------------------------------------------------------------------------------------ template
 class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
     """The template refused the messages; a ValueError so the client gets a 400 with its message."""
+
+
+class _GenerationTag(jinja2.ext.Extension):
+    """transformers' `{% generation %}...{% endgeneration %}`: marks assistant text for training; renders its body as is."""
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        return jinja2.nodes.CallBlock(self.call_method("_render"), [], [], body).set_lineno(lineno)
+
+    def _render(self, caller):
+        return caller()
 
 
 class ChatTemplate:
@@ -38,7 +52,7 @@ class ChatTemplate:
         def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
             return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 
-        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
+        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols", _GenerationTag])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         self.source = source
