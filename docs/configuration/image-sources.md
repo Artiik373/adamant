@@ -1,7 +1,5 @@
 # Image sources
 
-[简体中文](../zh/configuration/image-sources.md)
-
 A request names an image as a `data:` URL, `http(s)` URL, `file:` URL or path. What the server reads depends on whether the request is
 from this machine. A [document](documents.md) named by URL or path follows the same rules.
 

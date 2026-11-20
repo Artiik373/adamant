@@ -1,7 +1,5 @@
 # DFlash2 precision
 
-[简体中文](../zh/precision/dflash2.md)
-
 [Serving and conversion](../dflash2.md)
 
 DFlash2 only proposes tokens. The existing target verifier, penalties, grammar

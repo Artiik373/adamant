@@ -1,7 +1,5 @@
 # Sampling and thinking
 
-[简体中文](../zh/configuration/sampling.md)
-
 A request's sampling fields win. A field it leaves out takes the server option of the same name, then the model file's `sampling`
 default, then the engine's. `/props` reports what is in effect. An out-of-range value is a 400 that names the field.
 

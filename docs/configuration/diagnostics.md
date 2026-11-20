@@ -1,7 +1,5 @@
 # Diagnostics and measurement flags
 
-[简体中文](../zh/configuration/diagnostics.md)
-
 Flags for measuring, debugging and testing the engine. All are off by default and are not settings.
 Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` engine, **bench** = `basalt-bench`.
 

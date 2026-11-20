@@ -1,7 +1,5 @@
 # DFlash2
 
-[简体中文](zh/dflash2.md)
-
 `--dflash2 PACK` selects the official Flash-Next DFlash2 block drafter instead of MTP.
 The target model, sampler and grammar verifier remain responsible for every emitted token.
 MTP remains the default. This is an opt-in CUDA port of the implementation in

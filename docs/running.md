@@ -1,7 +1,5 @@
 # Running the server
 
-[简体中文](zh/running.md)
-
 Settings: [configuration](configuration/index.md). Diagnostic flags: `bin/basalt --help`. Several models: [models and the router](configuration/models.md).
 
 ## Start-up

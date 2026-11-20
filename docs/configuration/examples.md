@@ -1,7 +1,5 @@
 # Example configurations
 
-[简体中文](../zh/configuration/examples.md)
-
 Start with `bin/basalt serve --config basalt_config.json`. Model paths are relative to the file. Settings: [configuration](index.md).
 
 ## One GPU (32 GB) and RAM

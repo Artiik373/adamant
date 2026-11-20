@@ -1,7 +1,5 @@
 # How quality is measured
 
-[简体中文](../zh/precision/quality.md)
-
 Basalt scores a model against a full-precision reference on the same text, through the decode path that generates tokens.
 [Qwen3.8-Flash-Next](qwen38-flash-next.md) is scored this way.
 

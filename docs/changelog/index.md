@@ -1,7 +1,5 @@
 # Changelog
 
-[简体中文](../zh/changelog/index.md)
-
 Releases, newest first. Entries up to the fork point are Basalt's; Adamant starts its own history from the Ada port. Versions are 0.x: a minor release adds a model or another large change; a patch release brings fixes and smaller features, and can rename or remove a flag (a removed or renamed flag breaks a config, as Basalt keeps no shims, so each entry's Upgrading section lists them). Each release is an annotated tag `vX.Y.Z` with a GitHub Release carrying its entry; there are no prebuilt binaries, build from source ([building](../building.md)) or pack a built tree ([platforms](../platforms.md#release-archives)).
 
 | Release | Date | Summary |

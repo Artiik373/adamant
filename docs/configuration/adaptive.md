@@ -1,7 +1,5 @@
 # Adaptive expert tier
 
-[简体中文](../zh/configuration/adaptive.md)
-
 Flash-Next only. The GPUs hold part of the experts. The adaptive tier counts what the conversation routes to and, in rounds beside decode, moves the most
 used experts into VRAM. The defaults are the fastest measured here.
 
