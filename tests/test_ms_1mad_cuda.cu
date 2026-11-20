@@ -127,6 +127,7 @@ int main() {
     ok &= test_cuda_gemv<4>(64, 640, 204);
     ok &= test_cuda_gemv<6>(64, 2560, 205);
     ok &= test_cuda_gemv<6>(64, 640, 206);
+    ok &= test_cuda_gemv<3>(64, 132, 212);   // row stride padded from 54 to 56 bytes
     // More rows than resident warps: exercises the grid-stride prefetch loop.
     ok &= test_cuda_gemv<6>(8192, 2560, 207);
     ok &= test_cuda_gemv<4>(8192, 640, 208);

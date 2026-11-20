@@ -18,8 +18,7 @@ import ms_moe_converter as ms
 def unpack_per_row_ms(blob: bytes, out_f: int, in_f: int, k: int) -> torch.Tensor:
     """Reference bit-exact unpacker matching src/kernels/ms_1mad_avx2.h."""
     lut = ms.build_1mad_lut(torch.device("cpu"))
-    n_sym_bytes = ((in_f - 1) * k + 7) // 8
-    stride = 4 + n_sym_bytes
+    stride = ms.ms_row_bytes(in_f, k)
     assert len(blob) == out_f * stride
 
     out = torch.empty((out_f, in_f), dtype=torch.float32)

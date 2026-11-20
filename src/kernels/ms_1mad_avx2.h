@@ -60,8 +60,9 @@ inline float fp16_to_fp32(uint16_t h) noexcept {
 #endif
 }
 
+// Row stride: 4-byte header plus the symbol stream, padded to 4 bytes so every row start is word-aligned.
 inline size_t ms_row_bytes(int in_features, int k) noexcept {
-    return 4u + static_cast<size_t>(((in_features - 1) * k + 7) / 8);
+    return (4u + static_cast<size_t>(((in_features - 1) * k + 7) / 8) + 3u) & ~size_t{3};
 }
 
 inline void fwht_rotate_input(

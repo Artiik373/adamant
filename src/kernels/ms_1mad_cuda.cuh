@@ -15,8 +15,9 @@ constexpr uint32_t kMadMul = 34038481u;
 constexpr uint32_t kMadAdd = 76625530u;
 constexpr uint32_t kStateMask = 0x3FFFu;
 
+// Same stride as the CPU header: padded to 4 bytes so every row start is word-aligned.
 __host__ __device__ inline size_t ms_row_bytes(int in_features, int k) {
-    return 4u + static_cast<size_t>(((in_features - 1) * k + 7) / 8);
+    return (4u + static_cast<size_t>(((in_features - 1) * k + 7) / 8) + 3u) & ~size_t{3};
 }
 
 __device__ __forceinline__ float decode_1mad_dp4a(uint32_t state) {

@@ -134,6 +134,7 @@ int main() {
     ok &= test_gemv_shape<4>(64, 640, 104);
     ok &= test_gemv_shape<6>(64, 2560, 105);
     ok &= test_gemv_shape<6>(64, 640, 106);
+    ok &= test_gemv_shape<3>(64, 132, 107);   // row stride padded from 54 to 56 bytes
 
     if (!ok) {
         std::fprintf(stderr, "FAILED\n");

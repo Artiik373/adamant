@@ -251,6 +251,11 @@ def viterbi_code_matrix(
     return scales_fp16, states, w_quant
 
 
+def ms_row_bytes(in_f: int, k: int) -> int:
+    """Row stride: 4-byte header plus symbols, padded to 4 bytes (matches the C++ ms_row_bytes)."""
+    return (4 + ((in_f - 1) * k + 7) // 8 + 3) & ~3
+
+
 def pack_per_row_ms(scales_fp16: torch.Tensor, states: torch.Tensor, k: int) -> bytes:
     """Pack per-row MS trellis without 512-weight padding.
 
@@ -258,12 +263,13 @@ def pack_per_row_ms(scales_fp16: torch.Tensor, states: torch.Tensor, k: int) -> 
       fp16   d          (2 bytes)
       uint16 s0         (2 bytes, 14-bit initial state)
       uint8  qs[...]    ceil((in_features - 1) * k / 8) bytes, MSB-first k-bit symbols
+      zero padding      to a 4-byte row stride (ms_row_bytes)
     """
     scales_np = scales_fp16.cpu().numpy()
     states_np = states.cpu().numpy()
     out_f, in_f = states_np.shape
     sym_mask = (1 << k) - 1
-    n_sym_bytes = ((in_f - 1) * k + 7) // 8
+    n_sym_bytes = ms_row_bytes(in_f, k) - 4
 
     buf = bytearray()
     for r in range(out_f):
