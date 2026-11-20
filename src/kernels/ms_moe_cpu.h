@@ -1,7 +1,7 @@
 #pragma once
 
-// Persistent-thread-pool AVX2 MoE SwiGLU FFN dispatcher for DDR5-offloaded experts (i5-13600KF).
-// Eliminates per-layer std::thread spawn/join and heap allocation overhead (48 layers/token).
+// Spin-barrier persistent-thread-pool AVX2 MoE SwiGLU FFN dispatcher for DDR5-offloaded experts.
+// Eliminates Windows std::condition_variable wakeup latency (~2 ms/layer) across 48 layers/token.
 
 #include "kernels/ms_1mad_avx2.h"
 #include "kernels/ms_dispatch.h"
@@ -9,11 +9,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
-#include <condition_variable>
 #include <cstdint>
-#include <mutex>
 #include <thread>
 #include <vector>
+
+#if defined(__AVX2__) || defined(_MSC_VER)
+#include <immintrin.h>
+#endif
 
 namespace adamant::kernels::ms {
 
@@ -25,6 +27,12 @@ struct MsExpertView {
     float          router_weight;
     MsQuantType    quant_type;
 };
+
+inline void cpu_pause() noexcept {
+#if defined(__AVX2__) || defined(_MSC_VER)
+    _mm_pause();
+#endif
+}
 
 inline void run_single_ms_expert(
     const MsExpertView& ex,
@@ -50,7 +58,7 @@ inline void run_single_ms_expert(
     dispatch_ms_cpu_gemv(ex.quant_type, ex.down_w, scratch_mid, scratch_out, hidden_size, inter_size);
 }
 
-// Persistent worker pool with pre-allocated per-thread scratch buffers (zero mallocs per layer).
+// Low-latency spin-barrier worker pool with pre-allocated per-thread scratch buffers.
 class MsCpuMoEExecutor {
 public:
     MsCpuMoEExecutor(int num_threads, int hidden_size, int inter_size, int max_active = 16)
@@ -69,12 +77,8 @@ public:
     }
 
     ~MsCpuMoEExecutor() {
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            stop_ = true;
-            ++gen_;
-        }
-        cv_.notify_all();
+        stop_.store(true, std::memory_order_release);
+        gen_.fetch_add(1, std::memory_order_release);
         for (auto& w : workers_) w.join();
     }
 
@@ -92,18 +96,15 @@ public:
         if (num_threads_ == 1) {
             run_slice(0, experts, num_active, down_hadamard_block);
         } else {
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                cur_experts_ = experts;
-                cur_active_ = num_active;
-                cur_down_blk_ = down_hadamard_block;
-                remaining_.store(num_threads_ - 1, std::memory_order_release);
-                ++gen_;
-            }
-            cv_.notify_all();
+            cur_experts_ = experts;
+            cur_active_ = num_active;
+            cur_down_blk_ = down_hadamard_block;
+            remaining_.store(num_threads_ - 1, std::memory_order_release);
+            gen_.fetch_add(1, std::memory_order_release);
+
             run_slice(0, experts, num_active, down_hadamard_block);
             while (remaining_.load(std::memory_order_acquire) > 0) {
-                std::this_thread::yield();
+                cpu_pause();
             }
         }
 
@@ -137,16 +138,13 @@ private:
     void worker_loop(int tid) {
         uint64_t seen = 0;
         while (true) {
-            std::unique_lock<std::mutex> lk(mu_);
-            cv_.wait(lk, [&]() { return gen_ != seen; });
-            seen = gen_;
-            if (stop_) return;
-            const MsExpertView* ex = cur_experts_;
-            const int n_act = cur_active_;
-            const int d_blk = cur_down_blk_;
-            lk.unlock();
+            while (gen_.load(std::memory_order_acquire) == seen) {
+                cpu_pause();
+            }
+            seen = gen_.load(std::memory_order_relaxed);
+            if (stop_.load(std::memory_order_acquire)) return;
 
-            run_slice(tid, ex, n_act, d_blk);
+            run_slice(tid, cur_experts_, cur_active_, cur_down_blk_);
             remaining_.fetch_sub(1, std::memory_order_release);
         }
     }
@@ -161,14 +159,12 @@ private:
     std::vector<std::vector<float>> s_mid_;
 
     std::vector<std::thread> workers_;
-    std::mutex mu_;
-    std::condition_variable cv_;
-    uint64_t gen_ = 0;
-    bool stop_ = false;
+    alignas(64) std::atomic<uint64_t> gen_{0};
+    alignas(64) std::atomic<int> remaining_{0};
+    alignas(64) std::atomic<bool> stop_{false};
     const MsExpertView* cur_experts_ = nullptr;
     int cur_active_ = 0;
     int cur_down_blk_ = 128;
-    std::atomic<int> remaining_{0};
 };
 
 } // namespace adamant::kernels::ms

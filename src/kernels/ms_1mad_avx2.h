@@ -1,10 +1,11 @@
 #pragma once
 
-// Optimized AVX2 1MAD bitshift-trellis GEMV & block FWHT kernels for Adamant (per-row .basalt MS layout).
-// Optimizations vs initial version:
-//   - Replaces 7-instruction byte-sum with 2-instruction VPMADDUBSW + VPMADDWD
-//   - Direct register pack (_mm256_setr_epi32) avoids store-to-load forwarding stall
-//   - Software prefetching (_mm_prefetch) of next weight row from DDR5
+// High-throughput AVX2 1MAD bitshift-trellis GEMV & block FWHT kernels for Adamant.
+// Key optimizations:
+//   - Zero serial state dependency: loads 64-bit bitstream chunks (bswap64) and extracts
+//     8x 14-bit trellis states in parallel via AVX2 variable shifts (_mm256_srlv_epi32).
+//   - 2-instruction byte-sum via VPMADDUBSW + VPMADDWD.
+//   - Software prefetching of upcoming weight rows from DDR5.
 
 #include <cstddef>
 #include <cstdint>
@@ -20,6 +21,14 @@ namespace adamant::kernels::ms {
 constexpr uint32_t kMadMul = 34038481u;
 constexpr uint32_t kMadAdd = 76625530u;
 constexpr uint32_t kStateMask = 0x3FFFu; // 14-bit state
+
+inline uint64_t bswap64_portable(uint64_t x) noexcept {
+#if defined(_MSC_VER)
+    return _byteswap_uint64(x);
+#else
+    return __builtin_bswap64(x);
+#endif
+}
 
 inline float fp16_to_fp32(uint16_t h) noexcept {
 #if defined(__F16C__) && defined(__AVX2__)
@@ -53,10 +62,10 @@ inline float fp16_to_fp32(uint16_t h) noexcept {
 }
 
 inline size_t ms_row_bytes(int in_features, int k) noexcept {
+    // +8 bytes tail padding safe margin is handled by callers or scalar tail
     return 4u + static_cast<size_t>(((in_features - 1) * k + 7) / 8);
 }
 
-// Orthonormal block Fast Walsh-Hadamard Transform with sign flip: y = R^T x
 inline void fwht_rotate_input(
     const float* __restrict x,
     const int8_t* __restrict signs,
@@ -136,28 +145,51 @@ inline float ms_1mad_row_dot(
     float acc = 0.0f;
 
 #if defined(__AVX2__)
-    const __m256i v_mul   = _mm256_set1_epi32(static_cast<int32_t>(kMadMul));
-    const __m256i v_add   = _mm256_set1_epi32(static_cast<int32_t>(kMadAdd));
-    const __m256i v_ones8 = _mm256_set1_epi8(1);
+    const __m256i v_mul    = _mm256_set1_epi32(static_cast<int32_t>(kMadMul));
+    const __m256i v_add    = _mm256_set1_epi32(static_cast<int32_t>(kMadAdd));
+    const __m256i v_ones8  = _mm256_set1_epi8(1);
     const __m256i v_ones16 = _mm256_set1_epi16(1);
-    const __m256i v_bias  = _mm256_set1_epi32(510);
+    const __m256i v_bias   = _mm256_set1_epi32(510);
+    const __m256i v_smask  = _mm256_set1_epi32(static_cast<int32_t>(kStateMask));
     __m256 v_acc = _mm256_setzero_ps();
 
+    // Handle first few columns until start_bit = c * K >= 14 (purely inside qs)
     int c = 0;
-    for (; c + 8 <= in_features; c += 8) {
-        uint32_t s_0 = state;
-        uint32_t s_1 = state = ((state << K) | read_symbol_msb<K>(qs, c + 0)) & kStateMask;
-        uint32_t s_2 = state = ((state << K) | read_symbol_msb<K>(qs, c + 1)) & kStateMask;
-        uint32_t s_3 = state = ((state << K) | read_symbol_msb<K>(qs, c + 2)) & kStateMask;
-        uint32_t s_4 = state = ((state << K) | read_symbol_msb<K>(qs, c + 3)) & kStateMask;
-        uint32_t s_5 = state = ((state << K) | read_symbol_msb<K>(qs, c + 4)) & kStateMask;
-        uint32_t s_6 = state = ((state << K) | read_symbol_msb<K>(qs, c + 5)) & kStateMask;
-        uint32_t s_7 = state = ((state << K) | read_symbol_msb<K>(qs, c + 6)) & kStateMask;
-        if (c + 8 < in_features) {
-            state = ((state << K) | read_symbol_msb<K>(qs, c + 7)) & kStateMask;
+    while (c < in_features && c * K < 14) {
+        if (c > 0) {
+            state = ((state << K) | read_symbol_msb<K>(qs, c - 1)) & kStateMask;
         }
+        uint32_t x = state * kMadMul + kMadAdd;
+        int32_t v = static_cast<int32_t>((x & 0xFFu) + ((x >> 8) & 0xFFu) +
+                                         ((x >> 16) & 0xFFu) + (x >> 24)) - 510;
+        acc += static_cast<float>(v) * x_rot[c];
+        ++c;
+    }
 
-        // Direct register pack avoids store-to-load forwarding stall
+    // Parallel 64-bit window extraction: zero serial dependency across the 8 lanes.
+    // For K <= 6, 8 consecutive 14-bit windows span at most 7*K + 14 <= 56 bits,
+    // which always fits inside one unaligned 64-bit load (plus up to 7-bit byte offset).
+    // Stop 16 columns early so the 8-byte unaligned load never reads past the row buffer.
+    const int vec_end = in_features - 16;
+    for (; c + 8 <= vec_end; c += 8) {
+        const int qs_bit0 = c * K - 14;
+        const int byte0 = qs_bit0 >> 3;
+        const int bit_off = qs_bit0 & 7;
+
+        uint64_t raw_le;
+        std::memcpy(&raw_le, qs + byte0, 8);
+        uint64_t bits = bswap64_portable(raw_le) << bit_off;
+
+        // Extract 8x 14-bit windows directly from the 64-bit register in parallel
+        uint32_t s_0 = static_cast<uint32_t>(bits >> (64 - 14 - 0 * K)) & kStateMask;
+        uint32_t s_1 = static_cast<uint32_t>(bits >> (64 - 14 - 1 * K)) & kStateMask;
+        uint32_t s_2 = static_cast<uint32_t>(bits >> (64 - 14 - 2 * K)) & kStateMask;
+        uint32_t s_3 = static_cast<uint32_t>(bits >> (64 - 14 - 3 * K)) & kStateMask;
+        uint32_t s_4 = static_cast<uint32_t>(bits >> (64 - 14 - 4 * K)) & kStateMask;
+        uint32_t s_5 = static_cast<uint32_t>(bits >> (64 - 14 - 5 * K)) & kStateMask;
+        uint32_t s_6 = static_cast<uint32_t>(bits >> (64 - 14 - 6 * K)) & kStateMask;
+        uint32_t s_7 = static_cast<uint32_t>(bits >> (64 - 14 - 7 * K)) & kStateMask;
+
         __m256i vs = _mm256_setr_epi32(
             static_cast<int32_t>(s_0), static_cast<int32_t>(s_1),
             static_cast<int32_t>(s_2), static_cast<int32_t>(s_3),
@@ -165,9 +197,6 @@ inline float ms_1mad_row_dot(
             static_cast<int32_t>(s_6), static_cast<int32_t>(s_7)
         );
         __m256i vx = _mm256_add_epi32(_mm256_mullo_epi32(vs, v_mul), v_add);
-
-        // 2-instruction unsigned byte sum per 32-bit lane:
-        // maddubs_epi16(unsigned vx, signed 1) -> 16-bit pair sums, then madd_epi16 -> 32-bit sum
         __m256i pair_sums = _mm256_maddubs_epi16(vx, v_ones8);
         __m256i sum_i = _mm256_sub_epi32(_mm256_madd_epi16(pair_sums, v_ones16), v_bias);
 
@@ -182,12 +211,25 @@ inline float ms_1mad_row_dot(
     __m128 shuf = _mm_movehdup_ps(s4);
     __m128 s2 = _mm_add_ps(s4, shuf);
     shuf = _mm_movehl_ps(shuf, s2);
-    acc = _mm_cvtss_f32(_mm_add_ss(s2, shuf));
+    acc += _mm_cvtss_f32(_mm_add_ss(s2, shuf));
 
+    // Reconstruct state at column `c` for the short scalar tail
+    if (c < in_features && c > 0) {
+        const int qs_bit = c * K - 14;
+        const int byte_idx = qs_bit >> 3;
+        const int bit_off = qs_bit & 7;
+        uint32_t raw = (static_cast<uint32_t>(qs[byte_idx]) << 16) |
+                       (static_cast<uint32_t>(qs[byte_idx + 1]) << 8) |
+                        static_cast<uint32_t>(qs[byte_idx + 2]);
+        state = (raw >> (24 - bit_off - 14)) & kStateMask;
+        uint32_t x = state * kMadMul + kMadAdd;
+        int32_t v = static_cast<int32_t>((x & 0xFFu) + ((x >> 8) & 0xFFu) +
+                                         ((x >> 16) & 0xFFu) + (x >> 24)) - 510;
+        acc += static_cast<float>(v) * x_rot[c];
+        ++c;
+    }
     for (; c < in_features; ++c) {
-        if (c > 0) {
-            state = ((state << K) | read_symbol_msb<K>(qs, c - 1)) & kStateMask;
-        }
+        state = ((state << K) | read_symbol_msb<K>(qs, c - 1)) & kStateMask;
         uint32_t x = state * kMadMul + kMadAdd;
         int32_t v = static_cast<int32_t>((x & 0xFFu) + ((x >> 8) & 0xFFu) +
                                          ((x >> 16) & 0xFFu) + (x >> 24)) - 510;
