@@ -1,7 +1,7 @@
 """End-to-end BF16 -> real Hessian -> MS_C{k} -> exact KLD smoke test for dense Qwen3 models.
 
-Runs on a single GPU (e.g. RTX 3090) in ~2-3 minutes for Qwen3-1.7B:
-1. Loads BF16 HF model + calibration tokens (calib_2m.pt or random fallback).
+Runs on a single GPU (e.g. RTX 3090) for Qwen3-1.7B:
+1. Loads BF16 HF model + calibration tokens (calib_2m.pt).
 2. Evaluates BF16 reference logits on held-out sequences.
 3. Collects real per-linear Hessians H = E[x x^T] via forward hooks.
 4. Quantizes all linear layers (excluding lm_head unless --quant-lm-head) using
@@ -12,7 +12,7 @@ Runs on a single GPU (e.g. RTX 3090) in ~2-3 minutes for Qwen3-1.7B:
 Usage:
   python tools/convert/smoke_kld_qwen3.py \
       --model-dir G:\\llm\\models\\Qwen3-1.7B \
-      --calib G:\\llm\\calib\\calib_2m.pt \
+      --calib C:\\llm\\calib\\calib_2m.pt \
       --k 4 --calib-seqs 64 --eval-seqs 8
 """
 
@@ -66,7 +66,7 @@ def main() -> None:
     print(f"Device: {device} | Loading {args.model_dir} (bf16)...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_dir,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map=device,
         trust_remote_code=True,
     )
@@ -82,7 +82,6 @@ def main() -> None:
     print(f"Evaluating BF16 reference logits on {args.eval_seqs} held-out sequences...")
     ref_logits = collect_logits(model, eval_ids, device)
 
-    # Collect per-layer Hessians H = E[x x^T]
     hessians: dict[str, torch.Tensor] = {}
     counts: dict[str, int] = {}
     hooks = []
@@ -128,11 +127,11 @@ def main() -> None:
         _scales, _states, w_rot_q = ms.viterbi_code_matrix(w_rot, hu, k=k_use, lut=lut)
 
         # Invert rotation: W_q = (W_rot_q @ H) * signs
-        w_q = ms.block_hadamard_rows(w_rot_q, block_size=blk) * signs.unsqueeze(0)
+        w_q = ms.fwht_blocks(w_rot_q, block_size=blk) * signs.unsqueeze(0)
         mod.weight.data.copy_(w_q.to(dtype=mod.weight.dtype))
 
-        if (idx + 1) % 28 == 0 or (idx + 1) == len(target_linears):
-            print(f"  [{idx + 1}/{len(target_linears)}] quantized ({time.time() - t0:.1f}s)")
+        if (idx + 1) == 1 or (idx + 1) % 14 == 0 or (idx + 1) == len(target_linears):
+            print(f"  [{idx + 1}/{len(target_linears)}] {name} done ({time.time() - t0:.1f}s)", flush=True)
 
     print("Evaluating quantized MS logits...")
     cand_logits = collect_logits(model, eval_ids, device)
