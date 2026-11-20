@@ -17,6 +17,9 @@ void exl3_expert_grouped(const NativeExpertLayout& L, float limit, const unsigne
                          const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
                          void* scratch, float* out, void* stream, int64_t grid_groups);
 
+/// The scratch exl3_expert_grouped takes for `cap` entries of a wide window (more than 128): the SwiGLU rows only.
+size_t exl3_wide_scratch_bytes(int64_t cap, int64_t n_ff) noexcept;
+
 /// One expert's gate and up into the prompt path's interleaved fp16 layout: row 2r = gate output r, row 2r+1 = up output
 /// r, n_embd values each (W_full transposed, the transforms applied).  `blob` is the expert's first byte, `up_off` its
 /// up record's offset.

@@ -1162,6 +1162,8 @@ void fx_proj(int type, const uint8_t* rec0, size_t rec1, int K, int N, int nproj
 
 }  // namespace
 
+size_t exl3_wide_scratch_bytes(int64_t cap, int64_t n_ff) noexcept { return (size_t) cap * (size_t) n_ff * sizeof(float); }
+
 bool exl3_expert_supported(int type, int64_t n_embd, int64_t n_ff) noexcept {
     return cpu::exl3_type(type) && ((n_embd == 2560 && n_ff == 640) || (n_embd == 1536 && n_ff == 1536)) &&
            cpu::exl3_words(type) % 8 == 0;
@@ -1188,11 +1190,12 @@ void exl3_expert_grouped(const NativeExpertLayout& L, float limit, const unsigne
     const unsigned gy = (unsigned) ((grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups);
     if (L.n_embd == 1536 && cap_entries > kWideEntries) {   // a wide window: each weight tile decoded once a pass
         const unsigned gw = (unsigned) std::min<int64_t>(gy, 1024);
+        float* hw = (float*) scratch;   // exl3_wide_scratch_bytes
         launch_wide<1536, 1536, true>(w, dim3((unsigned) (L.n_ff / 128), gw), s, grp_ptr, grp_start, n_groups, ent_tok,
-                                      nullptr, (const Q81*) x_q8_1, nullptr, h, 0, L.up_off, variant, limit);
+                                      nullptr, (const Q81*) x_q8_1, nullptr, hw, 0, L.up_off, variant, limit);
         check("exl3_expert_grouped/wide gu");
         launch_wide<1536, 1536, false>(wd, dim3((unsigned) (L.n_embd / 128), gw), s, grp_ptr, grp_start, n_groups,
-                                       nullptr, ent_dst, nullptr, h, out, L.down_off, 0, variant, 0.0f);
+                                       nullptr, ent_dst, nullptr, hw, out, L.down_off, 0, variant, 0.0f);
         check("exl3_expert_grouped/wide down");
         return;
     }
