@@ -1,15 +1,15 @@
 """End-to-end BF16 -> real Hessian -> MS_C{k} -> exact KLD smoke test for dense Qwen3 models.
 
 Runs on a single GPU (e.g. RTX 3090) for Qwen3-1.7B:
-- Batched GPU Hessian collection (batch_size=8, no per-step GPU->CPU syncs: ~2s)
-- `--fast-greedy`: fast 1-step trellis + LDLQ coding (~15s total for all 196 matrices)
-- Default (without `--fast-greedy`): full 14-bit Viterbi coding
+- Batched GPU Hessian collection (~2-9s)
+- Default: compiled CUDA 14-bit 1MAD Viterbi kernel (`ms_viterbi_cuda.cu`)
+- `--fast-greedy`: 1-step greedy trellis + LDLQ (~15-140s pure PyTorch)
 
 Usage:
   python tools/convert/smoke_kld_qwen3.py \
       --model-dir G:\\llm\\models\\Qwen3-1.7B \
       --calib C:\\llm\\calib\\calib_2m.pt \
-      --k 4 --calib-seqs 64 --eval-seqs 8 --fast-greedy
+      --k 4 --calib-seqs 64 --eval-seqs 8
 """
 
 from __future__ import annotations
@@ -44,23 +44,21 @@ def greedy_trellis_code_matrix(
     k: int,
     lut: torch.Tensor,
 ) -> torch.Tensor:
-    """Fast GPU 1-step greedy 1MAD trellis + LDLQ error feedback (~100x faster than Python Viterbi)."""
+    """Fast GPU 1-step greedy 1MAD trellis + LDLQ error feedback."""
     out_f, in_f = w_rot.shape
     device = w_rot.device
     w_work = w_rot.clone().to(torch.float32)
 
     row_std = w_work.std(dim=1).clamp(min=1e-8)
-    scales = (ms.GAINS[k] * row_std / ms.CODEBOOK_STD).to(torch.float16).to(torch.float32)  # [out_f]
+    scales = (ms.GAINS[k] * row_std / ms.CODEBOOK_STD).to(torch.float16).to(torch.float32)
     inv_scales = 1.0 / scales.clamp(min=1e-12)
 
     w_quant = torch.empty((out_f, in_f), dtype=torch.float32, device=device)
     hu_diag = torch.diagonal(hu)
     n_pred = 1 << k
-    sym = torch.arange(n_pred, device=device, dtype=torch.int64).unsqueeze(0)  # [1, 2^k]
+    sym = torch.arange(n_pred, device=device, dtype=torch.int64).unsqueeze(0)
 
-    # Column 0: pick best initial state from 16384-entry LUT in chunks of rows
-    # (for speed, pick best state over a 256-strided subset or full argmin in chunks)
-    target0 = (w_work[:, 0] * inv_scales).unsqueeze(1)  # [out_f, 1]
+    target0 = (w_work[:, 0] * inv_scales).unsqueeze(1)
     state = torch.empty(out_f, dtype=torch.int64, device=device)
     for r0 in range(0, out_f, 512):
         r1 = min(r0 + 512, out_f)
@@ -72,10 +70,9 @@ def greedy_trellis_code_matrix(
         err = (w_work[:, 0] - q0) / hu_diag[0]
         w_work[:, 1:] -= err.unsqueeze(1) * hu[0, 1:].unsqueeze(0)
 
-    # Columns 1..in_f-1: only 2^k candidate next states per row!
     for c in range(1, in_f):
-        cand_states = ((state << k) & ms.STATE_MASK).unsqueeze(1) | sym  # [out_f, 2^k]
-        cand_vals = lut[cand_states] * scales.unsqueeze(1)               # [out_f, 2^k]
+        cand_states = ((state << k) & ms.STATE_MASK).unsqueeze(1) | sym
+        cand_vals = lut[cand_states] * scales.unsqueeze(1)
         best_idx = (cand_vals - w_work[:, c].unsqueeze(1)).abs().argmin(dim=1)
         state = cand_states.gather(1, best_idx.unsqueeze(1)).squeeze(1)
         qc = cand_vals.gather(1, best_idx.unsqueeze(1)).squeeze(1)
@@ -106,7 +103,7 @@ def main() -> None:
     parser.add_argument("--calib-seqs", type=int, default=64, help="Number of 512-tok sequences for Hessian")
     parser.add_argument("--eval-seqs", type=int, default=8, help="Held-out 512-tok sequences for KLD")
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size for Hessian collection")
-    parser.add_argument("--fast-greedy", action="store_true", help="Use fast 1-step greedy trellis + LDLQ (~15s)")
+    parser.add_argument("--fast-greedy", action="store_true", help="Use 1-step greedy trellis instead of CUDA Viterbi")
     parser.add_argument("--quant-lm-head", action="store_true", help="Also quantize lm_head to MS_C6")
     args = parser.parse_args()
 
@@ -126,11 +123,16 @@ def main() -> None:
     calib_ids = calib_all[: args.calib_seqs]
     eval_ids = calib_all[-args.eval_seqs :]
 
+    viterbi_cuda_fn = None
+    if not args.fast_greedy and device.type == "cuda":
+        print("Compiling/loading CUDA 14-bit Viterbi kernel (ms_viterbi_cuda.cu)...", flush=True)
+        from ms_viterbi_cuda import viterbi_code_matrix_cuda
+        viterbi_cuda_fn = viterbi_code_matrix_cuda
+
     t0 = time.time()
     print(f"Evaluating BF16 reference logits on {args.eval_seqs} held-out sequences...", flush=True)
     ref_logits = collect_logits(model, eval_ids, device, batch_size=args.batch_size)
 
-    # Accumulate Hessians on GPU (no per-step CPU syncs)
     hessians: dict[str, torch.Tensor] = {}
     counts: dict[str, int] = {}
     hooks = []
@@ -165,7 +167,7 @@ def main() -> None:
     print(f"Hessians collected in {time.time() - t0:.1f}s.", flush=True)
 
     lut = ms.build_1mad_lut(device)
-    mode_str = "fast-greedy" if args.fast_greedy else "viterbi"
+    mode_str = "fast-greedy" if args.fast_greedy else ("viterbi-cuda" if viterbi_cuda_fn else "viterbi-py")
     print(f"Quantizing {len(target_linears)} linear layers to MS_C{args.k} ({mode_str})...", flush=True)
     for idx, (name, mod) in enumerate(target_linears):
         k_use = 6 if name == "lm_head" else args.k
@@ -179,6 +181,8 @@ def main() -> None:
 
         if args.fast_greedy:
             w_rot_q = greedy_trellis_code_matrix(w_rot, hu, k=k_use, lut=lut)
+        elif viterbi_cuda_fn is not None:
+            _scales, _states, w_rot_q = viterbi_cuda_fn(w_rot, hu, k=k_use, lut=lut)
         else:
             _scales, _states, w_rot_q = ms.viterbi_code_matrix(w_rot, hu, k=k_use, lut=lut)
 
@@ -186,7 +190,8 @@ def main() -> None:
         mod.weight.data.copy_(w_q.to(dtype=mod.weight.dtype))
 
         if (idx + 1) == 1 or (idx + 1) % 28 == 0 or (idx + 1) == len(target_linears):
-            print(f"  [{idx + 1}/{len(target_linears)}] {name} done ({time.time() - t0:.1f}s)", flush=True)
+            rel_err = ((w_q - w_f32).norm() / w_f32.norm().clamp(min=1e-8)).item()
+            print(f"  [{idx + 1}/{len(target_linears)}] {name} rel_err={rel_err:.4f} ({time.time() - t0:.1f}s)", flush=True)
 
     print("Evaluating quantized MS logits...", flush=True)
     cand_logits = collect_logits(model, eval_ids, device, batch_size=args.batch_size)
