@@ -238,6 +238,16 @@ public:
     int64_t file_lookups() const { return file_hits_; }
     /// The experts only the file holds.
     program::ExpertSpill spill() const;
+    /// RAM given back to the system under memory pressure, a layer's span at a time from the last layer down: its
+    /// experts are read from the mapped file until the span is taken back (read again from the file), bottom up.
+    /// Main thread only, between windows or requests (the tier settles first).
+    bool ram_can_give_back() const;
+    /// Gives back spans until `want` bytes are freed or none is left; returns the bytes freed.
+    uint64_t ram_give_back(uint64_t want);
+    /// Takes back the lowest given-back span when `budget` covers it; returns the bytes taken (0: none, or failed).
+    uint64_t ram_take_back(uint64_t budget);
+    /// Bytes of the RAM tier given back now.
+    uint64_t ram_given_back() const { return given_bytes_; }
     /// What `PROBE rates` measures: this tier's pool, RAM blobs, formats and second card.
     void probe_env(program::ProbeEnv& env);
 
@@ -363,6 +373,9 @@ private:
     int cover_ = 0;                         ///< experts per layer in the RAM tier
     std::vector<int32_t> ram_idx_;          ///< [layer * n_expert + e] pinned slot or -1
     std::vector<int32_t> spare_;            ///< [layer] pinned slot free for a home leaving the main card, or -1
+    std::vector<std::vector<int32_t>> given_idx_;   ///< [layer] ram_idx_ and then spare_ of a given-back span; empty: held
+    uint64_t given_bytes_ = 0;
+    bool view_watched_ = false;             ///< file_ is the RAM guard's reclaim view
     std::vector<uint64_t> last_miss_;       ///< [layer * n_expert + e] token + 1 of the last miss
     uint64_t token_ = 0;
     platform::MappedFile file_;             ///< the experts section

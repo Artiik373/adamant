@@ -203,6 +203,12 @@ public:
     /// bytes, the same list whatever the position) with the stream the session works on: the shared engine copies them
     /// (basalt/core/checkpoint_transfer.hpp).  `save`: a checkpoint is about to be taken at `pos`; the session brings its
     /// state to `pos` first, or refuses.
+    /// RAM the experts give back under memory pressure and take back when it is free (see Runtime::ram_balance);
+    /// called between windows or requests.
+    virtual bool ram_can_give_back() { return false; }
+    virtual uint64_t ram_give_back(uint64_t want) { (void) want; return 0; }
+    virtual uint64_t ram_take_back(uint64_t budget) { (void) budget; return 0; }
+    virtual uint64_t ram_given_back() { return 0; }
     virtual size_t running_bytes() const { return 0; }
     virtual Result running_state(int64_t pos, bool save, core::RunningState& s) { (void) pos; (void) save; (void) s; return {Status::NotImplemented, "this model keeps no checkpoint"}; }
     /// The regions of running_state() hold a checkpoint's bytes again, `head` (its size as running_state gave it) the host

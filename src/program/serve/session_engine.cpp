@@ -182,6 +182,11 @@ public:
         std::fputs(reply.c_str(), stdout);
     }
     void between_requests(const std::string&) override {}
+    // one tier serves every slot's session
+    bool ram_can_give_back() override { return sessions_[0]->ram_can_give_back(); }
+    uint64_t ram_give_back(uint64_t want) override { return sessions_[0]->ram_give_back(want); }
+    uint64_t ram_take_back(uint64_t budget) override { return sessions_[0]->ram_take_back(budget); }
+    uint64_t ram_given_back() override { return sessions_[0]->ram_given_back(); }
     Flow run_request() override;
     void enc_command(const std::string& cmd) override;
     // The conversations the engine holds go to the disk tier when no stored copy reaches them: the RAM tier's at exit,

@@ -59,6 +59,7 @@ ExpertTier::~ExpertTier() {
         if (l < ram_pins_.size()) core::unpin_ram(ram_[l], ram_pins_[l]);
     }
     ram_allocations_.clear();
+    if (view_watched_) platform::ram_guard_reclaim_view(nullptr, 0);   // before file_ is unmapped
     platform::free_aligned(act_);
 }
 
@@ -319,6 +320,75 @@ program::ExpertSpill ExpertTier::spill() const {
     uint64_t one_each = 0;
     for (const ExpertTierSpec::Layer& e : s_.layers) one_each += e.blob_bytes;
     return {(int64_t) n_layers_ * homes_.file, (int64_t) n_layers_ * n_expert_, one_each * (uint64_t) homes_.file};
+}
+
+bool ExpertTier::ram_can_give_back() const {
+    for (int l = 0; l < (int) ram_.size(); ++l)
+        if (ram_[(size_t) l]) return true;
+    return false;
+}
+
+uint64_t ExpertTier::ram_give_back(uint64_t want) {
+    if (!ram_can_give_back()) return 0;
+    settle();   // no copy or read in flight touches a span
+    if (!file_) {   // every expert had a RAM or VRAM home, so the file was not mapped
+        std::string err;
+        std::optional<platform::MappedFile> mf = platform::MappedFile::open_ro(s_.path, &err);
+        if (!mf) {
+            basalt::log::error(s_.area.c_str(), "RAM give-back: %s", err.c_str());
+            return 0;
+        }
+        file_ = std::move(*mf);
+    }
+    if (!view_watched_) {
+        platform::ram_guard_reclaim_view(file_.data(), file_.size());
+        view_watched_ = true;
+    }
+    if (given_idx_.empty()) given_idx_.resize((size_t) n_layers_);
+    uint64_t freed = 0;
+    for (int l = n_layers_ - 1; l >= 0 && freed < want; --l) {
+        if (!ram_[(size_t) l]) continue;
+        const size_t base = (size_t) l * n_expert_;
+        std::vector<int32_t>& keep = given_idx_[(size_t) l];
+        keep.assign(ram_idx_.begin() + (std::ptrdiff_t) base, ram_idx_.begin() + (std::ptrdiff_t) (base + n_expert_));
+        keep.push_back(spare_[(size_t) l]);
+        std::fill(ram_idx_.begin() + (std::ptrdiff_t) base, ram_idx_.begin() + (std::ptrdiff_t) (base + n_expert_), -1);
+        spare_[(size_t) l] = -1;   // no main-card home leaves for RAM while the span is away
+        core::unpin_ram(ram_[(size_t) l], ram_pins_[(size_t) l]);
+        ram_pins_[(size_t) l] = {};
+        const uint64_t bytes = ram_allocations_[(size_t) l].capacity();
+        ram_allocations_[(size_t) l].reset();
+        ram_[(size_t) l] = nullptr;
+        freed += bytes;
+    }
+    given_bytes_ += freed;
+    return freed;
+}
+
+uint64_t ExpertTier::ram_take_back(uint64_t budget) {
+    int l = 0;
+    while (l < (int) given_idx_.size() && given_idx_[(size_t) l].empty()) ++l;
+    if (l == (int) given_idx_.size()) return 0;
+    const ExpertTierSpec::Layer& el = s_.layers[(size_t) l];
+    const uint64_t span = el.blob_bytes * (uint64_t) (cover_ + 1);
+    if (ram_padded(span) > budget) return 0;
+    std::vector<RamAllocation> one(1);
+    if (!one[0].allocate(span)) return 0;
+    std::vector<int32_t>& keep = given_idx_[(size_t) l];
+    for (int e = 0; e < n_expert_; ++e)
+        if (keep[(size_t) e] >= 0)
+            std::memcpy(one[0].data() + (size_t) keep[(size_t) e] * el.blob_bytes,
+                        file_.data() + s_.range.offset + el.offset + (uint64_t) e * el.blob_bytes, el.blob_bytes);
+    ram_pins_[(size_t) l] = core::pin_ram_spans(one, /*mapped=*/false)[0];
+    const uint64_t bytes = one[0].capacity();
+    ram_allocations_[(size_t) l] = std::move(one[0]);
+    ram_[(size_t) l] = ram_allocations_[(size_t) l].data();
+    // the places come back last: until here every lookup of the layer read the file
+    std::copy(keep.begin(), keep.begin() + n_expert_, ram_idx_.begin() + (std::ptrdiff_t) ((size_t) l * n_expert_));
+    spare_[(size_t) l] = keep.back();
+    keep.clear();
+    given_bytes_ -= std::min(given_bytes_, bytes);
+    return bytes;
 }
 
 namespace {

@@ -71,6 +71,8 @@ Basalt 会拒绝让机器没有内存可用的设置，并且绝不会缩小你�
   交还它，目标是比保留量高 1 GiB：这些专家随后从模型文件读取。在请求之间，一旦比保留量高 2 GiB 的空闲保持住，且距上次交还已过
   30 秒，引擎就把这些块取回。日志写出 `RAM guard: N MiB of experts given back` 和 `... taken back into RAM`。在 Linux 上副本是一个
   注册的范围，危急的请求与以前一样停止。
+- Hy4-flash 的 RAM 专家层以同样方式交还 RAM，从最后一层往下，每次交还一层的区段，Linux 和 Windows 都适用；它自下而上取回
+  这些区段。
 - SSD 上的专家给出一条警告，所有模型相同：`N experts on SSD (X GiB) · free X GiB RAM`。控制台重复它，统计页面把它的
   Experts 块变为琥珀色。
 - 磁盘层保持比保留量高 1 GiB 的下限。

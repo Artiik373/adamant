@@ -207,6 +207,43 @@ int main() {
                 ++checked;
             }
         CHECK(checked == kLayers * kSlots);
+
+        // RAM given back under pressure: every span goes, lookups read the file, and every span comes back with the
+        // pack's bytes in each place it says it holds
+        const auto ram_right = [&](int& held) {
+            held = 0;
+            for (int l = 0; l < kLayers; ++l)
+                for (int e = 0; e < kExperts; ++e) {
+                    const core::ExpertTier::Source src = tier.locate(l, e);
+                    if (!src.pinned) continue;
+                    CHECK(std::memcmp(src.pinned, data.data() + ((size_t) l * kExperts + (size_t) e) * blob, blob) == 0);
+                    ++held;
+                }
+        };
+        int held_before = 0, held = 0;
+        ram_right(held_before);
+        CHECK(held_before > 0 && tier.ram_can_give_back() && tier.ram_given_back() == 0);
+        const uint64_t given = tier.ram_give_back(~0ull);
+        CHECK(given > 0 && tier.ram_given_back() == given && !tier.ram_can_give_back());
+        ram_right(held);
+        CHECK(held == 0);
+        for (int t = 0; t < 200; ++t) {
+            tier.begin_token(1);
+            for (int l = 0; l < kLayers; ++l) {
+                const int32_t id = draw(r);
+                core::ExpertTier::Lookup lk;
+                CHECK(tier.lookup(l, &id, 1, lk, err));
+                tier.promote(l, lk);
+                tier.pump(-1, core::ExpertTier::kAllPieces);
+            }
+        }
+        tier.settle();
+        CHECK(tier.ram_take_back(0) == 0);   // a budget below one span takes nothing
+        uint64_t taken = 0;
+        for (int l = 0; l < kLayers; ++l) taken += tier.ram_take_back(~0ull);
+        CHECK(taken == given && tier.ram_given_back() == 0 && tier.ram_take_back(~0ull) == 0);
+        ram_right(held);
+        CHECK(held == held_before);
         cudaFreeHost(h_rows);
     }
     // a bounded lend (ExpertTierSpec::lend_segment) with copies weighted by layer: half the arena goes, every layer keeps a

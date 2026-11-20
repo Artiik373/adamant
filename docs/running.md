@@ -107,6 +107,8 @@ Basalt refuses settings that would leave the machine without memory, and never s
   model file. It takes the pieces back between requests once 2 GiB above the reserve stay free and 30 s have passed since the
   last give-back. The log says `RAM guard: N MiB of experts given back` and `... taken back into RAM`. On Linux the copy is one
   registered range and a critical request stops as before.
+- Hy4-flash's RAM expert tier gives RAM back the same way, one layer's span at a time from the last layer down, on Linux
+  and Windows; it takes the spans back bottom up.
 - Experts on the SSD give one warning, the same for every model: `N experts on SSD (X GiB) · free X GiB RAM`. The console
   repeats it and the stats page turns its Experts block amber.
 - The disk tier keeps its floor a GiB above the reserve.

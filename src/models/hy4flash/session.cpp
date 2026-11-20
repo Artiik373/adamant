@@ -680,6 +680,17 @@ public:
         return {};
     }
 
+    bool ram_can_give_back() override { return tier_ && tier_->ram_can_give_back(); }
+    uint64_t ram_give_back(uint64_t want) override {
+        if (!tier_ || cudaDeviceSynchronize() != cudaSuccess) return 0;   // every slot's stream: they share the tier
+        return tier_->ram_give_back(want);
+    }
+    uint64_t ram_take_back(uint64_t budget) override {
+        if (!tier_ || cudaDeviceSynchronize() != cudaSuccess) return 0;
+        return tier_->ram_take_back(budget);
+    }
+    uint64_t ram_given_back() override { return tier_ ? tier_->ram_given_back() : 0; }
+
     // ---- conversations: the latent rows and pooled keys by position (save_cells / restore_cells), the rings by checkpoint
     // (running_state). A ring holds the last swa_ring() (window layers) or kRawRing (indexer rows) positions, so a checkpoint
     // at `pos` is intact while the session has not run more than kMaxRows rows past it.
