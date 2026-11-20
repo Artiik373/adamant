@@ -146,8 +146,8 @@ def viterbi_code_matrix(
     hu: torch.Tensor,
     k: int,
     lut: torch.Tensor,
-    window: int = 24,
-    commit: int = 16,
+    window: int = 32,
+    commit: int = 8,
     row_chunk: int = 256,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fast GPU-batched sliding-window 14-bit Viterbi search with LDLQ error feedback."""

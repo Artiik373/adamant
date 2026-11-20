@@ -40,8 +40,8 @@ def viterbi_code_matrix_cuda(
     hu: torch.Tensor,
     k: int,
     lut: torch.Tensor,
-    window: int = 24,
-    commit: int = 16,
+    window: int = 32,
+    commit: int = 8,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Full 14-bit 1MAD Viterbi + LDLQ using the compiled CUDA kernel."""
     s, st, q = viterbi_code_batched_cuda(w_rot.unsqueeze(0), hu.unsqueeze(0), k, lut, window, commit)
@@ -54,12 +54,16 @@ def viterbi_code_batched_cuda(
     hu: torch.Tensor,
     k: int,
     lut: torch.Tensor,
-    window: int = 24,
-    commit: int = 16,
+    window: int = 32,
+    commit: int = 8,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Viterbi + LDLQ for E matrices at once: w_rot [E, out, in], hu [E, in, in]."""
     ext = get_viterbi_ext()
     n_mat, out_f, in_f = w_rot.shape
+    if not (torch.isfinite(w_rot).all() and torch.isfinite(hu).all()):
+        raise ValueError("viterbi input has non-finite weights or Hessian factor")
+    if hu.shape != (n_mat, in_f, in_f) or not 1 <= k <= 6:
+        raise ValueError(f"bad viterbi input: w {tuple(w_rot.shape)}, hu {tuple(hu.shape)}, k {k}")
     rows = n_mat * out_f
     device = w_rot.device
     w_work = w_rot.to(torch.float32).clone().contiguous()
