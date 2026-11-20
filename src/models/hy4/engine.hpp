@@ -3,7 +3,7 @@
 // The trunk lives on the GPU: its matrices quantized at load (Q8_0 or Q6_K), kv_b as fp16 for the absorbed MLA, the
 // router, norms, iHC and small indexer weights as fp32, the embedding as BF16. The routed experts are one pinned host
 // range (host VMM), read by the GPU in place. The Engram tables stay in the source shards and their rows are read per
-// token. KV caches: a ring of kWindow + kMaxT positions on the sliding layers, the whole context on the sparse ones.
+// token. KV caches: a ring of kWindow + kPassRows positions on the sliding layers, the whole context on the sparse ones.
 #pragma once
 
 #include "basalt/models/hy4/geometry.hpp"
@@ -37,7 +37,7 @@ public:
     /// Runs tokens[0..n) (n <= kMaxP) at positions pos .. pos + n - 1. `pos` may be below the positions run so far:
     /// the later ones are dropped (a rejected draft). picks[t]: the greedy next token after tokens[t]; `logits`
     /// ([n][kVocab] floats, host) optional. A window wider than kMaxT (a prompt's) gives its last row only: the
-    /// other picks are -1 and their logits rows are left as they were.
+    /// other picks are -1 and its logits are row 0 of `logits` (kVocab floats).
     bool step_window(const int32_t* tokens, int n, int64_t pos, int32_t* picks, float* logits, std::string& err);
     /// step_window of one token; returns the greedy next token, -1 on failure.
     int32_t step(int32_t token, int64_t pos, float* logits, std::string& err);

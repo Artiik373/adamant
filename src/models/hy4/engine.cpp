@@ -4,6 +4,7 @@
 #include "basalt/core/model_file.hpp"
 #include "basalt/core/vmm.hpp"
 #include "basalt/ggml/ggml.h"
+#include "basalt/kernels/exl3_kernels.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/log.hpp"
@@ -116,23 +117,26 @@ struct Engine::Impl {
     std::vector<uint64_t> layer_off;   // per model layer (0 for the dense one)
     k::NativeExpertLayout xl{};
 
-    // buffers (kMaxP rows; the head's logits kMaxT)
+    // buffers (kPassRows rows; the streams and the routed experts' kMaxP; the head's logits kMaxT)
     float *streams, *y, *xn, *qr, *q, *kva, *gate_b, *q_lat, *o_lat, *o_heads, *a, *logits, *router_logits, *route_w,
         *lat, *exp_rows, *lat_sum, *sh_g, *sh_u, *ffn_a, *ffn_b, *idx_q, *idx_hw, *idx_tk, *idx_scr, *eg_rows, *eg_e,
         *eg_key, *eg_val, *hc_pre, *hc_post, *dense_g, *dense_u;
-    void *xq = nullptr, *xq2 = nullptr, *exp_scratch = nullptr;
+    void *xq = nullptr, *xq2 = nullptr, *xlq = nullptr, *exp_scratch = nullptr;   // xlq: the experts' input, kMaxP rows
     int32_t *route_ids, *sel, *sel_n, *small;
     // the grouped-experts tables of a layer, built on the host from the router's picks and copied in one piece
     static constexpr int kMaxEnt = kMaxP * kExpertsUsed;
+    // [ptr: ne][start: ne + 1][n][dst: ne][tok: ne], laid out for a window's ne entries: one copy of its size moves it
     struct Groups {
-        unsigned long long ptr[kMaxEnt];
-        int32_t start[kMaxEnt + 1];
-        int32_t n;
-        int32_t dst[kMaxEnt];
-        int32_t tok[kMaxEnt];
+        unsigned long long* ptr;
+        int32_t *start, *n, *dst, *tok;
+        Groups(void* base, int ne)
+            : ptr((unsigned long long*) base), start((int32_t*) (ptr + ne)), n(start + ne + 1), dst(n + 1), tok(dst + ne) {}
+        static size_t bytes(int ne) { return (size_t) ne * 8 + ((size_t) 3 * ne + 2) * 4; }
     };
-    Groups* d_grp = nullptr;
-    Groups* h_grp = nullptr;      // pinned
+    void* d_grp = nullptr;
+    void* h_grp = nullptr;        // pinned
+    std::vector<int> grp_ord;     // the window's entries by expert
+    bool in_win[kExperts] = {};   // the layer's experts the window routes to
     int32_t* h_small = nullptr;   // pinned, kMaxP each: token, pos, lo_window, hi, lo_full (0)
     float* h_eg_rows = nullptr;   // pinned: [engram][kMaxP][kEngramHeads][kEngramHeadDim]
     std::vector<uint16_t> eg_raw;
@@ -166,7 +170,7 @@ struct Engine::Impl {
         warm.assign(kMaxT + 1, false);
         if (cudaMallocHost((void**) &h_logits, (size_t) kMaxT * kVocab * 4) != cudaSuccess ||
             cudaMallocHost((void**) &h_ids, kMaxEnt * 4) != cudaSuccess ||
-            cudaMallocHost((void**) &h_grp, sizeof(Groups)) != cudaSuccess) {
+            cudaMallocHost((void**) &h_grp, Groups::bytes(kMaxEnt)) != cudaSuccess) {
             err = "pinned host buffers";
             return false;
         }
@@ -311,9 +315,9 @@ struct Engine::Impl {
             if (score[(size_t) idx] == 0.f) score[(size_t) idx] = counts[(size_t) idx];
         }
     }
-    // the device address of layer l's expert e, copying it into a slot on a miss; `picked` ([n_picked]) are this
-    // window's experts, whose slots are not given up
-    unsigned long long expert_place(int l, int e, const int32_t* picked, int n_picked) {
+    // the device address of layer l's expert e, copying it into a slot on a miss; the slots of this window's experts
+    // (in_win) are not given up
+    unsigned long long expert_place(int l, int e) {
         const size_t idx = (size_t) l * kExperts + (size_t) e;
         counts[idx] += 1.f;
         score[idx] += 1.f;
@@ -331,12 +335,7 @@ struct Engine::Impl {
             const int32_t ow = owner[(size_t) i];
             if (ow < 0) { v = i; break; }
             if (score[(size_t) ow] >= best) continue;
-            bool in_use = ow / kExperts == l;
-            if (in_use) {
-                in_use = false;
-                for (int k2 = 0; k2 < n_picked; ++k2) in_use = in_use || picked[k2] == ow % kExperts;
-            }
-            if (!in_use) { best = score[(size_t) ow]; v = i; }
+            if (!(ow / kExperts == l && in_win[ow % kExperts])) { best = score[(size_t) ow]; v = i; }
         }
         if (v < 0) return (unsigned long long) host;   // every slot holds one of this window's experts
         if (owner[(size_t) v] >= 0) slot_of[(size_t) owner[(size_t) v]] = -1;
@@ -350,14 +349,17 @@ struct Engine::Impl {
     // the window's experts as groups: entries of the same expert share one group, so a window reads each once
     void expert_groups_host(int l, int T) {
         const int ne = T * kExpertsUsed;
-        int ord[kMaxEnt];
+        grp_ord.resize((size_t) ne);
+        int* ord = grp_ord.data();
         for (int i = 0; i < ne; ++i) ord[i] = i;
         std::stable_sort(ord, ord + ne, [&](int a2, int b2) { return h_ids[a2] < h_ids[b2]; });
-        Groups& g = *h_grp;
+        std::fill(in_win, in_win + kExperts, false);
+        for (int i = 0; i < ne; ++i) in_win[h_ids[i]] = true;
+        Groups g(h_grp, ne);
         int n = 0;
         for (int i = 0; i < ne; ++i) {
             const int en = ord[i];
-            const unsigned long long at = expert_place(l, h_ids[en], h_ids, ne);
+            const unsigned long long at = expert_place(l, h_ids[en]);
             if (i == 0 || h_ids[en] != h_ids[ord[i - 1]]) {
                 g.ptr[n] = at;
                 g.start[n++] = i;
@@ -366,7 +368,7 @@ struct Engine::Impl {
             g.tok[i] = en / kExpertsUsed;
         }
         g.start[n] = ne;
-        g.n = n;
+        *g.n = n;
     }
 
     // ---- graphs per window size: per layer the launches before the expert placement (A) and after it (B), the head ----
@@ -615,7 +617,7 @@ struct Engine::Impl {
                 !up_mat(f + ".shared_experts.down_proj.weight", y.sh_down, err))
                 return false;
         }
-        y.cap = y.sliding ? kWindow + kMaxP : o.max_context;
+        y.cap = y.sliding ? kWindow + kPassRows : o.max_context;
         if (y.sliding) {
             y.ckv = dalloc<uint16_t>((size_t) y.cap * kKvRank, owned);
             y.kpe = dalloc<uint16_t>((size_t) y.cap * kRope, owned);
@@ -732,8 +734,8 @@ struct Engine::Impl {
 
     bool alloc_buffers(std::string& err) {
         const int max_in = kHeadsSliding * kVHead;   // 16384: the widest GEMV input (o_proj of a sliding layer)
-        constexpr size_t M = kMaxP;
-        streams = dalloc<float>(M * kHcFlat, owned);
+        constexpr size_t M = kPassRows;
+        streams = dalloc<float>((size_t) kMaxP * kHcFlat, owned);
         y = dalloc<float>(M * kEmbd, owned);
         xn = dalloc<float>(M * kEmbd, owned);
         qr = dalloc<float>(M * kQRank, owned);
@@ -746,9 +748,9 @@ struct Engine::Impl {
         a = dalloc<float>(M * kEmbd, owned);
         logits = dalloc<float>((size_t) kMaxT * kVocab, owned);
         router_logits = dalloc<float>(M * kExperts, owned);
-        route_w = dalloc<float>(M * kExpertsUsed, owned);
+        route_w = dalloc<float>(kMaxEnt, owned);
         lat = dalloc<float>(M * kLatent, owned);
-        exp_rows = dalloc<float>(M * kExpertsUsed * kLatent, owned);
+        exp_rows = dalloc<float>((size_t) kMaxEnt * kLatent, owned);
         lat_sum = dalloc<float>(M * kLatent, owned);
         sh_g = dalloc<float>(M * kSharedFf, owned);
         sh_u = dalloc<float>(M * kSharedFf, owned);
@@ -759,37 +761,46 @@ struct Engine::Impl {
         idx_q = dalloc<float>(M * kIdxHeads * kIdxDim, owned);
         idx_hw = dalloc<float>(M * kIdxHeads, owned);
         idx_tk = dalloc<float>(M * kIdxDim, owned);
-        idx_scr = dalloc<float>(indexer_scratch_floats(o.max_context / kIdxRatio + 1, kMaxP), owned);
+        idx_scr = dalloc<float>(indexer_scratch_floats(o.max_context / kIdxRatio + 1, kPassRows), owned);
         eg_rows = dalloc<float>(M * kEngramLayers * kEngramHeads * kEngramHeadDim, owned);
         eg_e = dalloc<float>(M * kEngramDim, owned);
         eg_key = dalloc<float>(M * kHc * kEmbd, owned);
         eg_val = dalloc<float>(M * kEmbd, owned);
         hc_pre = dalloc<float>(M * kHc, owned);
         hc_post = dalloc<float>(M * kHc, owned);
-        xq = dalloc<uint8_t>(k::native_q8_1_bytes(std::max(max_in, kDenseFf), 1) * kMaxP, owned);
-        xq2 = dalloc<uint8_t>(k::native_q8_1_bytes(std::max(max_in, kDenseFf), 1) * kMaxP, owned);
-        exp_scratch = dalloc<uint8_t>(k::native_expert_scratch_bytes(kMaxEnt, kExpertFf), owned);
+        xq = dalloc<uint8_t>(k::native_q8_1_bytes(std::max(max_in, kDenseFf), 1) * M, owned);
+        xq2 = dalloc<uint8_t>(k::native_q8_1_bytes(std::max(max_in, kDenseFf), 1) * M, owned);
+        xlq = dalloc<uint8_t>(k::native_q8_1_bytes(kLatent, 1) * kMaxP, owned);
+        // a decode window's scratch, or a wide window's (EXL3: the SwiGLU rows only)
+        const size_t wide = k::exl3_expert_supported(xl.gu_type, xl.n_embd, xl.n_ff)
+                                ? k::exl3_wide_scratch_bytes(kMaxEnt, kExpertFf)
+                                : k::native_expert_scratch_bytes(kMaxEnt, kExpertFf);
+        exp_scratch = dalloc<uint8_t>(std::max(k::native_expert_scratch_bytes(kMaxT * kExpertsUsed, kExpertFf), wide), owned);
         route_ids = dalloc<int32_t>(kMaxEnt, owned);
         sel = dalloc<int32_t>(M * kIdxGroupTopk * kIdxRatio, owned);
         sel_n = dalloc<int32_t>(M, owned);
-        small = dalloc<int32_t>(5 * M, owned);
-        d_grp = dalloc<Groups>(1, owned);
-        if (cudaMallocHost((void**) &h_small, 5 * M * 4) != cudaSuccess ||
-            cudaMallocHost((void**) &h_eg_rows, M * kEngramLayers * kEngramHeads * kEngramHeadDim * 4) != cudaSuccess) {
+        small = dalloc<int32_t>(5 * kMaxP, owned);
+        d_grp = dalloc<uint8_t>(Groups::bytes(kMaxEnt), owned);
+        if (cudaMallocHost((void**) &h_small, 5 * kMaxP * 4) != cudaSuccess ||
+            cudaMallocHost((void**) &h_eg_rows, (size_t) kMaxP * kEngramLayers * kEngramHeads * kEngramHeadDim * 4) != cudaSuccess) {
             err = "pinned host buffers";
             return false;
         }
         eg_raw.resize((size_t) kEngramHeads * kEngramHeadDim);
-        for (void* p : {(void*) streams, (void*) xq, (void*) exp_scratch, (void*) small, (void*) idx_scr, (void*) d_grp})
+        for (void* p : {(void*) streams, (void*) xq, (void*) xlq, (void*) exp_scratch, (void*) small, (void*) idx_scr, d_grp})
             if (p == nullptr) { err = "out of VRAM for the decode buffers"; return false; }
         return true;
     }
 
-    // ---- decode: T rows, row t at position pos + t ----
+    // ---- decode: T rows, row t at position pos + t; a wide window's pass covers rows row0 .. row0 + T - 1 ----
     int T = 1;
-    int32_t* P() const { return small + kMaxP; }           // pos[T]
-    int32_t* LoWin() const { return small + 2 * kMaxP; }   // the sliding window's first position [T]
-    int32_t* Hi() const { return small + 3 * kMaxP; }      // pos + 1 [T]
+    int row0 = 0;
+    int head_row0 = 0;   // the window row of the head's first row
+    int sel_row0 = 0;    // the window row of the drafter's target picks' first row
+    float* S() const { return streams + (size_t) row0 * kHcFlat; }
+    int32_t* P() const { return small + kMaxP + row0; }           // pos[T]
+    int32_t* LoWin() const { return small + 2 * kMaxP + row0; }   // the sliding window's first position [T]
+    int32_t* Hi() const { return small + 3 * kMaxP + row0; }      // pos + 1 [T]
     int32_t* Zero() const { return small + 4 * kMaxP; }    // 0 [T]
 
     void mm(const Mat& m, const void* x_q8_1, float* out) {
@@ -888,7 +899,7 @@ struct Engine::Impl {
 
     void attention(int l) {
         Layer& y_ = L[l];
-        hc_mix(streams, y_.attn_hc, T, hc_pre, hc_post, y, s);
+        hc_mix(S(), y_.attn_hc, T, hc_pre, hc_post, y, s);
         rms_norm_rows(y, y_.in_norm, kEmbd, T, kEmbd, kRmsEps, xn, s);
         quant(xn, kEmbd, xq);
         mm(y_.q_a, xq, qr);
@@ -915,6 +926,7 @@ struct Engine::Impl {
             mm(y_.idx_hw, xq, idx_hw);
             indexer_select_at(idx_q, idx_hw, y_.grp_keys, o.max_context / kIdxRatio, P(), T, idx_scr, sel, sel_n, s);
             if (y_.dfly >= 0) {   // the drafter reads the last accepted row's picks
+                sel_row0 = row0;
                 cudaMemcpyAsync(df.tsel[y_.dfly], sel, (size_t) T * kIdxGroupTopk * kIdxRatio * 4, cudaMemcpyDeviceToDevice, s);
                 cudaMemcpyAsync(df.tsel_n[y_.dfly], sel_n, (size_t) T * 4, cudaMemcpyDeviceToDevice, s);
             }
@@ -926,13 +938,13 @@ struct Engine::Impl {
         quant(o_heads, y_.heads * kVHead, xq);
         mm(y_.o, xq, a);
         rms_norm_rows(a, y_.post_proj_norm, kEmbd, T, kEmbd, kRmsEps, a, s);
-        hc_apply(streams, a, hc_post, T, s);
+        hc_apply(S(), a, hc_post, T, s);
         mark(kPhAttn);
     }
 
     void ffn_pre(int l) {
         Layer& y_ = L[l];
-        hc_mix(streams, y_.mlp_hc, T, hc_pre, hc_post, y, s);
+        hc_mix(S(), y_.mlp_hc, T, hc_pre, hc_post, y, s);
         rms_norm_rows(y, y_.post_attn_norm, kEmbd, T, kEmbd, kRmsEps, xn, s);
         quant(xn, kEmbd, xq);
         if (y_.dense) {
@@ -943,27 +955,43 @@ struct Engine::Impl {
             rms_norm_rows(ffn_a, y_.post_fc2_norm, kEmbd, T, kEmbd, kRmsEps, a, s);
         } else {
             gemv_f32(y_.router, xn, kEmbd, kExperts, T, router_logits, s);
-            route_sigmoid_topk(router_logits, y_.router_bias, T, route_ids, route_w, s);
+            const size_t e0 = (size_t) row0 * kExpertsUsed;
+            route_sigmoid_topk(router_logits, y_.router_bias, T, route_ids + e0, route_w + e0, s);
             mm(y_.lat_in, xq, lat);
-            quant(lat, kLatent, xq2);
-            cudaMemcpyAsync(h_ids, route_ids, (size_t) T * kExpertsUsed * 4, cudaMemcpyDeviceToHost, s);
+            quant(lat, kLatent, (uint8_t*) xlq + (size_t) row0 * k::native_q8_1_bytes(kLatent, 1));
+            cudaMemcpyAsync(h_ids + e0, route_ids + e0, (size_t) T * kExpertsUsed * 4, cudaMemcpyDeviceToHost, s);
             mark(kPhFfn);
             return;
         }
-        hc_apply(streams, a, hc_post, T, s);
+        hc_apply(S(), a, hc_post, T, s);
         mark(kPhFfn);
     }
 
     // after the host grouped and placed this window's experts (h_grp)
     void ffn_post(int l) {
-        Layer& y_ = L[l];
+        ffn_experts();
+        ffn_rest(l, false);
+    }
+    // the routed experts of all T rows
+    void ffn_experts() {
         const int ne = T * kExpertsUsed;
-        cudaMemcpyAsync(d_grp, h_grp, sizeof(Groups), cudaMemcpyHostToDevice, s);
+        const Groups dg(d_grp, ne);
+        cudaMemcpyAsync(d_grp, h_grp, Groups::bytes(ne), cudaMemcpyHostToDevice, s);
         mark(kPhCopy);   // the cache misses' copies, queued before this segment
-        k::native_expert_grouped_clamped(xl, kSwigluLimit, d_grp->ptr, d_grp->start, &d_grp->n, d_grp->dst, d_grp->tok,
-                                         ne, ne, xq2, exp_scratch, exp_rows, s);
+        k::native_expert_grouped_clamped(xl, kSwigluLimit, dg.ptr, dg.start, dg.n, dg.dst, dg.tok, ne, ne, xlq, exp_scratch,
+                                         exp_rows, s);
         mark(kPhExperts);
-        expert_sum(exp_rows, route_w, kLatent, T, lat_sum, s);
+    }
+    // the rest of the FFN of the pass; `again`: its input once more (other passes ran since ffn_pre)
+    void ffn_rest(int l, bool again) {
+        Layer& y_ = L[l];
+        if (again) {
+            hc_mix(S(), y_.mlp_hc, T, hc_pre, hc_post, y, s);
+            rms_norm_rows(y, y_.post_attn_norm, kEmbd, T, kEmbd, kRmsEps, xn, s);
+            quant(xn, kEmbd, xq);
+        }
+        const size_t e0 = (size_t) row0 * kExpertsUsed;
+        expert_sum(exp_rows + e0 * kLatent, route_w + e0, kLatent, T, lat_sum, s);
         quant(lat_sum, kLatent, xq2);
         mm(y_.lat_out, xq2, ffn_a);
         mm(y_.sh_gate, xq, sh_g);
@@ -972,20 +1000,20 @@ struct Engine::Impl {
         mm(y_.sh_down, xq2, ffn_b);
         add_rows(ffn_a, ffn_b, T * kEmbd, a, s);
         rms_norm_rows(a, y_.combine_norm, kEmbd, T, kEmbd, kRmsEps, a, s);
-        hc_apply(streams, a, hc_post, T, s);
+        hc_apply(S(), a, hc_post, T, s);
         mark(kPhFfn);
     }
 
     void engram(int e) {
         Engram& g = eg[(size_t) e];
         const size_t rows = (size_t) kEngramHeads * kEngramHeadDim;
-        cudaMemcpyAsync(eg_rows + (size_t) e * kMaxP * rows, h_eg_rows + (size_t) e * kMaxP * rows, (size_t) T * rows * 4,
-                        cudaMemcpyHostToDevice, s);
-        engram_rows(eg_rows + (size_t) e * kMaxP * rows, g.head_norm, kEngramEps, T, eg_e, s);
+        cudaMemcpyAsync(eg_rows + (size_t) e * kPassRows * rows, h_eg_rows + ((size_t) e * kMaxP + row0) * rows,
+                        (size_t) T * rows * 4, cudaMemcpyHostToDevice, s);
+        engram_rows(eg_rows + (size_t) e * kPassRows * rows, g.head_norm, kEngramEps, T, eg_e, s);
         quant(eg_e, kEngramDim, xq2);
         mm(g.key, xq2, eg_key);
         mm(g.value, xq2, eg_val);
-        engram_apply(eg_key, eg_val, g.w, T, streams, s);
+        engram_apply(eg_key, eg_val, g.w, T, S(), s);
         mark(kPhEngram);
     }
 
@@ -1001,8 +1029,8 @@ struct Engine::Impl {
         float conf_b = 0.f;
         float* conf = nullptr;                // [kDflyBlock] its logits, without the bias
         float* h_conf = nullptr;              // pinned
-        int32_t* tsel[kDflyLayers] = {};      // the target layers' picks of the last window, [kMaxP][topk * ratio]
-        int32_t* tsel_n[kDflyLayers] = {};    // [kMaxP]
+        int32_t* tsel[kDflyLayers] = {};      // the target layers' picks of the last pass, [kPassRows][topk * ratio]
+        int32_t* tsel_n[kDflyLayers] = {};    // [kPassRows]
         int32_t* rsel[kDflyLayers] = {};      // the last accepted row's picks [topk * ratio], and [1] its count
         int32_t* rsel_n[kDflyLayers] = {};
         int32_t* bsel = nullptr;              // the block's keys [kDflyBlock][kDflySelStride]
@@ -1036,8 +1064,8 @@ struct Engine::Impl {
                 return false;
             if (y.q_b.n_out != kDflyHeads * kQkHead || y.d_gate.n_out != kDflyFf) { err = p + ": unexpected shapes"; return false; }
             L[kDflyTarget[i]].dfly = i;
-            df.tsel[i] = dalloc<int32_t>((size_t) kMaxP * kIdxGroupTopk * kIdxRatio, owned);
-            df.tsel_n[i] = dalloc<int32_t>(kMaxP, owned);
+            df.tsel[i] = dalloc<int32_t>((size_t) kPassRows * kIdxGroupTopk * kIdxRatio, owned);
+            df.tsel_n[i] = dalloc<int32_t>(kPassRows, owned);
             df.rsel[i] = dalloc<int32_t>((size_t) kIdxGroupTopk * kIdxRatio, owned);
             df.rsel_n[i] = dalloc<int32_t>(1, owned);
         }
@@ -1294,8 +1322,11 @@ bool Engine::step_window(const int32_t* tokens, int n, int64_t pos, int32_t* pic
     m.ev_phase.clear();
     m.mark(Impl::kPhHead);
     cudaMemcpyAsync(m.small, m.h_small, 5 * kMaxP * 4, cudaMemcpyHostToDevice, m.s);
-    embed_bf16(m.embed, m.small, kEmbd, T, m.xn, m.s);
-    hc_expand(m.xn, m.streams, T, m.s);
+    for (int c = 0; c < T; c += kPassRows) {
+        const int rows_c = std::min(kPassRows, T - c);
+        embed_bf16(m.embed, m.small + c, kEmbd, rows_c, m.xn, m.s);
+        hc_expand(m.xn, m.streams + (size_t) c * kHcFlat, rows_c, m.s);
+    }
     m.dump("001_hc_expand");
     std::string prev = "001_hc_expand";
     int mod = 2;
@@ -1306,6 +1337,39 @@ bool Engine::step_window(const int32_t* tokens, int n, int64_t pos, int32_t* pic
             const auto h0 = std::chrono::steady_clock::now();
             if (!rows[(size_t) e].get()) { err = eg_err[(size_t) e]; return false; }
             m.host_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - h0).count();
+        }
+        if (wide) {   // passes of kPassRows rows, the routed experts on all rows at once
+            auto passes = [&](auto&& f) {
+                for (int c = 0; c < T; c += kPassRows) {
+                    m.row0 = c;
+                    m.T = std::min(kPassRows, T - c);
+                    f();
+                }
+                m.row0 = 0;
+                m.T = T;
+            };
+            if (e >= 0) {
+                m.feed(prev, pos);
+                passes([&] { m.engram(e); });
+                std::snprintf(nm, sizeof nm, "%03d_model.layers.%d.engram_layer", mod++, l);
+                m.dump(nm);
+                prev = nm;
+            }
+            m.feed(prev, pos);
+            passes([&] {
+                m.attention(l);
+                m.ffn_pre(l);
+            });
+            if (!m.L[l].dense) {
+                if (!cuda_ok(cudaStreamSynchronize(m.s), "the router", err)) return false;
+                m.expert_groups_host(l, T);
+                m.ffn_experts();
+                passes([&] { m.ffn_rest(l, true); });
+            }
+            std::snprintf(nm, sizeof nm, "%03d_model.layers.%d", mod++, l);
+            m.dump(nm);
+            prev = nm;
+            continue;
         }
         if (!cap && e >= 0) {   // the dumps and the feed sit between the Engram module and the block
             m.feed(prev, pos);
@@ -1331,12 +1395,13 @@ bool Engine::step_window(const int32_t* tokens, int n, int64_t pos, int32_t* pic
         m.dump(nm);
         prev = nm;
     }
-    const int h0 = wide ? T - 1 : 0, hn = T - h0;   // the head's rows
+    const int h0 = wide ? T - 1 : 0, hn = T - h0;   // the head's rows, at row 0 of its buffers
     m.T = hn;
+    m.head_row0 = h0;
     if (!m.segment(wide ? none : m.g_head[(size_t) T - 1], cap, [&] {
-            hc_mix(m.streams + (size_t) h0 * kHcFlat, m.head_hc, hn, m.hc_pre, nullptr, m.y + (size_t) h0 * kEmbd, m.s);
-            rms_norm_rows(m.y + (size_t) h0 * kEmbd, m.final_norm, kEmbd, hn, kEmbd, kRmsEps, m.xn + (size_t) h0 * kEmbd, m.s);
-            m.quant(m.xn + (size_t) h0 * kEmbd, kEmbd, m.xq);
+            hc_mix(m.streams + (size_t) h0 * kHcFlat, m.head_hc, hn, m.hc_pre, nullptr, m.y, m.s);
+            rms_norm_rows(m.y, m.final_norm, kEmbd, hn, kEmbd, kRmsEps, m.xn, m.s);
+            m.quant(m.xn, kEmbd, m.xq);
             m.mm(m.head, m.xq, m.logits);
             cudaMemcpyAsync(m.h_logits, m.logits, (size_t) hn * kVocab * 4, cudaMemcpyDeviceToHost, m.s);
         }, err))
@@ -1355,7 +1420,7 @@ bool Engine::step_window(const int32_t* tokens, int n, int64_t pos, int32_t* pic
         }
         m.ph_steps += T;
     }
-    if (logits != nullptr) std::memcpy(logits + (size_t) h0 * kVocab, m.h_logits, (size_t) hn * kVocab * 4);
+    if (logits != nullptr) std::memcpy(logits, m.h_logits, (size_t) hn * kVocab * 4);
     for (int t = 0; t < T; ++t) {
         const float* lg = m.h_logits + (size_t) (t - h0) * kVocab;
         picks[t] = t < h0 ? -1 : (int32_t) (std::max_element(lg, lg + kVocab) - lg);
@@ -1368,16 +1433,18 @@ int Engine::draft(int32_t anchor, int64_t pos, int32_t* out, float* conf, std::s
     if (!m.df.on || pos + kDflyBlock > m.o.max_context) return 0;
     // the last accepted token is the row before `pos` of the last window (its later rows are rejected drafts)
     const int64_t last_row = pos - 1 - ((int64_t) m.history.size() - m.T);
-    if (last_row < 0 || last_row >= m.T) {
+    if (last_row < m.head_row0 || last_row >= m.T) {
         err = "a draft follows a window, from the position after one of its rows";
         return -1;
     }
     // the last accepted row's final hidden (the head's normed rows) and its picks in each target layer
-    cudaMemcpyAsync(m.df.cat + kEmbd, m.xn + (size_t) last_row * kEmbd, kEmbd * 4, cudaMemcpyDeviceToDevice, m.s);
+    cudaMemcpyAsync(m.df.cat + kEmbd, m.xn + (size_t) (last_row - m.head_row0) * kEmbd, kEmbd * 4,
+                    cudaMemcpyDeviceToDevice, m.s);
+    const int64_t sel_row = last_row - m.sel_row0;
     for (int i = 0; i < kDflyLayers; ++i) {
-        cudaMemcpyAsync(m.df.rsel[i], m.df.tsel[i] + (size_t) last_row * kIdxGroupTopk * kIdxRatio,
+        cudaMemcpyAsync(m.df.rsel[i], m.df.tsel[i] + (size_t) sel_row * kIdxGroupTopk * kIdxRatio,
                         (size_t) kIdxGroupTopk * kIdxRatio * 4, cudaMemcpyDeviceToDevice, m.s);
-        cudaMemcpyAsync(m.df.rsel_n[i], m.df.tsel_n[i] + last_row, 4, cudaMemcpyDeviceToDevice, m.s);
+        cudaMemcpyAsync(m.df.rsel_n[i], m.df.tsel_n[i] + sel_row, 4, cudaMemcpyDeviceToDevice, m.s);
     }
     int32_t* h = m.df.h_dsmall;
     for (int j = 0; j < kDflyBlock; ++j) {

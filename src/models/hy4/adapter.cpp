@@ -210,7 +210,7 @@ private:
         max_new = std::min<int64_t>(max_new, o_.max_context - n);
         const bool greedy = s.temperature <= 0;
         std::mt19937_64 rng(s.seeded ? s.seed : std::random_device{}());
-        if (!greedy) logits_.resize((size_t) kMaxP * kVocab);
+        if (!greedy) logits_.resize((size_t) kMaxT * kVocab);
         std::string err;
         int32_t picks[kMaxP];
 
@@ -234,7 +234,8 @@ private:
             basalt::protocol::emit("PP %lld %lld %.1f %.1f\n", (long long) pos, (long long) n, ms,
                                    ms > 0 ? 1000.0 * (double) (pos - reuse) / ms : 0.0);
             if (last)
-                next = greedy ? picks[rows - 1] : sample_row(logits_.data() + (size_t) (rows - 1) * kVocab, s, rng).pick;
+                next = greedy ? picks[rows - 1]
+                              : sample_row(logits_.data() + (size_t) (rows > kMaxT ? 0 : rows - 1) * kVocab, s, rng).pick;
             if (in_.stopped()) { stopped = true; break; }
         }
         const double prompt_ms = ms_since(t0);

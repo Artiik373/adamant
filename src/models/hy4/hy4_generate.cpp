@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
     namespace hy4 = basalt::models::hy4;
     std::string model, tokens, trunk = "q8_0";
     hy4::EngineOptions o;
-    int max_new = 16, suffix_draft = 3, prompt_rows = hy4::kMaxT;
+    int max_new = 16, suffix_draft = 3, prompt_rows = hy4::kMaxP;
     float dfly_min = 0.4f;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];

@@ -30,7 +30,8 @@ constexpr int kWindow = 512;                 ///< sliding layers attend position
 constexpr float kRopeThetaSliding = 10000.0f;
 constexpr float kRopeThetaSparse = 10000000.0f;
 constexpr int kMaxT = 8;                     ///< rows of a decode window
-constexpr int kMaxP = 128;                   ///< rows of a prompt window
+constexpr int kMaxP = 2048;                  ///< rows of a prompt window: the routed experts run on all of them at once
+constexpr int kPassRows = 128;               ///< rows of a prompt window the trunk runs at a time
 
 // compressed indexer of the sparse layers
 constexpr int kIdxHeads = 16;
