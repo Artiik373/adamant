@@ -4,6 +4,7 @@ Runs on a single GPU (e.g. RTX 3090) for Qwen3-1.7B:
 - Batched GPU Hessian collection (~2-9s)
 - Default: compiled CUDA 14-bit 1MAD Viterbi kernel (`ms_viterbi_cuda.cu`)
 - `--fast-greedy`: 1-step greedy trellis + LDLQ (~15-140s pure PyTorch)
+- `--gguf FILE`: measure a GGUF's linear layers instead (same tokens, same BF16 reference)
 
 Usage:
   python tools/convert/smoke_kld_qwen3.py \
@@ -15,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import sys
 import time
 from pathlib import Path
@@ -27,7 +29,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import ms_moe_converter as ms  # noqa: E402
-from eval_ms_kld import compute_kld_metrics  # noqa: E402
+from eval_ms_kld import compute_kld_metrics, split_calib  # noqa: E402
 
 
 def largest_pow2_divisor(n: int, cap: int = 512) -> int:
@@ -84,6 +86,35 @@ def greedy_trellis_code_matrix(
     return w_quant
 
 
+GGUF_NAMES = {
+    "attn_q": "self_attn.q_proj", "attn_k": "self_attn.k_proj", "attn_v": "self_attn.v_proj",
+    "attn_output": "self_attn.o_proj", "ffn_gate": "mlp.gate_proj", "ffn_up": "mlp.up_proj", "ffn_down": "mlp.down_proj",
+}
+
+
+def load_gguf_linears(model: nn.Module, path: Path) -> str:
+    """Replace each decoder-layer linear weight with its dequantized GGUF tensor; returns the type mix and bpw."""
+    import gguf
+    from gguf.quants import dequantize
+
+    mods = dict(model.named_modules())
+    bits = n = 0
+    types: dict[str, int] = {}
+    for t in gguf.GGUFReader(path).tensors:
+        parts = t.name.split(".")
+        if parts[0] != "blk" or parts[2] not in GGUF_NAMES:
+            continue
+        mod = mods[f"model.layers.{parts[1]}.{GGUF_NAMES[parts[2]]}"]
+        w = torch.from_numpy(dequantize(t.data, t.tensor_type).copy())
+        assert w.shape == mod.weight.shape, t.name
+        mod.weight.data.copy_(w.to(mod.weight.dtype))
+        types[t.tensor_type.name] = types.get(t.tensor_type.name, 0) + 1
+        bits += t.n_bytes * 8
+        n += w.numel()
+    assert sum(types.values()) == len(GGUF_NAMES) * model.config.num_hidden_layers, types
+    return f"{types}, {bits / n:.3f} bpw"
+
+
 @torch.no_grad()
 def collect_logits(model: nn.Module, eval_ids: torch.Tensor, device: torch.device, batch_size: int = 4) -> torch.Tensor:
     outs = []
@@ -105,6 +136,13 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size for Hessian collection")
     parser.add_argument("--fast-greedy", action="store_true", help="Use 1-step greedy trellis instead of CUDA Viterbi")
     parser.add_argument("--quant-lm-head", action="store_true", help="Also quantize lm_head to MS_C6")
+    parser.add_argument("--gguf", type=Path, help="Measure this GGUF's decoder linears instead of quantizing")
+    parser.add_argument(
+        "--calib-mode", choices=["fp", "guided"], default="fp",
+        help="fp: Hessians from the BF16 model; "
+        "guided: GuidedQuant, x x^T weighted by the squared loss gradient of each output-row group",
+    )
+    parser.add_argument("--guided-groups", type=int, default=4, help="output-row groups per layer for --calib-mode guided")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -120,8 +158,7 @@ def main() -> None:
     calib_all = torch.load(args.calib, map_location="cpu", weights_only=True)
     vocab_size = model.config.vocab_size
     calib_all = calib_all.clamp(0, vocab_size - 1)
-    calib_ids = calib_all[: args.calib_seqs]
-    eval_ids = calib_all[-args.eval_seqs :]
+    calib_ids, eval_ids = split_calib(calib_all, args.calib_seqs, args.eval_seqs)
 
     viterbi_cuda_fn = None
     if not args.fast_greedy and device.type == "cuda":
@@ -132,6 +169,54 @@ def main() -> None:
     t0 = time.time()
     print(f"Evaluating BF16 reference logits on {args.eval_seqs} held-out sequences...", flush=True)
     ref_logits = collect_logits(model, eval_ids, device, batch_size=args.batch_size)
+
+    if args.gguf:
+        print(f"Loading decoder linears from {args.gguf}: {load_gguf_linears(model, args.gguf)}", flush=True)
+        report(f"GGUF {args.gguf.name}", ref_logits, collect_logits(model, eval_ids, device, args.batch_size), t0)
+        return
+
+    target_linears = [
+        (name, mod)
+        for name, mod in model.named_modules()
+        if isinstance(mod, nn.Linear) and (args.quant_lm_head or name != "lm_head")
+    ]
+    lut = ms.build_1mad_lut(device)
+    mode_str = "fast-greedy" if args.fast_greedy else ("viterbi-cuda" if viterbi_cuda_fn else "viterbi-py")
+
+    def quantize_linear(idx: int, name: str, mod: nn.Linear, w_target: torch.Tensor, h_f32: torch.Tensor) -> None:
+        k_use = 6 if name == "lm_head" else args.k
+        w_f32 = mod.weight.detach().to(device=device, dtype=torch.float32)
+        blk = largest_pow2_divisor(int(w_f32.shape[1]), cap=512)
+        seed = (idx + 1) * 10007
+
+        # h_f32 [in, in], or [groups, in, in] with one Hessian per contiguous block of output rows
+        hs = h_f32 if h_f32.dim() == 3 else h_f32.unsqueeze(0)
+        n_g = hs.shape[0]
+        w_g = w_target.reshape(n_g, -1, w_target.shape[1])
+        rot = [ms.rotate_weight_and_hessian(w_g[j], hs[j], block_size=blk, seed=seed) for j in range(n_g)]
+        signs = rot[0][2]  # same seed: every group shares one rotation
+        hu = torch.stack([ms.cholesky_inv_upper(r[1]) for r in rot])
+        w_rot = torch.stack([r[0] for r in rot])
+        if viterbi_cuda_fn is not None and not args.fast_greedy:
+            from ms_viterbi_cuda import viterbi_code_batched_cuda
+
+            w_rot_q = viterbi_code_batched_cuda(w_rot, hu, k_use, lut)[2]
+        elif args.fast_greedy:
+            w_rot_q = torch.stack([greedy_trellis_code_matrix(w_rot[j], hu[j], k=k_use, lut=lut) for j in range(n_g)])
+        else:
+            w_rot_q = torch.stack([ms.viterbi_code_matrix(w_rot[j], hu[j], k=k_use, lut=lut)[2] for j in range(n_g)])
+        w_q = ms.fwht_blocks(w_rot_q.reshape(w_target.shape), block_size=blk) * signs.unsqueeze(0)
+        mod.weight.data.copy_(w_q.to(dtype=mod.weight.dtype))
+
+        if (idx + 1) == 1 or (idx + 1) % 28 == 0 or (idx + 1) == len(target_linears):
+            rel_err = ((w_q - w_f32).norm() / w_f32.norm().clamp(min=1e-8)).item()
+            print(f"  [{idx + 1}/{len(target_linears)}] {name} rel_err={rel_err:.4f} ({time.time() - t0:.1f}s)", flush=True)
+
+    if args.calib_mode == "guided":
+        quantize_guided(model, target_linears, quantize_linear, calib_ids, device, args)
+        report(f"MS_C{args.k} ({mode_str}, guided G={args.guided_groups})", ref_logits,
+               collect_logits(model, eval_ids, device, args.batch_size), t0)
+        return
 
     hessians: dict[str, torch.Tensor] = {}
     counts: dict[str, int] = {}
@@ -149,11 +234,6 @@ def main() -> None:
                 counts[name] += x.shape[0]
         return hook
 
-    target_linears = [
-        (name, mod)
-        for name, mod in model.named_modules()
-        if isinstance(mod, nn.Linear) and (args.quant_lm_head or name != "lm_head")
-    ]
     for name, mod in target_linears:
         hooks.append(mod.register_forward_hook(make_hook(name)))
 
@@ -166,38 +246,73 @@ def main() -> None:
     torch.cuda.synchronize()
     print(f"Hessians collected in {time.time() - t0:.1f}s.", flush=True)
 
-    lut = ms.build_1mad_lut(device)
-    mode_str = "fast-greedy" if args.fast_greedy else ("viterbi-cuda" if viterbi_cuda_fn else "viterbi-py")
     print(f"Quantizing {len(target_linears)} linear layers to MS_C{args.k} ({mode_str})...", flush=True)
     for idx, (name, mod) in enumerate(target_linears):
-        k_use = 6 if name == "lm_head" else args.k
         w_f32 = mod.weight.detach().to(device=device, dtype=torch.float32)
-        h_f32 = hessians.pop(name) / max(counts[name], 1)
-        blk = largest_pow2_divisor(int(w_f32.shape[1]), cap=512)
-        seed = (idx + 1) * 10007
-
-        w_rot, h_rot, signs = ms.rotate_weight_and_hessian(w_f32, h_f32, block_size=blk, seed=seed)
-        hu = ms.cholesky_inv_upper(h_rot)
-
-        if args.fast_greedy:
-            w_rot_q = greedy_trellis_code_matrix(w_rot, hu, k=k_use, lut=lut)
-        elif viterbi_cuda_fn is not None:
-            _scales, _states, w_rot_q = viterbi_cuda_fn(w_rot, hu, k=k_use, lut=lut)
-        else:
-            _scales, _states, w_rot_q = ms.viterbi_code_matrix(w_rot, hu, k=k_use, lut=lut)
-
-        w_q = ms.fwht_blocks(w_rot_q, block_size=blk) * signs.unsqueeze(0)
-        mod.weight.data.copy_(w_q.to(dtype=mod.weight.dtype))
-
-        if (idx + 1) == 1 or (idx + 1) % 28 == 0 or (idx + 1) == len(target_linears):
-            rel_err = ((w_q - w_f32).norm() / w_f32.norm().clamp(min=1e-8)).item()
-            print(f"  [{idx + 1}/{len(target_linears)}] {name} rel_err={rel_err:.4f} ({time.time() - t0:.1f}s)", flush=True)
+        quantize_linear(idx, name, mod, w_f32, hessians.pop(name) / max(counts[name], 1))
 
     print("Evaluating quantized MS logits...", flush=True)
-    cand_logits = collect_logits(model, eval_ids, device, batch_size=args.batch_size)
+    report(f"MS_C{args.k} ({mode_str})", ref_logits, collect_logits(model, eval_ids, device, args.batch_size), t0)
+
+
+def quantize_guided(model, target_linears, quantize_linear, calib_ids, device, args, chunk_layers: int = 7) -> None:
+    """GuidedQuant: per output-row group j, H_j = sum_t (sum_{i in j} g_ti^2) x_t x_t^T, where g is the gradient of
+    the next-token loss of the BF16 model with respect to the layer output. Collected a few layers at a time."""
+    grad_model = copy.deepcopy(model)
+    grad_model.requires_grad_(False)
+    gmods = dict(grad_model.named_modules())
+    n_groups = args.guided_groups
+    emb_hook = grad_model.get_input_embeddings().register_forward_hook(lambda _m, _i, out: out.requires_grad_(True))
+
+    def layer_of(name: str) -> int:
+        return int(name.split(".")[2]) if name.startswith("model.layers.") else model.config.num_hidden_layers
+
+    for c in range(0, model.config.num_hidden_layers + 1, chunk_layers):
+        chunk = [(i, n, m) for i, (n, m) in enumerate(target_linears) if c <= layer_of(n) < c + chunk_layers]
+        if not chunk:
+            continue
+        hess: dict[str, torch.Tensor] = {}
+        hooks = []
+        for _, name, mod in chunk:
+            def fwd(_m, inp, out, name=name):
+                x = inp[0].detach().reshape(-1, inp[0].shape[-1]).float()
+
+                def bwd(g):
+                    gw = g.reshape(x.shape[0], n_groups, -1).float().pow(2).sum(-1)  # [tokens, groups]
+                    xg = x.unsqueeze(0) * gw.T.sqrt().unsqueeze(-1)  # [groups, tokens, in]
+                    h = torch.bmm(xg.transpose(1, 2), xg)
+                    if name in hess:
+                        hess[name] += h
+                    else:
+                        hess[name] = h
+
+                out.register_hook(bwd)
+
+            hooks.append(gmods[name].register_forward_hook(fwd))
+        t0 = time.time()
+        tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = True  # Hessian sums only: TF32 inputs, FP32 accumulation
+        with torch.enable_grad():
+            for i in range(0, calib_ids.shape[0], args.batch_size):
+                inp = calib_ids[i : i + args.batch_size].to(device=device, dtype=torch.long)
+                grad_model(input_ids=inp, labels=inp).loss.backward()
+        torch.backends.cuda.matmul.allow_tf32 = tf32
+        for hk in hooks:
+            hk.remove()
+        torch.cuda.synchronize()
+        t1 = time.time()
+        for idx, name, mod in chunk:
+            quantize_linear(idx, name, mod, mod.weight.detach().float(), hess.pop(name))
+        torch.cuda.synchronize()
+        print(f"  layers {c}-{c + chunk_layers - 1}: gradients+Hessians {t1 - t0:.0f}s, quantize {time.time() - t1:.0f}s", flush=True)
+    emb_hook.remove()
+    del grad_model
+
+
+def report(label: str, ref_logits: torch.Tensor, cand_logits: torch.Tensor, t0: float) -> None:
     metrics = compute_kld_metrics(ref_logits, cand_logits)
     print(
-        f"\n=== Qwen3 MS_C{args.k} ({mode_str}) Smoke Result ===\n"
+        f"\n=== Qwen3 {label} Smoke Result ===\n"
         f"Tokens:         {metrics['tokens']}\n"
         f"Mean KLD:       {metrics['mean_kld']:.5f}\n"
         f"Max KLD:        {metrics['max_kld']:.5f}\n"

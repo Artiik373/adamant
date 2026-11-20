@@ -40,6 +40,24 @@ Hadamard of size `largest_pow2_divisor(n_in)`, at most 512. `n_in` must be a mul
   runs the fp16 GEMM.
 - **Not yet:** routed experts in `.basalt` (the grouped GEMV `launch_ms_1mad_gemv_grouped` exists), CPU tiers.
 
+## Converter Search
+
+Rows are coded after a random block Hadamard rotation with `d = gain_k * std(row) / 147.8` (`gain` 1.0 / 1.15 / 1.2 for
+`k` = 1 / 2 / >= 3). The Viterbi search runs over windows of 32 columns, commits the first 8, feeds their LDLQ error
+forward (damping 1% of the mean Hessian diagonal) and slides on by 8. Branch costs are weighted by `1 / Hu[c, c]^2`.
+
+Qwen3-1.7B, decoder linears only, against BF16 (`smoke_kld_qwen3.py`, 64 calibration and 32 eval sequences of 512 tokens
+spread over all four calibration pools, RTX 3090 at 350 W):
+
+| Coding | bpw | KLD mean | top-1 |
+| :--- | :--- | :--- | :--- |
+| MS_C3 | 3.025 | 0.0336 | 89.37% |
+| MS_C3, GuidedQuant Hessians (`--calib-mode guided`) | 3.025 | 0.0295 | 90.09% |
+| MS_C4 | 4.025 | 0.0091 | 93.90% |
+| Q4_K_M (unsloth / bartowski GGUF, `--gguf`) | 4.80 | 0.0201 / 0.0185 | 91.78% / 91.82% |
+
+Windows of 24 committing 16 measured MS_C3 KLD 0.0423 against 0.0378 for 32 / 8 on one math-only eval split.
+
 ## Building a Pack
 
 `ms_convert_dense_spine.py` codes one tensor into a record (`<name>.json` + payload) with the GDN value heads already in

@@ -17,6 +17,18 @@ import torch
 import torch.nn.functional as F
 
 
+def split_calib(pool: torch.Tensor, n_calib: int, n_eval: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Disjoint calibration and eval sequences, each spread evenly over the whole pool (so over every text source)."""
+    n = pool.shape[0]
+    assert n_calib + n_eval <= n, (n_calib, n_eval, n)
+    eval_idx = torch.linspace(0, n - 1, n_eval + 2)[1:-1].round().long() if n_eval else torch.empty(0, dtype=torch.long)
+    rest = torch.ones(n, dtype=torch.bool)
+    rest[eval_idx] = False
+    rest_idx = rest.nonzero().squeeze(1)
+    calib_idx = rest_idx[torch.linspace(0, rest_idx.numel() - 1, n_calib).round().long()] if n_calib else rest_idx[:0]
+    return pool[calib_idx], pool[eval_idx]
+
+
 def compute_kld_metrics(ref_logits: torch.Tensor, cand_logits: torch.Tensor, chunk_tokens: int = 256) -> dict:
     """Compute exact full-vocab KLD, max KLD, and top-1 match rate in fp32 chunks."""
     ref_flat = ref_logits.reshape(-1, ref_logits.shape[-1])
