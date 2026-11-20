@@ -46,8 +46,9 @@ static void pack_row_ref(uint8_t* dst, float scale, const std::vector<uint32_t>&
     }
 }
 
+// n_experts > 1 runs the grouped launch with a separate weight matrix and input per expert.
 template <int K>
-static bool test_cuda_gemv(int out_f, int in_f, uint32_t seed) {
+static bool test_cuda_gemv(int out_f, int in_f, uint32_t seed, int n_experts = 1) {
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> dist_x(-1.0f, 1.0f);
     std::uniform_real_distribution<float> dist_d(0.001f, 0.02f);
@@ -55,12 +56,13 @@ static bool test_cuda_gemv(int out_f, int in_f, uint32_t seed) {
     std::uniform_int_distribution<uint32_t> dist_sym(0, (1u << K) - 1u);
 
     const size_t stride = adamant::kernels::ms::ms_row_bytes(in_f, K);
-    std::vector<uint8_t> h_w(static_cast<size_t>(out_f) * stride, 0);
-    std::vector<float> h_x(in_f);
-    for (int c = 0; c < in_f; ++c) h_x[c] = dist_x(rng);
+    const size_t w_bytes = static_cast<size_t>(out_f) * stride;
+    std::vector<uint8_t> h_w(w_bytes * n_experts, 0);
+    std::vector<float> h_x(static_cast<size_t>(in_f) * n_experts);
+    for (float& v : h_x) v = dist_x(rng);
 
     std::vector<uint32_t> row_states(in_f);
-    for (int r = 0; r < out_f; ++r) {
+    for (int r = 0; r < out_f * n_experts; ++r) {
         uint32_t s = dist_s0(rng);
         row_states[0] = s;
         for (int c = 1; c < in_f; ++c) {
@@ -70,36 +72,50 @@ static bool test_cuda_gemv(int out_f, int in_f, uint32_t seed) {
         pack_row_ref(h_w.data() + static_cast<size_t>(r) * stride, dist_d(rng), row_states, K);
     }
 
-    std::vector<float> cpu_out(out_f, 0.0f);
-    adamant::kernels::ms::ms_1mad_gemv<K>(h_w.data(), h_x.data(), cpu_out.data(), out_f, in_f);
+    std::vector<float> cpu_out(static_cast<size_t>(out_f) * n_experts, 0.0f);
+    for (int e = 0; e < n_experts; ++e) {
+        adamant::kernels::ms::ms_1mad_gemv<K>(h_w.data() + e * w_bytes, h_x.data() + static_cast<size_t>(e) * in_f,
+                                              cpu_out.data() + static_cast<size_t>(e) * out_f, out_f, in_f);
+    }
 
     uint8_t* d_w = nullptr;
     float* d_x = nullptr;
     float* d_out = nullptr;
     cudaMalloc(&d_w, h_w.size());
     cudaMalloc(&d_x, h_x.size() * sizeof(float));
-    cudaMalloc(&d_out, out_f * sizeof(float));
+    cudaMalloc(&d_out, cpu_out.size() * sizeof(float));
     cudaMemcpy(d_w, h_w.data(), h_w.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(d_x, h_x.data(), h_x.size() * sizeof(float), cudaMemcpyHostToDevice);
 
-    if (adamant::kernels::ms_cuda::launch_ms_1mad_gemv<K>(d_w, d_x, d_out, out_f, in_f) != cudaSuccess ||
-        cudaDeviceSynchronize() != cudaSuccess) {
-        std::printf("[CUDA MS_C%d %dx%d] launch failed\n", K, out_f, in_f);
+    std::vector<const uint8_t*> w_ptrs(n_experts);
+    std::vector<const float*> x_ptrs(n_experts);
+    std::vector<float*> out_ptrs(n_experts);
+    for (int e = 0; e < n_experts; ++e) {
+        w_ptrs[e] = d_w + e * w_bytes;
+        x_ptrs[e] = d_x + static_cast<size_t>(e) * in_f;
+        out_ptrs[e] = d_out + static_cast<size_t>(e) * out_f;
+    }
+    const cudaError_t err = n_experts == 1
+        ? adamant::kernels::ms_cuda::launch_ms_1mad_gemv<K>(d_w, d_x, d_out, out_f, in_f)
+        : adamant::kernels::ms_cuda::launch_ms_1mad_gemv_grouped<K>(
+              w_ptrs.data(), x_ptrs.data(), out_ptrs.data(), n_experts, out_f, in_f);
+    if (err != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+        std::printf("[CUDA MS_C%d %dx%d x%d] launch failed\n", K, out_f, in_f, n_experts);
         return false;
     }
 
-    std::vector<float> gpu_out(out_f, 0.0f);
-    cudaMemcpy(gpu_out.data(), d_out, out_f * sizeof(float), cudaMemcpyDeviceToHost);
+    std::vector<float> gpu_out(cpu_out.size(), 0.0f);
+    cudaMemcpy(gpu_out.data(), d_out, gpu_out.size() * sizeof(float), cudaMemcpyDeviceToHost);
 
     cudaFree(d_w);
     cudaFree(d_x);
     cudaFree(d_out);
 
     float max_err = 0.0f;
-    for (int r = 0; r < out_f; ++r) {
-        max_err = std::max(max_err, std::fabs(gpu_out[r] - cpu_out[r]));
+    for (size_t i = 0; i < gpu_out.size(); ++i) {
+        max_err = std::max(max_err, std::fabs(gpu_out[i] - cpu_out[i]));
     }
-    std::printf("[CUDA MS_C%d %dx%d] max_abs_err vs CPU = %.6g\n", K, out_f, in_f, max_err);
+    std::printf("[CUDA MS_C%d %dx%d x%d] max_abs_err vs CPU = %.6g\n", K, out_f, in_f, n_experts, max_err);
     return max_err < 1e-3f;
 }
 
@@ -114,6 +130,10 @@ int main() {
     // More rows than resident warps: exercises the grid-stride prefetch loop.
     ok &= test_cuda_gemv<6>(8192, 2560, 207);
     ok &= test_cuda_gemv<4>(8192, 640, 208);
+    // Grouped expert launch; 40 experts also covers the split into several launches.
+    ok &= test_cuda_gemv<4>(640, 2560, 209, 8);
+    ok &= test_cuda_gemv<4>(2560, 640, 210, 8);
+    ok &= test_cuda_gemv<3>(640, 2560, 211, 40);
     if (!ok) {
         std::fprintf(stderr, "CUDA TESTS FAILED\n");
         return 1;

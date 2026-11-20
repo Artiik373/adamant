@@ -37,14 +37,20 @@ __device__ __forceinline__ float decode_1mad_dp4a(uint32_t state) {
 constexpr int kMaxRowWords = 512;
 constexpr int kWordsPerLane = kMaxRowWords / 32;
 
+// One launch covers up to kMaxGroup matrices of the same shape and K (blockIdx.y picks one),
+// e.g. the active experts of one MoE projection. Passed by value as a kernel parameter.
+constexpr int kMaxGroup = 32;
+struct MsGemvGroup {
+    const uint8_t* weights[kMaxGroup];
+    const float* x_rot[kMaxGroup];
+    float* out[kMaxGroup];
+};
+
 template <int K, int WARPS_PER_BLOCK>
-__global__ void ms_1mad_gemv_fast_kernel(
-    const uint8_t* __restrict__ weights,
-    const float* __restrict__ x_rot,
-    float* __restrict__ out,
-    int out_features,
-    int in_features
-) {
+__global__ void ms_1mad_gemv_fast_kernel(const MsGemvGroup group, int out_features, int in_features) {
+    const uint8_t* __restrict__ weights = group.weights[blockIdx.y];
+    const float* __restrict__ x_rot = group.x_rot[blockIdx.y];
+    float* __restrict__ out = group.out[blockIdx.y];
     __shared__ uint32_t smem_rows[WARPS_PER_BLOCK][kMaxRowWords + 1];  // +1: window read past the last word
     static_assert(K >= 1 && 3 * K + 14 <= 32, "4 states must fit one 32-bit window");
     extern __shared__ float4 s_x4[];
@@ -54,7 +60,7 @@ __global__ void ms_1mad_gemv_fast_kernel(
     __syncthreads();
 
     const int lane = threadIdx.x & 31;
-    const int warp_stride = gridDim.x * WARPS_PER_BLOCK;
+    const int warp_stride = gridDim.x * WARPS_PER_BLOCK;  // rows of this matrix per pass
     int row = blockIdx.x * WARPS_PER_BLOCK + (threadIdx.x >> 5);
     if (row >= out_features) return;
 
@@ -134,6 +140,46 @@ __global__ void fwht_rotate_input_kernel(
     y[base + tid] = smem[tid] * rsqrtf(static_cast<float>(BLOCK_SIZE));
 }
 
+// Runs n same-shape GEMVs: out[e] = W[e] * x_rot[e]. Pointer arrays are host memory.
+template <int K>
+inline cudaError_t launch_ms_1mad_gemv_grouped(
+    const uint8_t* const* weights,
+    const float* const* x_rot,
+    float* const* out,
+    int n,
+    int out_features,
+    int in_features,
+    cudaStream_t stream = nullptr
+) {
+    constexpr int kWarpsPerBlock = 8;
+    constexpr int kThreads = kWarpsPerBlock * 32;
+    const size_t row_bytes = ms_row_bytes(in_features, K);
+    if ((row_bytes & 3u) != 0u || row_bytes > kMaxRowWords * 4u || (in_features & 3) != 0 || n < 0) {
+        return cudaErrorInvalidValue;
+    }
+    int dev = 0, sms = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    const int needed = (out_features + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    for (int base = 0; base < n; base += kMaxGroup) {
+        const int count = (n - base < kMaxGroup) ? n - base : kMaxGroup;
+        MsGemvGroup group{};
+        for (int e = 0; e < count; ++e) {
+            group.weights[e] = weights[base + e];
+            group.x_rot[e] = x_rot[base + e];
+            group.out[e] = out[base + e];
+        }
+        int per_matrix = (sms * 4 + count - 1) / count;
+        if (per_matrix > needed) per_matrix = needed;
+        ms_1mad_gemv_fast_kernel<K, kWarpsPerBlock>
+            <<<dim3(per_matrix, count), kThreads, in_features * sizeof(float), stream>>>(
+                group, out_features, in_features);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) return err;
+    }
+    return cudaSuccess;
+}
+
 template <int K>
 inline cudaError_t launch_ms_1mad_gemv(
     const uint8_t* weights,
@@ -143,22 +189,7 @@ inline cudaError_t launch_ms_1mad_gemv(
     int in_features,
     cudaStream_t stream = nullptr
 ) {
-    constexpr int kWarpsPerBlock = 8;
-    constexpr int kThreads = kWarpsPerBlock * 32;
-    const size_t row_bytes = ms_row_bytes(in_features, K);
-    if ((row_bytes & 3u) != 0u || row_bytes > kMaxRowWords * 4u || (in_features & 3) != 0) {
-        return cudaErrorInvalidValue;
-    }
-    int dev = 0, sms = 0;
-    cudaGetDevice(&dev);
-    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-    const int max_blocks = sms * 4;
-    const int needed = (out_features + kWarpsPerBlock - 1) / kWarpsPerBlock;
-    const int blocks = needed < max_blocks ? needed : max_blocks;
-    ms_1mad_gemv_fast_kernel<K, kWarpsPerBlock><<<blocks, kThreads, in_features * sizeof(float), stream>>>(
-        weights, x_rot, out, out_features, in_features
-    );
-    return cudaGetLastError();
+    return launch_ms_1mad_gemv_grouped<K>(&weights, &x_rot, &out, 1, out_features, in_features, stream);
 }
 
 } // namespace adamant::kernels::ms_cuda

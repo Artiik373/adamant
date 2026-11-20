@@ -11,19 +11,32 @@
 using namespace adamant::kernels::ms_cuda;
 
 template <int K>
-static void bench_shape(const char* label, int out_f, int in_f, int iters) {
-    size_t w_bytes = static_cast<size_t>(out_f) * ms_row_bytes(in_f, K);
+static void bench_shape(const char* label, int out_f, int in_f, int iters, int n = 1) {
+    const size_t one_w = static_cast<size_t>(out_f) * ms_row_bytes(in_f, K);
+    const size_t w_bytes = one_w * n;
     uint8_t* d_w = nullptr;
     float* d_x = nullptr;
     float* d_out = nullptr;
     cudaMalloc(&d_w, w_bytes);
-    cudaMalloc(&d_x, in_f * sizeof(float));
-    cudaMalloc(&d_out, out_f * sizeof(float));
+    cudaMalloc(&d_x, static_cast<size_t>(in_f) * n * sizeof(float));
+    cudaMalloc(&d_out, static_cast<size_t>(out_f) * n * sizeof(float));
     cudaMemset(d_w, 0x5A, w_bytes);
-    cudaMemset(d_x, 0, in_f * sizeof(float));
+    cudaMemset(d_x, 0, static_cast<size_t>(in_f) * n * sizeof(float));
+
+    std::vector<const uint8_t*> w_ptrs(n);
+    std::vector<const float*> x_ptrs(n);
+    std::vector<float*> out_ptrs(n);
+    for (int e = 0; e < n; ++e) {
+        w_ptrs[e] = d_w + e * one_w;
+        x_ptrs[e] = d_x + static_cast<size_t>(e) * in_f;
+        out_ptrs[e] = d_out + static_cast<size_t>(e) * out_f;
+    }
+    auto launch = [&] {
+        launch_ms_1mad_gemv_grouped<K>(w_ptrs.data(), x_ptrs.data(), out_ptrs.data(), n, out_f, in_f);
+    };
 
     // Warmup
-    for (int i = 0; i < 10; ++i) launch_ms_1mad_gemv<K>(d_w, d_x, d_out, out_f, in_f);
+    for (int i = 0; i < 10; ++i) launch();
     cudaDeviceSynchronize();
 
     cudaEvent_t ev0, ev1;
@@ -31,7 +44,7 @@ static void bench_shape(const char* label, int out_f, int in_f, int iters) {
     cudaEventCreate(&ev1);
     cudaEventRecord(ev0);
     for (int i = 0; i < iters; ++i) {
-        launch_ms_1mad_gemv<K>(d_w, d_x, d_out, out_f, in_f);
+        launch();
     }
     cudaEventRecord(ev1);
     cudaEventSynchronize(ev1);
@@ -41,8 +54,8 @@ static void bench_shape(const char* label, int out_f, int in_f, int iters) {
     double us_per_call = (ms_total * 1000.0) / iters;
     double gb_per_s = (static_cast<double>(w_bytes) * iters) / (ms_total * 1e6);
 
-    std::printf("[CUDA %-14s MS_C%d %4dx%-4d] %6.1f us | %.1f GB/s\n",
-                label, K, out_f, in_f, us_per_call, gb_per_s);
+    std::printf("[CUDA %-14s MS_C%d %5dx%-4d x%-2d] %6.1f us | %.1f GB/s\n",
+                label, K, out_f, in_f, n, us_per_call, gb_per_s);
 
     cudaEventDestroy(ev0);
     cudaEventDestroy(ev1);
@@ -58,5 +71,9 @@ int main() {
     bench_shape<4>("Expert down", 2560,  640, 500);
     bench_shape<3>("Expert gate",  640, 2560, 500);
     bench_shape<3>("Expert down", 2560,  640, 500);
+    bench_shape<4>("Expert gate",  640, 2560, 500, 8);
+    bench_shape<4>("Expert down", 2560,  640, 500, 8);
+    bench_shape<3>("Expert gate",  640, 2560, 500, 8);
+    bench_shape<3>("Expert down", 2560,  640, 500, 8);
     return 0;
 }
