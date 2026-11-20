@@ -3,7 +3,7 @@
 // Optimized AVX2 1MAD bitshift-trellis GEMV & block FWHT kernels for Adamant (per-row .basalt MS layout).
 // Optimizations vs initial version:
 //   - Replaces 7-instruction byte-sum with 2-instruction VPMADDUBSW + VPMADDWD
-//   - Pre-allocated register-friendly 64-bit bit-buffer for MSB-first symbol extraction
+//   - Direct register pack (_mm256_setr_epi32) avoids store-to-load forwarding stall
 //   - Software prefetching (_mm_prefetch) of next weight row from DDR5
 
 #include <cstddef>
@@ -22,8 +22,8 @@ constexpr uint32_t kMadAdd = 76625530u;
 constexpr uint32_t kStateMask = 0x3FFFu; // 14-bit state
 
 inline float fp16_to_fp32(uint16_t h) noexcept {
-#if defined(__F16C__)
-    return _cvtsh_ss(h);
+#if defined(__F16C__) && defined(__AVX2__)
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(h))));
 #else
     uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
     uint32_t exp  = (h >> 10) & 0x1Fu;
