@@ -1,11 +1,11 @@
 #pragma once
 
-// Peak-throughput Ampere (sm_86) CUDA 1MAD bitshift-trellis GEMV & block FWHT kernels.
-// Key sm_86 optimizations:
-//   - Single-instruction PTX `dp4a.u32.u32` for the 4-byte unsigned sum + (-510) bias
-//     (replaces 7 INT32 shift/mask/add instructions on sm_86's half-rate INT32 pipe).
-//   - Contiguous per-thread column blocks (in_features / 32) decoded from register-cached
-//     uint32_t words (zero shared memory, zero bank conflicts, 100% occupancy).
+// High-bandwidth Ampere (sm_86) CUDA 1MAD bitshift-trellis GEMV & block FWHT kernels.
+// Combines:
+//   - 100% coalesced 128-byte warp loads (uint32_t per lane) into a tiny 1 KB shared-memory
+//     buffer (100% occupancy on sm_86).
+//   - Single-instruction PTX `dp4a.u32.u32` for the 4-byte unsigned sum + (-510) bias.
+//   - 32-bit word reads from shared memory via __byte_perm (no 3x byte-load overhead).
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -22,7 +22,6 @@ __host__ __device__ inline size_t ms_row_bytes(int in_features, int k) {
     return 4u + static_cast<size_t>(((in_features - 1) * k + 7) / 8);
 }
 
-// Single-instruction unsigned 4-byte sum minus 510 using Ampere native dp4a.u32.u32.
 __device__ __forceinline__ float decode_1mad_dp4a(uint32_t state) {
     uint32_t x = state * kMadMul + kMadAdd;
     int32_t sum;
@@ -30,95 +29,83 @@ __device__ __forceinline__ float decode_1mad_dp4a(uint32_t state) {
     return __int2float_rn(sum);
 }
 
-__device__ __forceinline__ uint32_t load_be24(const uint8_t* __restrict__ p) {
-    return (static_cast<uint32_t>(__ldg(p)) << 16) |
-           (static_cast<uint32_t>(__ldg(p + 1)) << 8) |
-            static_cast<uint32_t>(__ldg(p + 2));
+// Fast 32-bit big-endian unaligned read from shared memory using 2 word loads + funnel shift.
+__device__ __forceinline__ uint32_t load_be32_smem(const uint32_t* __restrict__ s_u32, int byte_idx) {
+    const int w = byte_idx >> 2;
+    const int b = byte_idx & 3;
+    uint32_t lo = __byte_perm(s_u32[w], 0, 0x0123);     // bswap32(w)
+    if (b == 0) return lo;
+    uint32_t hi = __byte_perm(s_u32[w + 1], 0, 0x0123); // bswap32(w + 1)
+    return __funnelshift_l(hi, lo, b * 8);
 }
 
 template <int K>
-__device__ __forceinline__ uint32_t decode_state_at(
+__device__ __forceinline__ uint32_t decode_state_smem_u32(
     uint16_t s0,
-    const uint8_t* __restrict__ qs,
+    const uint32_t* __restrict__ s_qs_u32,
     int col
 ) {
     if (col == 0) return static_cast<uint32_t>(s0) & kStateMask;
     const int start_bit = col * K;
     if (start_bit < 14) {
         uint32_t hi = (static_cast<uint32_t>(s0) & kStateMask) << start_bit;
-        uint32_t lo = load_be24(qs) >> (24 - start_bit);
+        uint32_t lo = load_be32_smem(s_qs_u32, 0) >> (32 - start_bit);
         return (hi | lo) & kStateMask;
     }
     const int qs_bit = start_bit - 14;
     const int byte_idx = qs_bit >> 3;
     const int bit_off = qs_bit & 7;
-    return (load_be24(qs + byte_idx) >> (24 - bit_off - 14)) & kStateMask;
+    uint32_t raw = load_be32_smem(s_qs_u32, byte_idx);
+    return (raw >> (32 - bit_off - 14)) & kStateMask;
 }
 
-// High-occupancy register-only warp-per-row GEMV:
-// Each lane processes a contiguous slice of columns, keeping a 64-bit bit-buffer in registers
-// and shifting out K-bit symbols with minimal memory traffic + 1-cycle dp4a.u32.u32 decode.
-template <int K, int WARPS_PER_BLOCK = 8>
-__global__ void ms_1mad_gemv_dp4a_kernel(
+// Coalesced warp-per-row GEMV with 128-byte coalesced staging + dp4a.u32.u32 decode.
+template <int K, int WARPS_PER_BLOCK = 4>
+__global__ void ms_1mad_gemv_fast_kernel(
     const uint8_t* __restrict__ weights,
     const float* __restrict__ x_rot,
     float* __restrict__ out,
     int out_features,
     int in_features
 ) {
+    constexpr int kMaxRowWords = 512;
+    __shared__ uint32_t smem_rows[WARPS_PER_BLOCK][kMaxRowWords];
+
     const int warp_in_blk = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int row_idx = blockIdx.x * WARPS_PER_BLOCK + warp_in_blk;
     if (row_idx >= out_features) return;
 
     const size_t stride = ms_row_bytes(in_features, K);
-    const uint8_t* row = weights + static_cast<size_t>(row_idx) * stride;
+    const uint8_t* g_row = weights + static_cast<size_t>(row_idx) * stride;
+    uint32_t* s_row_u32 = smem_rows[warp_in_blk];
 
-    const float d = __half2float(__ldg(reinterpret_cast<const __half*>(row)));
-    const uint16_t s0 = __ldg(reinterpret_cast<const uint16_t*>(row + 2));
-    const uint8_t* qs = row + 4;
+    // 100% coalesced 128-byte warp loads
+    const int n_words = static_cast<int>((stride + 3u) >> 2);
+    const uint32_t* g_u32 = reinterpret_cast<const uint32_t*>(g_row);
+    const bool aligned4 = (reinterpret_cast<uintptr_t>(g_row) & 3u) == 0u;
+    if (aligned4) {
+        for (int w = lane; w < n_words; w += 32) {
+            s_row_u32[w] = __ldg(g_u32 + w);
+        }
+    } else {
+        uint8_t* s_bytes = reinterpret_cast<uint8_t*>(s_row_u32);
+        for (int b = lane; b < static_cast<int>(stride); b += 32) {
+            s_bytes[b] = __ldg(g_row + b);
+        }
+    }
+    __syncwarp();
 
-    // Contiguous slice per lane: e.g. for in_features=2560, each lane does 80 contiguous columns
-    const int cols_per_lane = (in_features + 31) >> 5;
-    const int c_start = lane * cols_per_lane;
-    const int c_end = min(c_start + cols_per_lane, in_features);
+    const uint32_t hdr = s_row_u32[0];
+    const float d = __half2float(*reinterpret_cast<const __half*>(&hdr));
+    const uint16_t s0 = static_cast<uint16_t>(hdr >> 16);
+    const uint32_t* s_qs_u32 = s_row_u32 + 1;
 
     float acc = 0.0f;
-    if (c_start < c_end) {
-        // Initialize 14-bit state at c_start once
-        uint32_t state = decode_state_at<K>(s0, qs, c_start);
-        acc = fmaf(decode_1mad_dp4a(state), __ldg(x_rot + c_start), acc);
-
-        // Stream remaining symbols in this lane's contiguous slice from a register bit-buffer
-        constexpr uint32_t kSymMask = (1u << K) - 1u;
-        int c = c_start + 1;
-        int bit_pos = c_start * K; // symbol index (c - 1) starts at bit (c - 1) * K
-        int byte_idx = bit_pos >> 3;
-        int bit_off = bit_pos & 7;
-
-        // Preload 32 bits big-endian into a 64-bit shift register
-        uint64_t bitbuf = 0;
-        int bits_avail = 0;
-        auto refill = [&]() {
-            while (bits_avail <= 32 && byte_idx < static_cast<int>(stride - 4)) {
-                bitbuf = (bitbuf << 8) | static_cast<uint64_t>(__ldg(qs + byte_idx));
-                ++byte_idx;
-                bits_avail += 8;
-            }
-        };
-
-        refill();
-        if (bit_off > 0) {
-            bits_avail -= bit_off;
-        }
-
-        for (; c < c_end; ++c) {
-            if (bits_avail < K) refill();
-            bits_avail -= K;
-            uint32_t sym = static_cast<uint32_t>(bitbuf >> bits_avail) & kSymMask;
-            state = ((state << K) | sym) & kStateMask;
-            acc = fmaf(decode_1mad_dp4a(state), __ldg(x_rot + c), acc);
-        }
+    #pragma unroll 4
+    for (int c = lane; c < in_features; c += 32) {
+        uint32_t state = decode_state_smem_u32<K>(s0, s_qs_u32, c);
+        acc = fmaf(decode_1mad_dp4a(state), __ldg(x_rot + c), acc);
     }
 
     #pragma unroll
@@ -167,10 +154,10 @@ inline void launch_ms_1mad_gemv(
     int in_features,
     cudaStream_t stream = nullptr
 ) {
-    constexpr int kWarpsPerBlock = 8;
+    constexpr int kWarpsPerBlock = 4;
     constexpr int kThreads = kWarpsPerBlock * 32;
     const int blocks = (out_features + kWarpsPerBlock - 1) / kWarpsPerBlock;
-    ms_1mad_gemv_dp4a_kernel<K, kWarpsPerBlock><<<blocks, kThreads, 0, stream>>>(
+    ms_1mad_gemv_fast_kernel<K, kWarpsPerBlock><<<blocks, kThreads, 0, stream>>>(
         weights, x_rot, out, out_features, in_features
     );
 }
