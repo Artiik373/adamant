@@ -1,11 +1,8 @@
 #pragma once
 
-// High-bandwidth Ampere (sm_86) CUDA 1MAD bitshift-trellis GEMV & block FWHT kernels.
-// Combines:
-//   - 100% coalesced 128-byte warp loads (uint32_t per lane) into a tiny 1 KB shared-memory
-//     buffer (100% occupancy on sm_86).
-//   - Single-instruction PTX `dp4a.u32.u32` for the 4-byte unsigned sum + (-510) bias.
-//   - 32-bit word reads from shared memory via __byte_perm (no 3x byte-load overhead).
+// CUDA 1MAD bitshift-trellis GEMV and block FWHT kernels.
+// Rows are staged through shared memory and decoded with dp4a.u32.u32; reads of unaligned
+// 32-bit windows use two word loads plus a funnel shift.
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -59,8 +56,13 @@ __device__ __forceinline__ uint32_t decode_state_smem_u32(
     return (raw >> (32 - bit_off - 14)) & kStateMask;
 }
 
-// Coalesced warp-per-row GEMV with 128-byte coalesced staging + dp4a.u32.u32 decode.
-template <int K, int WARPS_PER_BLOCK = 4>
+// Grid-stride warp-per-row GEMV. x_rot is staged once per block in shared memory; each warp
+// prefetches its next row into registers while it decodes the current row from shared memory.
+// Rows must be 4-byte aligned and at most kMaxRowWords words (checked by the launcher).
+constexpr int kMaxRowWords = 512;
+constexpr int kWordsPerLane = kMaxRowWords / 32;
+
+template <int K, int WARPS_PER_BLOCK>
 __global__ void ms_1mad_gemv_fast_kernel(
     const uint8_t* __restrict__ weights,
     const float* __restrict__ x_rot,
@@ -68,53 +70,57 @@ __global__ void ms_1mad_gemv_fast_kernel(
     int out_features,
     int in_features
 ) {
-    constexpr int kMaxRowWords = 512;
     __shared__ uint32_t smem_rows[WARPS_PER_BLOCK][kMaxRowWords];
+    extern __shared__ float s_x[];
 
-    const int warp_in_blk = threadIdx.x >> 5;
+    for (int i = threadIdx.x; i < in_features; i += blockDim.x) s_x[i] = __ldg(x_rot + i);
+    __syncthreads();
+
     const int lane = threadIdx.x & 31;
-    const int row_idx = blockIdx.x * WARPS_PER_BLOCK + warp_in_blk;
-    if (row_idx >= out_features) return;
+    const int warp_stride = gridDim.x * WARPS_PER_BLOCK;
+    int row = blockIdx.x * WARPS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= out_features) return;
 
-    const size_t stride = ms_row_bytes(in_features, K);
-    const uint8_t* g_row = weights + static_cast<size_t>(row_idx) * stride;
-    uint32_t* s_row_u32 = smem_rows[warp_in_blk];
+    const int stride_words = static_cast<int>(ms_row_bytes(in_features, K) >> 2);
+    const uint32_t* g_u32 = reinterpret_cast<const uint32_t*>(weights);
+    uint32_t* s_row = smem_rows[threadIdx.x >> 5];
 
-    // 100% coalesced 128-byte warp loads
-    const int n_words = static_cast<int>((stride + 3u) >> 2);
-    const uint32_t* g_u32 = reinterpret_cast<const uint32_t*>(g_row);
-    const bool aligned4 = (reinterpret_cast<uintptr_t>(g_row) & 3u) == 0u;
-    if (aligned4) {
-        for (int w = lane; w < n_words; w += 32) {
-            s_row_u32[w] = __ldg(g_u32 + w);
+    uint32_t buf[kWordsPerLane];
+    auto fetch = [&](int r) {
+        const uint32_t* g = g_u32 + static_cast<size_t>(r) * stride_words;
+        #pragma unroll
+        for (int j = 0; j < kWordsPerLane; ++j) {
+            const int w = lane + 32 * j;
+            if (w < stride_words) buf[j] = __ldg(g + w);
         }
-    } else {
-        uint8_t* s_bytes = reinterpret_cast<uint8_t*>(s_row_u32);
-        for (int b = lane; b < static_cast<int>(stride); b += 32) {
-            s_bytes[b] = __ldg(g_row + b);
+    };
+    fetch(row);
+
+    for (; row < out_features; row += warp_stride) {
+        __syncwarp();
+        #pragma unroll
+        for (int j = 0; j < kWordsPerLane; ++j) {
+            const int w = lane + 32 * j;
+            if (w < stride_words) s_row[w] = buf[j];
         }
-    }
-    __syncwarp();
+        __syncwarp();
+        if (row + warp_stride < out_features) fetch(row + warp_stride);
 
-    const uint32_t hdr = s_row_u32[0];
-    const float d = __half2float(*reinterpret_cast<const __half*>(&hdr));
-    const uint16_t s0 = static_cast<uint16_t>(hdr >> 16);
-    const uint32_t* s_qs_u32 = s_row_u32 + 1;
+        const uint32_t hdr = s_row[0];
+        const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(hdr & 0xFFFFu)));
+        const uint16_t s0 = static_cast<uint16_t>(hdr >> 16);
+        const uint32_t* s_qs_u32 = s_row + 1;
 
-    float acc = 0.0f;
-    #pragma unroll 4
-    for (int c = lane; c < in_features; c += 32) {
-        uint32_t state = decode_state_smem_u32<K>(s0, s_qs_u32, c);
-        acc = fmaf(decode_1mad_dp4a(state), __ldg(x_rot + c), acc);
-    }
-
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        acc += __shfl_down_sync(0xFFFFFFFFu, acc, offset);
-    }
-
-    if (lane == 0) {
-        out[row_idx] = acc * d;
+        float acc = 0.0f;
+        #pragma unroll 4
+        for (int c = lane; c < in_features; c += 32) {
+            acc = fmaf(decode_1mad_dp4a(decode_state_smem_u32<K>(s0, s_qs_u32, c)), s_x[c], acc);
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, offset);
+        }
+        if (lane == 0) out[row] = acc * d;
     }
 }
 
@@ -146,7 +152,7 @@ __global__ void fwht_rotate_input_kernel(
 }
 
 template <int K>
-inline void launch_ms_1mad_gemv(
+inline cudaError_t launch_ms_1mad_gemv(
     const uint8_t* weights,
     const float* x_rot,
     float* out,
@@ -154,12 +160,20 @@ inline void launch_ms_1mad_gemv(
     int in_features,
     cudaStream_t stream = nullptr
 ) {
-    constexpr int kWarpsPerBlock = 4;
+    constexpr int kWarpsPerBlock = 8;
     constexpr int kThreads = kWarpsPerBlock * 32;
-    const int blocks = (out_features + kWarpsPerBlock - 1) / kWarpsPerBlock;
-    ms_1mad_gemv_fast_kernel<K, kWarpsPerBlock><<<blocks, kThreads, 0, stream>>>(
+    const size_t row_bytes = ms_row_bytes(in_features, K);
+    if ((row_bytes & 3u) != 0u || row_bytes > kMaxRowWords * 4u) return cudaErrorInvalidValue;
+    int dev = 0, sms = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    const int max_blocks = sms * 4;
+    const int needed = (out_features + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    const int blocks = needed < max_blocks ? needed : max_blocks;
+    ms_1mad_gemv_fast_kernel<K, kWarpsPerBlock><<<blocks, kThreads, in_features * sizeof(float), stream>>>(
         weights, x_rot, out, out_features, in_features
     );
+    return cudaGetLastError();
 }
 
 } // namespace adamant::kernels::ms_cuda

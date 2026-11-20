@@ -82,8 +82,11 @@ static bool test_cuda_gemv(int out_f, int in_f, uint32_t seed) {
     cudaMemcpy(d_w, h_w.data(), h_w.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(d_x, h_x.data(), h_x.size() * sizeof(float), cudaMemcpyHostToDevice);
 
-    adamant::kernels::ms_cuda::launch_ms_1mad_gemv<K>(d_w, d_x, d_out, out_f, in_f);
-    cudaDeviceSynchronize();
+    if (adamant::kernels::ms_cuda::launch_ms_1mad_gemv<K>(d_w, d_x, d_out, out_f, in_f) != cudaSuccess ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        std::printf("[CUDA MS_C%d %dx%d] launch failed\n", K, out_f, in_f);
+        return false;
+    }
 
     std::vector<float> gpu_out(out_f, 0.0f);
     cudaMemcpy(gpu_out.data(), d_out, out_f * sizeof(float), cudaMemcpyDeviceToHost);
@@ -108,6 +111,9 @@ int main() {
     ok &= test_cuda_gemv<4>(64, 640, 204);
     ok &= test_cuda_gemv<6>(64, 2560, 205);
     ok &= test_cuda_gemv<6>(64, 640, 206);
+    // More rows than resident warps: exercises the grid-stride prefetch loop.
+    ok &= test_cuda_gemv<6>(8192, 2560, 207);
+    ok &= test_cuda_gemv<4>(8192, 640, 208);
     if (!ok) {
         std::fprintf(stderr, "CUDA TESTS FAILED\n");
         return 1;
