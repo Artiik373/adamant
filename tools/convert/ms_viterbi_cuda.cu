@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAException.h>
 #include <cstdint>
 #include <cmath>
 
@@ -17,138 +18,114 @@ __device__ __forceinline__ float decode_1mad(int s) {
     return static_cast<float>(v);
 }
 
-// Step t == 0: initialize costs from either uniform 0 (first window) or prev_state
-__global__ void viterbi_step0_kernel(
-    const float* __restrict__ w_col,      // [rc]
+// One block per row runs the whole window DP. Thread tid owns states tid + m * T, which hold every
+// predecessor of its own remainders j = s mod 2^(14-k), so costs live in registers and only the per-j
+// minimum crosses threads (double-buffered: one barrier per step). All states with the same j share one
+// predecessor, so the back-pointer is stored once per j as the predecessor's top-k bits.
+template <int PT, int K>
+__global__ void __launch_bounds__(NUM_STATES / PT) viterbi_window_kernel(
+    const float* __restrict__ w_win,      // [rc, w_len]
     const float* __restrict__ scales,     // [rc]
+    const float* __restrict__ inv_piv2,   // [n_groups, w_len]
+    int rows_per_group,
     const int32_t* __restrict__ prev_s,   // [rc] or nullptr
-    float piv,
-    int rc,
-    int k,
-    float* __restrict__ costs_out,        // [rc, NUM_STATES]
-    int16_t* __restrict__ backptr0        // [rc, NUM_STATES]
+    int w_len,
+    int step_commit,
+    uint8_t* __restrict__ backptr,        // [rc, w_len, n_rem]
+    int32_t* __restrict__ out_states      // [rc, step_commit]
 ) {
-    int r = blockIdx.y;
-    int s = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rc || s >= NUM_STATES) return;
+    constexpr int T = NUM_STATES / PT;
+    extern __shared__ float min_c[];      // [2, n_rem]
+    __shared__ float red_c[T];
+    __shared__ int red_s[T];
 
-    float d = scales[r];
-    float x = w_col[r];
-    float v = decode_1mad(s);
-    float branch = piv * (d * d * v * v - 2.0f * x * d * v);
+    constexpr int k = K;
+    constexpr int shift_r = STATE_BITS - K;
+    constexpr int n_rem = 1 << shift_r;
+    constexpr int lg_pt = PT == 16 ? 4 : 6;
+    constexpr int n_sub = PT >> K;        // remainders owned per thread
+    static_assert(PT >= (1 << K), "a thread must own all predecessors of its remainders");
+    const int r = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float d = scales[r];
+    const float d2 = d * d;
+    const float* w_row = w_win + static_cast<size_t>(r) * w_len;
+    const float* piv_row = inv_piv2 + static_cast<size_t>(r / rows_per_group) * w_len;
+    uint8_t* bp_row = backptr + static_cast<size_t>(r) * w_len * n_rem;
 
-    int idx = r * NUM_STATES + s;
-    if (prev_s == nullptr) {
-        costs_out[idx] = branch;
-        backptr0[idx] = 0;
-    } else {
-        int ps = prev_s[r];
-        int base = (ps << k) & STATE_MASK;
-        int mask = ~((1 << k) - 1);
-        costs_out[idx] = ((s & mask) == base) ? branch : INFINITY;
-        backptr0[idx] = static_cast<int16_t>(ps);
-    }
-}
+    float v[PT], c[PT];
+    #pragma unroll
+    for (int m = 0; m < PT; ++m) v[m] = decode_1mad(tid + m * T);
 
-// Step t > 0: one thread per (row, j) where j in [0, n_rem)
-__global__ void viterbi_step_kernel(
-    const float* __restrict__ costs_in,   // [rc, NUM_STATES]
-    const float* __restrict__ w_col,      // [rc]
-    const float* __restrict__ scales,     // [rc]
-    float piv,
-    int rc,
-    int k,
-    float* __restrict__ costs_out,        // [rc, NUM_STATES]
-    int16_t* __restrict__ backptr_t       // [rc, NUM_STATES]
-) {
-    int r = blockIdx.y;
-    int shift_r = STATE_BITS - k;
-    int n_pred = 1 << k;
-    int n_rem = 1 << shift_r;
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rc || j >= n_rem) return;
-
-    const float* row_in = costs_in + r * NUM_STATES;
-    float min_c = INFINITY;
-    int best_a = 0;
-
-    #pragma unroll 4
-    for (int a = 0; a < n_pred; ++a) {
-        int pred = (a << shift_r) | j;
-        float c = row_in[pred];
-        if (c < min_c) {
-            min_c = c;
-            best_a = a;
+    {
+        const float a = piv_row[0] * d2;
+        const float b = -piv_row[0] * 2.0f * w_row[0] * d;
+        const int mask = ~((1 << k) - 1);
+        const int base = prev_s ? ((prev_s[r] << k) & STATE_MASK) : 0;
+        #pragma unroll
+        for (int m = 0; m < PT; ++m) {
+            int s = tid + m * T;
+            float branch = v[m] * (a * v[m] + b);
+            c[m] = (prev_s == nullptr || (s & mask) == base) ? branch : INFINITY;
         }
     }
 
-    int16_t best_pred = static_cast<int16_t>((best_a << shift_r) | j);
-    float d = scales[r];
-    float d2 = d * d;
-    float two_xd = 2.0f * w_col[r] * d;
-
-    float* row_out = costs_out + r * NUM_STATES;
-    int16_t* bp_out = backptr_t + r * NUM_STATES;
-    int s_base = j << k;
-
-    #pragma unroll 4
-    for (int b = 0; b < n_pred; ++b) {
-        int s_next = s_base | b;
-        float v = decode_1mad(s_next);
-        float branch = piv * (d2 * v * v - two_xd * v);
-        row_out[s_next] = min_c + branch;
-        bp_out[s_next] = best_pred;
+    for (int t = 1; t < w_len; ++t) {
+        float* mc = min_c + (t & 1) * n_rem;
+        uint8_t* bp_t = bp_row + static_cast<size_t>(t) * n_rem;
+        // m = (pred_top << (lg_pt - k)) | sub, remainder j = tid + sub * T
+        #pragma unroll
+        for (int sub = 0; sub < n_sub; ++sub) {
+            float best = INFINITY;
+            int best_a = 0;
+            #pragma unroll
+            for (int m = 0; m < PT; ++m) {
+                if ((m & (n_sub - 1)) != sub) continue;
+                if (c[m] < best) { best = c[m]; best_a = m >> (lg_pt - k); }
+            }
+            int j = tid + sub * T;
+            mc[j] = best;
+            bp_t[j] = static_cast<uint8_t>(best_a);
+        }
+        __syncthreads();
+        const float a = piv_row[t] * d2;
+        const float b = -piv_row[t] * 2.0f * w_row[t] * d;
+        #pragma unroll
+        for (int m = 0; m < PT; ++m) {
+            int s = tid + m * T;
+            c[m] = mc[s >> k] + v[m] * (a * v[m] + b);
+        }
     }
-}
-
-// Coalesced 256-thread block per row: parallel argmin across 16,384 states + backtrack
-__global__ void viterbi_backtrack_kernel(
-    const float* __restrict__ costs_final,  // [rc, NUM_STATES]
-    const int16_t* __restrict__ backptr,    // [w_len, rc, NUM_STATES]
-    int rc,
-    int w_len,
-    int step_commit,
-    int32_t* __restrict__ out_states        // [rc, step_commit]
-) {
-    int r = blockIdx.x;
-    if (r >= rc) return;
-
-    int tid = threadIdx.x;
-    const float* row_c = costs_final + static_cast<size_t>(r) * NUM_STATES;
 
     float best_c = INFINITY;
     int best_s = 0;
-    for (int s = tid; s < NUM_STATES; s += 256) {
-        float c = row_c[s];
-        if (c < best_c) {
-            best_c = c;
-            best_s = s;
-        }
+    #pragma unroll
+    for (int m = 0; m < PT; ++m) {
+        if (c[m] < best_c) { best_c = c[m]; best_s = tid + m * T; }
     }
-
-    __shared__ float smem_c[256];
-    __shared__ int smem_s[256];
-    smem_c[tid] = best_c;
-    smem_s[tid] = best_s;
+    red_c[tid] = best_c;
+    red_s[tid] = best_s;
     __syncthreads();
-
-    for (int stride = 128; stride > 0; stride >>= 1) {
+    for (int stride = T / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
-            if (smem_c[tid + stride] < smem_c[tid]) {
-                smem_c[tid] = smem_c[tid + stride];
-                smem_s[tid] = smem_s[tid + stride];
+            float oc = red_c[tid + stride];
+            int os = red_s[tid + stride];
+            if (oc < red_c[tid] || (oc == red_c[tid] && os < red_s[tid])) {
+                red_c[tid] = oc;
+                red_s[tid] = os;
             }
         }
         __syncthreads();
     }
 
     if (tid == 0) {
-        int cur = smem_s[0];
+        int cur = red_s[0];
         for (int t = w_len - 1; t >= 0; --t) {
-            if (t < step_commit) {
-                out_states[r * step_commit + t] = cur;
+            if (t < step_commit) out_states[r * step_commit + t] = cur;
+            if (t > 0) {
+                int j = cur >> k;
+                cur = (static_cast<int>(bp_row[static_cast<size_t>(t) * n_rem + j]) << shift_r) | j;
             }
-            cur = static_cast<int>(backptr[(static_cast<size_t>(t) * rc + r) * NUM_STATES + cur]);
         }
     }
 }
@@ -158,68 +135,46 @@ __global__ void viterbi_backtrack_kernel(
 torch::Tensor viterbi_window_cuda(
     torch::Tensor w_win,        // [rc, w_len] float32 contiguous
     torch::Tensor scales,       // [rc] float32 contiguous
-    torch::Tensor inv_piv2,     // [w_len] float32 CPU or CUDA
+    torch::Tensor inv_piv2,     // [n_groups, w_len] float32 CUDA contiguous; rows split evenly into groups
     c10::optional<torch::Tensor> prev_state,  // [rc] int32 or None
-    int k,
-    int step_commit,
-    torch::Tensor costs_a,      // [rc, NUM_STATES] float32
-    torch::Tensor costs_b,      // [rc, NUM_STATES] float32
-    torch::Tensor backptr       // [w_len, rc, NUM_STATES] int16
+    int64_t k,
+    int64_t step_commit,
+    torch::Tensor backptr       // [>= rc * w_len * n_rem] uint8
 ) {
+    TORCH_CHECK(k >= 1 && k <= 6, "k must be in [1, 6]");
+    TORCH_CHECK(w_win.is_contiguous() && inv_piv2.is_cuda(), "bad inputs");
     int rc = static_cast<int>(w_win.size(0));
     int w_len = static_cast<int>(w_win.size(1));
-    auto inv_piv2_cpu = inv_piv2.to(torch::kCPU).contiguous();
-    const float* piv_ptr = inv_piv2_cpu.data_ptr<float>();
-
-    auto w_t = w_win.transpose(0, 1).contiguous();  // [w_len, rc]
-    const float* scales_ptr = scales.data_ptr<float>();
-    const int32_t* prev_ptr = prev_state.has_value() ? prev_state.value().data_ptr<int32_t>() : nullptr;
-
-    float* c_in = costs_a.data_ptr<float>();
-    float* c_out = costs_b.data_ptr<float>();
-    int16_t* bp_base = backptr.data_ptr<int16_t>();
-
-    {
-        dim3 block(256);
-        dim3 grid((NUM_STATES + 255) / 256, rc);
-        viterbi_step0_kernel<<<grid, block>>>(
-            w_t.data_ptr<float>(),
-            scales_ptr,
-            prev_ptr,
-            piv_ptr[0],
-            rc,
-            k,
-            c_in,
-            bp_base
-        );
-    }
-
     int n_rem = 1 << (STATE_BITS - k);
-    dim3 block_step(256);
-    dim3 grid_step((n_rem + 255) / 256, rc);
-    for (int t = 1; t < w_len; ++t) {
-        viterbi_step_kernel<<<grid_step, block_step>>>(
-            c_in,
-            w_t.data_ptr<float>() + t * rc,
-            scales_ptr,
-            piv_ptr[t],
-            rc,
-            k,
-            c_out,
-            bp_base + static_cast<size_t>(t) * rc * NUM_STATES
-        );
-        std::swap(c_in, c_out);
-    }
+    TORCH_CHECK(inv_piv2.numel() % w_len == 0 && rc % (inv_piv2.numel() / w_len) == 0, "bad inv_piv2 groups");
+    int rows_per_group = rc / static_cast<int>(inv_piv2.numel() / w_len);
+    TORCH_CHECK(backptr.numel() >= static_cast<int64_t>(rc) * w_len * n_rem, "backptr too small");
 
+    size_t smem = 2 * static_cast<size_t>(n_rem) * sizeof(float);
     auto out_states = torch::empty({rc, step_commit}, torch::dtype(torch::kInt32).device(w_win.device()));
-    viterbi_backtrack_kernel<<<rc, 256>>>(
-        c_in,
-        bp_base,
-        rc,
-        w_len,
-        step_commit,
-        out_states.data_ptr<int32_t>()
-    );
+    auto launch = [&](auto kern, int threads) {
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
+        kern<<<rc, threads, smem>>>(
+            w_win.data_ptr<float>(),
+            scales.data_ptr<float>(),
+            inv_piv2.data_ptr<float>(),
+            rows_per_group,
+            prev_state.has_value() ? prev_state.value().data_ptr<int32_t>() : nullptr,
+            w_len,
+            static_cast<int>(step_commit),
+            backptr.data_ptr<uint8_t>(),
+            out_states.data_ptr<int32_t>()
+        );
+    };
+    switch (k) {
+        case 1: launch(viterbi_window_kernel<16, 1>, NUM_STATES / 16); break;
+        case 2: launch(viterbi_window_kernel<16, 2>, NUM_STATES / 16); break;
+        case 3: launch(viterbi_window_kernel<16, 3>, NUM_STATES / 16); break;
+        case 4: launch(viterbi_window_kernel<16, 4>, NUM_STATES / 16); break;
+        case 5: launch(viterbi_window_kernel<64, 5>, NUM_STATES / 64); break;
+        default: launch(viterbi_window_kernel<64, 6>, NUM_STATES / 64); break;
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out_states;
 }
 
