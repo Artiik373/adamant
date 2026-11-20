@@ -88,12 +88,7 @@ def rotate_weight_and_hessian(
 
 
 def denoise_hessian_rmt(h: torch.Tensor, n_samples: int, base_damp: float = 0.01) -> torch.Tensor:
-    """Marchenko-Pastur (MP+DG-Flat) RMT denoising for undersampled/cold experts (r/D < 0.5).
-
-    Shrinks noise-bulk eigenvalues below the MP upper edge lambda_+ while preserving
-    true signal spikes (lambda > lambda_+). Falls back to standard diagonal damping
-    when well-sampled.
-    """
+    """Marchenko-Pastur (MP+DG-Flat) RMT denoising for undersampled/cold experts (r/D < 0.5)."""
     d = h.shape[0]
     h = 0.5 * (h + h.T)
     mean_diag = torch.diagonal(h).mean().clamp(min=1e-8)
@@ -103,10 +98,8 @@ def denoise_hessian_rmt(h: torch.Tensor, n_samples: int, base_damp: float = 0.01
 
     gamma = d / float(max(n_samples, 1))
     if gamma <= 2.0:
-        # Well-sampled expert (r/D >= 0.5): standard diagonal damping
         return h + (base_damp * mean_diag) * torch.eye(d, device=h.device, dtype=h.dtype)
 
-    # Cold expert (r/D < 0.5): eigendecomposition & MP bulk flattening
     evals, evecs = torch.linalg.eigh(h)
     evals = evals.clamp(min=0.0)
     sigma2 = evals.median().clamp(min=1e-8)
@@ -152,15 +145,16 @@ def viterbi_code_matrix(
     hu: torch.Tensor,
     k: int,
     lut: torch.Tensor,
-    window: int = 32,
-    commit: int = 8,
+    window: int = 24,
+    commit: int = 16,
+    row_chunk: int = 256,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sliding-window 14-bit Viterbi search with LDLQ error feedback.
+    """Fast GPU-batched sliding-window 14-bit Viterbi search with LDLQ error feedback.
 
-    Returns:
-        scales_fp16: [out_features] fp16 per-row scales
-        states: [out_features, in_features] int32 trellis states
-        w_quant: [out_features, in_features] float32 decoded weights
+    Optimized for 24 GB GPUs (RTX 3090):
+    - Processes `row_chunk=256` rows in parallel (8x fewer Python loops).
+    - Uses `window=24, commit=16` (~2.6x fewer DP steps than 32/8).
+    - Pre-allocates index buffers and uses zero-copy expand/reshape instead of repeat_interleave.
     """
     out_f, in_f = w_rot.shape
     device = w_rot.device
@@ -168,24 +162,30 @@ def viterbi_code_matrix(
 
     row_std = w_work.std(dim=1).clamp(min=1e-8)
     scales_fp16 = (GAINS[k] * row_std / CODEBOOK_STD).to(torch.float16)
-    scales = scales_fp16.to(torch.float32)  # [out_f]
+    scales = scales_fp16.to(torch.float32)
 
     states = torch.empty((out_f, in_f), dtype=torch.int32, device=device)
     w_quant = torch.empty((out_f, in_f), dtype=torch.float32, device=device)
 
-    v2 = lut * lut  # [16384]
+    v2 = (lut * lut).unsqueeze(0)  # [1, 16384]
+    lut_row = lut.unsqueeze(0)     # [1, 16384]
     shift_r = STATE_BITS - k
     n_pred = 1 << k
     n_rem = 1 << shift_r
 
-    # Process rows in small chunks to stay well inside 24 GB VRAM
-    row_chunk = 32
+    hu_diag = torch.diagonal(hu)
+    inv_hu_diag2 = 1.0 / (hu_diag * hu_diag).clamp(min=1e-12)
+    sym_arange = torch.arange(n_pred, device=device, dtype=torch.int64).unsqueeze(0)
+    rem_arange = torch.arange(n_rem, device=device, dtype=torch.int32).unsqueeze(0)
+
     for r0 in range(0, out_f, row_chunk):
         r1 = min(r0 + row_chunk, out_f)
         rc = r1 - r0
-        d_c = scales[r0:r1].unsqueeze(1)  # [rc, 1]
+        d_c = scales[r0:r1].unsqueeze(1)   # [rc, 1]
         d2_c = d_c * d_c
-        w_c = w_work[r0:r1]  # [rc, in_f]
+        w_c = w_work[r0:r1]                # [rc, in_f]
+        row_idx = torch.arange(rc, device=device, dtype=torch.int64)
+        backptr = torch.empty((window, rc, NUM_STATES), dtype=torch.int16, device=device)
 
         prev_state: Optional[torch.Tensor] = None
         col = 0
@@ -194,23 +194,19 @@ def viterbi_code_matrix(
             w_len = w_end - col
             step_commit = min(commit, w_len)
 
-            # Initialize DP costs
             if prev_state is None:
                 costs = torch.zeros((rc, NUM_STATES), device=device, dtype=torch.float32)
             else:
                 costs = torch.full((rc, NUM_STATES), float("inf"), device=device, dtype=torch.float32)
-                base = (prev_state.to(torch.int64) << k) & STATE_MASK  # [rc]
-                sym = torch.arange(n_pred, device=device, dtype=torch.int64).unsqueeze(0)
-                valid_next = base.unsqueeze(1) | sym  # [rc, 2^k]
+                base = (prev_state.to(torch.int64) << k) & STATE_MASK
+                valid_next = base.unsqueeze(1) | sym_arange
                 costs.scatter_(1, valid_next, 0.0)
-
-            backptr = torch.empty((w_len, rc, NUM_STATES), dtype=torch.int16, device=device)
 
             for t in range(w_len):
                 c_idx = col + t
-                piv = 1.0 / (hu[c_idx, c_idx] * hu[c_idx, c_idx]).clamp(min=1e-12)
-                x_col = w_c[:, c_idx].unsqueeze(1)  # [rc, 1]
-                branch = piv * (d2_c * v2.unsqueeze(0) - 2.0 * x_col * d_c * lut.unsqueeze(0))
+                piv = inv_hu_diag2[c_idx]
+                x_col = w_c[:, c_idx].unsqueeze(1)
+                branch = piv * (d2_c * v2 - (2.0 * x_col * d_c) * lut_row)
 
                 if t == 0 and prev_state is None:
                     costs = branch
@@ -219,23 +215,18 @@ def viterbi_code_matrix(
                     costs = costs + branch
                     backptr[0] = prev_state.unsqueeze(1).expand(rc, NUM_STATES).to(torch.int16)
                 else:
-                    # Predecessors of s' = (j << k) | b are (a << (14-k)) | j
                     view = costs.view(rc, n_pred, n_rem)
                     min_cost, best_a = view.min(dim=1)  # [rc, n_rem]
-                    best_pred = (best_a << shift_r) | torch.arange(n_rem, device=device).unsqueeze(0)
-                    # Broadcast across low k bits
-                    costs = min_cost.repeat_interleave(n_pred, dim=1) + branch
-                    backptr[t] = best_pred.repeat_interleave(n_pred, dim=1).to(torch.int16)
+                    best_pred = ((best_a.to(torch.int32) << shift_r) | rem_arange).to(torch.int16)
+                    costs = min_cost.unsqueeze(2).expand(rc, n_rem, n_pred).reshape(rc, NUM_STATES) + branch
+                    backptr[t] = best_pred.unsqueeze(2).expand(rc, n_rem, n_pred).reshape(rc, NUM_STATES)
 
-            # Backtrack best path in window
-            best_end = costs.argmin(dim=1)  # [rc]
+            cur = costs.argmin(dim=1).to(torch.int32)
             path = torch.empty((rc, w_len), dtype=torch.int32, device=device)
-            cur = best_end.to(torch.int32)
             for t in range(w_len - 1, -1, -1):
                 path[:, t] = cur
-                cur = backptr[t, torch.arange(rc, device=device), cur.to(torch.int64)].to(torch.int32)
+                cur = backptr[t, row_idx, cur.to(torch.int64)].to(torch.int32)
 
-            # Commit first step_commit columns and apply LDLQ error feedback
             committed_s = path[:, :step_commit]
             committed_q = lut[committed_s.to(torch.int64)] * d_c
             states[r0:r1, col : col + step_commit] = committed_s
@@ -244,7 +235,7 @@ def viterbi_code_matrix(
             for t in range(step_commit):
                 c_idx = col + t
                 if c_idx + 1 < in_f:
-                    err = (w_c[:, c_idx] - committed_q[:, t]) / hu[c_idx, c_idx]
+                    err = (w_c[:, c_idx] - committed_q[:, t]) / hu_diag[c_idx]
                     w_c[:, c_idx + 1 :] -= err.unsqueeze(1) * hu[c_idx, c_idx + 1 :].unsqueeze(0)
 
             prev_state = committed_s[:, -1]
@@ -284,12 +275,7 @@ def pack_per_row_ms(scales_fp16: torch.Tensor, states: torch.Tensor, k: int) -> 
 
 
 def build_default_tier_plan(num_layers: int = 48) -> List[LayerBitConfig]:
-    """<= 55 GB main shard allocation for Qwen3.8-Flash-Next (125B main + 51B PLE separate).
-
-    - Outer layers (L00-L02, L44-L47) and selected GDN-2 layers (L06, L10, L38, L42): MS_C4 routed
-    - Remaining routed MoE layers: MS_C3
-    - Dense spine + lm_head: MS_C6
-    """
+    """<= 55 GB main shard allocation for Qwen3.8-Flash-Next (125B main + 51B PLE separate)."""
     ms_c4_layers = {0, 1, 2, 6, 10, 38, 42, 44, 45, 46, 47}
     return [
         LayerBitConfig(routed_k=4 if l in ms_c4_layers else 3, spine_k=6, head_k=6)
