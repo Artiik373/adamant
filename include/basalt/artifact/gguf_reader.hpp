@@ -43,6 +43,20 @@ namespace basalt {
 // suh fp16[K], then svh fp16[N] (see tools/exl3/build_experts.py).
 inline bool exl3_tensor_type(uint32_t t) { return t > 96 && t <= 112; }
 
+// MS (Mad Shift 1MAD trellis) tensors carry ids 120 + K, K the bits per weight (3, 4 or 6). Not block formats: the
+// payload of a [n_in, n_out] tensor is n_out rows of ms_row_bytes(n_in, K) (fp16 scale, uint16 14-bit start state,
+// MSB-first K-bit symbols, zero padding to 4 bytes), then int8 signs[n_in] (+1/-1) of the input rotation
+// y = W_rot * H(signs * x). H is the orthonormal block Hadamard of size ms_hadamard_block(n_in).
+inline bool ms_tensor_type(uint32_t t) { return t == 123 || t == 124 || t == 126; }
+inline int ms_bits(uint32_t t) { return (int) t - 120; }
+inline uint64_t ms_row_bytes(uint64_t n_in, int k) { return (4 + ((n_in - 1) * (uint64_t) k + 7) / 8 + 3) & ~uint64_t{3}; }
+// Largest power-of-two divisor of n_in, at most 512 (the converter uses the same rule).
+inline int ms_hadamard_block(uint64_t n_in) {
+    int b = 1;
+    while (b < 512 && n_in % (uint64_t) (2 * b) == 0) b *= 2;
+    return b;
+}
+
 inline const char* ggml_type_name(uint32_t t) {
     if (exl3_tensor_type(t)) return "EXL3";
     switch (t) {
@@ -110,6 +124,12 @@ inline const char* ggml_type_name(uint32_t t) {
         return "F8_E4M3";
     case 45:
         return "NVFP4_PLANES";
+    case 123:
+        return "MS_C3";
+    case 124:
+        return "MS_C4";
+    case 126:
+        return "MS_C6";
     default:
         return "?";
     }
@@ -498,6 +518,11 @@ inline uint64_t tensor_payload_bytes(const TensorInfo& t) {
         if (t.shape.size() != 2 || t.shape[0] == 0 || t.shape[1] == 0 || t.shape[0] % 128 || t.shape[1] % 128) return 0;
         const uint64_t k = t.shape[0], n = t.shape[1], w = (uint64_t) (t.type - 96) * 8;
         return k / 16 * (n / 16) * w * 2 + 2 * (k + n);
+    }
+    if (ms_tensor_type(t.type)) {   // n_in a multiple of 4 (the kernel reads its input in groups of 4)
+        if (t.shape.size() != 2 || t.shape[0] < 4 || t.shape[0] % 4 || t.shape[1] == 0 || t.shape[0] > (1u << 20) ||
+            t.shape[1] > (1u << 24)) return 0;
+        return t.shape[1] * ms_row_bytes(t.shape[0], ms_bits(t.type)) + t.shape[0];
     }
     int be = 0, bb = 0;
     if (t.shape.empty() || !block_geometry(t.type, be, bb) || t.shape[0] % (uint64_t) be) return 0;
