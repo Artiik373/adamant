@@ -23,13 +23,29 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
-from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextDecoderLayer, Qwen4ExpTextModel
+from transformers.models.qwen4_exp.modeling_qwen4_exp import (
+    Qwen4ExpTextDecoderLayer,
+    Qwen4ExpTextModel,
+    Qwen4ExpTextQSAIndexer,
+)
 
 import ms_moe_converter as ms
 from eval_ms_kld import split_calib
 from ms_viterbi_cuda import viterbi_code_batched_cuda
 
 PRE = "model.language_model."
+
+_indexer_forward = Qwen4ExpTextQSAIndexer.forward
+
+
+def _indexer_all(self, hidden_states, position_embeddings, attention_mask, past_key_values):
+    """Without a cache and with no more keys than the token budget, the indexer selects every key: skip it."""
+    if past_key_values is None and attention_mask.shape[-1] <= self.token_budget:
+        return torch.ones((), dtype=torch.bool, device=hidden_states.device)
+    return _indexer_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values)
+
+
+Qwen4ExpTextQSAIndexer.forward = _indexer_all
 NGRAM = "ple.ple_embedding.ngram_embedding."
 
 

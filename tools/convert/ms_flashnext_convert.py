@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import time
 from pathlib import Path
 
@@ -161,7 +162,11 @@ def main() -> None:
     p.add_argument("--spine-k", type=int, default=6)
     p.add_argument("--head-k", type=int, default=6)
     p.add_argument("--stop-after", type=int, default=None, help="last layer to convert in this run")
+    p.add_argument("--reuse-from", type=Path, help="an earlier output folder (same plan) to copy layers from")
+    p.add_argument("--reuse-layers", type=int, default=0, help="copy layers below this from --reuse-from")
     args = p.parse_args()
+    if args.reuse_layers and not args.reuse_from:
+        p.error("--reuse-layers needs --reuse-from")
 
     dev = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True  # Hessian sums: TF32 inputs, FP32 accumulation
@@ -190,6 +195,15 @@ def main() -> None:
     for l in range(start, min(last, nl - 1) + 1):
         t0 = time.time()
         layer = load_layer(cfg, args.hf_dir, wmap, l, dev)
+        if l < args.reuse_layers:
+            # the layer's records come from an earlier run with the same plan; only advance the stream
+            h = run_layer(layer, h, kws, bs)
+            for src in list(args.reuse_from.glob(f"blk.{l}.*")) + list((args.reuse_from / "experts").glob(f"blk.{l}.*")):
+                shutil.copy2(src, out / src.relative_to(args.reuse_from))
+            del layer
+            torch.save({"next_layer": l + 1, "h": h}, state)
+            print(f"layer {l:2d}: records reused from {args.reuse_from}, forward {time.time() - t0:.0f}s", flush=True)
+            continue
         hess, counts, xs = {}, {}, []
         hooks = spine_hooks(layer, hess, counts)
         h = run_layer(layer, h, kws, bs, grab_in=xs)
