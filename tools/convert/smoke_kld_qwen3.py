@@ -23,6 +23,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
 ROOT = Path(__file__).resolve().parent
@@ -138,9 +139,11 @@ def main() -> None:
     parser.add_argument("--quant-lm-head", action="store_true", help="Also quantize lm_head to MS_C6")
     parser.add_argument("--gguf", type=Path, help="Measure this GGUF's decoder linears instead of quantizing")
     parser.add_argument(
-        "--calib-mode", choices=["fp", "guided"], default="fp",
+        "--calib-mode", choices=["fp", "guided", "kron-emp", "kron-true"], default="fp",
         help="fp: Hessians from the BF16 model; "
-        "guided: GuidedQuant, x x^T weighted by the squared loss gradient of each output-row group",
+        "guided: GuidedQuant, x x^T weighted by the squared loss gradient of each output-row group; "
+        "kron-emp / kron-true: two-sided rounding on H = E[g g^T] (x) E[x x^T], g from data labels (empirical Fisher) "
+        "or from labels sampled from the model (true Fisher, the Hessian of the KL)",
     )
     parser.add_argument("--guided-groups", type=int, default=4, help="output-row groups per layer for --calib-mode guided")
     args = parser.parse_args()
@@ -212,9 +215,43 @@ def main() -> None:
             rel_err = ((w_q - w_f32).norm() / w_f32.norm().clamp(min=1e-8)).item()
             print(f"  [{idx + 1}/{len(target_linears)}] {name} rel_err={rel_err:.4f} ({time.time() - t0:.1f}s)", flush=True)
 
-    if args.calib_mode == "guided":
-        quantize_guided(model, target_linears, quantize_linear, calib_ids, device, args)
-        report(f"MS_C{args.k} ({mode_str}, guided G={args.guided_groups})", ref_logits,
+    def quantize_two_sided_many(items, rows: int = 128):
+        """LDLQ on H = B (x) A for many matrices at once. Rows go in order: each row is searched with A, and a
+        finished block of rows feeds (Ub[i, i'] / Ub[i, i]) (w_i - q_i) to every later row i'. Rows inside one
+        block ignore B. Step r searches block r of every matrix with the same input width in one batched call."""
+        from ms_viterbi_cuda import viterbi_code_batched_cuda
+
+        jobs = []
+        for idx, name, mod, w_target, (a, b) in items:
+            blk = largest_pow2_divisor(int(w_target.shape[1]), cap=512)
+            w_rot, a_rot, signs = ms.rotate_weight_and_hessian(w_target, a, block_size=blk, seed=(idx + 1) * 10007)
+            jobs.append({"idx": idx, "name": name, "mod": mod, "blk": blk, "signs": signs, "w": w_rot,
+                         "q": torch.empty_like(w_rot), "ua": ms.cholesky_inv_upper(a_rot), "ub": ms.cholesky_inv_upper(b)})
+        for in_f in sorted({j["w"].shape[1] for j in jobs}):
+            group = sorted((j for j in jobs if j["w"].shape[1] == in_f), key=lambda j: -j["w"].shape[0])
+            assert all(j["w"].shape[0] % rows == 0 for j in group)
+            hu = torch.stack([j["ua"] for j in group])
+            for r0 in range(0, group[0]["w"].shape[0], rows):
+                act = [j for j in group if j["w"].shape[0] > r0]  # a prefix: the group is sorted by rows
+                r1 = r0 + rows
+                q = viterbi_code_batched_cuda(torch.stack([j["w"][r0:r1] for j in act]), hu[: len(act)], args.k, lut)[2]
+                for j, qj in zip(act, q):
+                    j["q"][r0:r1] = qj
+                    if r1 < j["w"].shape[0]:
+                        coef = j["ub"][r0:r1, r1:] / torch.diagonal(j["ub"])[r0:r1, None]
+                        j["w"][r1:] -= coef.T @ (j["w"][r0:r1] - qj)
+            del hu
+        for j in jobs:
+            w_q = ms.fwht_blocks(j["q"], block_size=j["blk"]) * j["signs"].unsqueeze(0)
+            j["mod"].weight.data.copy_(w_q.to(dtype=j["mod"].weight.dtype))
+            if (j["idx"] + 1) % 28 == 0:
+                w0 = items[[i[0] for i in items].index(j["idx"])][3]
+                print(f"  [{j['idx'] + 1}/{len(target_linears)}] {j['name']} rel_err="
+                      f"{((w_q - w0).norm() / w0.norm()).item():.4f} ({time.time() - t0:.1f}s)", flush=True)
+
+    if args.calib_mode != "fp":
+        quantize_guided(model, target_linears, quantize_linear, quantize_two_sided_many, calib_ids, device, args)
+        report(f"MS_C{args.k} ({mode_str}, {args.calib_mode})", ref_logits,
                collect_logits(model, eval_ids, device, args.batch_size), t0)
         return
 
@@ -255,9 +292,12 @@ def main() -> None:
     report(f"MS_C{args.k} ({mode_str})", ref_logits, collect_logits(model, eval_ids, device, args.batch_size), t0)
 
 
-def quantize_guided(model, target_linears, quantize_linear, calib_ids, device, args, chunk_layers: int = 7) -> None:
-    """GuidedQuant: per output-row group j, H_j = sum_t (sum_{i in j} g_ti^2) x_t x_t^T, where g is the gradient of
-    the next-token loss of the BF16 model with respect to the layer output. Collected a few layers at a time."""
+def quantize_guided(model, target_linears, quantize_linear, quantize_many, calib_ids, device, args, chunk_layers: int = 7) -> None:
+    """Gradient-weighted Hessians from the BF16 model, a few layers at a time. g is the gradient of the next-token
+    loss with respect to the layer output. guided (GuidedQuant): per output-row group j, H_j = sum_t (sum_{i in j}
+    g_ti^2) x_t x_t^T. kron-*: the pair (A, B) = (sum x x^T, sum g g^T); kron-true samples the labels from the
+    model, so E[g g^T] is the Fisher of the model's own distribution."""
+    kron = args.calib_mode.startswith("kron")
     grad_model = copy.deepcopy(model)
     grad_model.requires_grad_(False)
     gmods = dict(grad_model.named_modules())
@@ -277,6 +317,19 @@ def quantize_guided(model, target_linears, quantize_linear, calib_ids, device, a
             def fwd(_m, inp, out, name=name):
                 x = inp[0].detach().reshape(-1, inp[0].shape[-1]).float()
 
+                def bwd_kron(g):
+                    g = g.reshape(x.shape[0], -1).float()
+                    a, b = x.T @ x, g.T @ g
+                    if name in hess:
+                        hess[name][0].add_(a)
+                        hess[name][1].add_(b)
+                    else:
+                        hess[name] = (a, b)
+
+                if kron:
+                    out.register_hook(bwd_kron)
+                    return
+
                 def bwd(g):
                     gw = g.reshape(x.shape[0], n_groups, -1).float().pow(2).sum(-1)  # [tokens, groups]
                     xg = x.unsqueeze(0) * gw.T.sqrt().unsqueeze(-1)  # [groups, tokens, in]
@@ -295,13 +348,21 @@ def quantize_guided(model, target_linears, quantize_linear, calib_ids, device, a
         with torch.enable_grad():
             for i in range(0, calib_ids.shape[0], args.batch_size):
                 inp = calib_ids[i : i + args.batch_size].to(device=device, dtype=torch.long)
-                grad_model(input_ids=inp, labels=inp).loss.backward()
+                if args.calib_mode == "kron-true":
+                    logits = grad_model(input_ids=inp).logits.float()
+                    y = torch.distributions.Categorical(logits=logits.detach()).sample()
+                    F.cross_entropy(logits.reshape(-1, logits.shape[-1]), y.reshape(-1)).backward()
+                    del logits
+                else:
+                    grad_model(input_ids=inp, labels=inp).loss.backward()
         torch.backends.cuda.matmul.allow_tf32 = tf32
         for hk in hooks:
             hk.remove()
         torch.cuda.synchronize()
         t1 = time.time()
-        for idx, name, mod in chunk:
+        if kron:
+            quantize_many([(idx, name, mod, mod.weight.detach().float(), hess.pop(name)) for idx, name, mod in chunk])
+        for idx, name, mod in chunk if not kron else []:
             quantize_linear(idx, name, mod, mod.weight.detach().float(), hess.pop(name))
         torch.cuda.synchronize()
         print(f"  layers {c}-{c + chunk_layers - 1}: gradients+Hessians {t1 - t0:.0f}s, quantize {time.time() - t1:.0f}s", flush=True)

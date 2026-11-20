@@ -53,6 +53,8 @@ spread over all four calibration pools, RTX 3090 at 350 W):
 | :--- | :--- | :--- | :--- |
 | MS_C3 | 3.025 | 0.0336 | 89.37% |
 | MS_C3, GuidedQuant Hessians (`--calib-mode guided`) | 3.025 | 0.0295 | 90.09% |
+| MS_C3, two-sided H = E[g g^T] (x) E[x x^T], data labels (`--calib-mode kron-emp`) | 3.025 | 0.0339 | 89.88% |
+| MS_C3, the same with labels sampled from the model (`--calib-mode kron-true`) | 3.025 | 0.0327 | 89.42% |
 | MS_C4 | 4.025 | 0.0091 | 93.90% |
 | Q4_K_M (unsloth / bartowski GGUF, `--gguf`) | 4.80 | 0.0201 / 0.0185 | 91.78% / 91.82% |
 
