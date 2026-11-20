@@ -1,8 +1,10 @@
 // tests/kernels/ms_gpu_parity.cpp - MS (1MAD trellis) dense projections through the engine's native_mmvq against the
 // CPU kernels, on random trellis rows at the model's dense geometry, 1..8 columns.  The input is quantized to Q8_1 by
 // native_quantize_q8_1 on the GPU; the reference rotates the same dequantized Q8_1 values on the CPU.  Also checks that
-// the GGUF payload size of an MS tensor equals native_mmvq_weight_bytes.
+// the GGUF payload size of an MS tensor equals native_mmvq_weight_bytes, and runs the prompt path's fp16 dequantizer
+// (ms_dequant_dense_f16) on a row slice: its rows times x against the same CPU reference.
 #include "basalt/artifact/gguf_reader.hpp"
+#include "basalt/kernels/ms_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "kernels/ms_1mad_avx2.h"
 
@@ -120,6 +122,45 @@ void run(int n_in, int n_out, int ncols, uint32_t seed) {
                 basalt::ggml_type_name(type), n_out, n_in, ncols, err, mag, rel, tol, ok ? "ok" : "FAIL");
     if (!ok) ++g_fail;
 }
+// ms_dequant_dense_f16 rows [row0, row0 + rows) times a float x, against the CPU rotation + GEMV on the same x.
+template <int K>
+void run_dequant(int n_in, int n_out, int row0, int rows, uint32_t seed) {
+    const int type = 120 + K;
+    std::mt19937 rng(seed);
+    const std::vector<uint8_t> payload = random_payload(K, n_in, n_out, rng);
+    std::vector<float> x(n_in), yr(n_out);
+    std::uniform_real_distribution<float> dx(-1.0f, 1.0f);
+    for (float& v : x) v = dx(rng);
+    ref_gemv<K>(payload, x.data(), yr.data(), n_in, n_out);
+
+    cudaStream_t s;
+    CK(cudaStreamCreate(&s));
+    void* dw;
+    uint16_t* dd;
+    CK(cudaMalloc(&dw, payload.size()));
+    CK(cudaMalloc(&dd, (size_t) rows * n_in * 2));
+    CK(cudaMemcpy(dw, payload.data(), payload.size(), cudaMemcpyHostToDevice));
+    gpu::ms_dequant_dense_f16(type, dw, n_in, n_out, row0, rows, dd, s);
+    CK(cudaStreamSynchronize(s));
+    std::vector<uint16_t> w((size_t) rows * n_in);
+    CK(cudaMemcpy(w.data(), dd, w.size() * 2, cudaMemcpyDeviceToHost));
+    CK(cudaFree(dw));
+    CK(cudaFree(dd));
+    CK(cudaStreamDestroy(s));
+
+    double err = 0, mag = 0;
+    for (int r = 0; r < rows; ++r) {
+        double y = 0;
+        for (int c = 0; c < n_in; ++c) y += (double) ms::fp16_to_fp32(w[(size_t) r * n_in + c]) * x[c];
+        err = std::max(err, std::fabs(y - yr[row0 + r]));
+        mag = std::max(mag, (double) std::fabs(yr[row0 + r]));
+    }
+    const double rel = err / (mag + 1e-30), tol = 1e-3;   // the weights rounded to fp16
+    const bool ok = rel <= tol;
+    std::printf("  %s %5dx%-5d rows %d+%d dequant f16  max err %.2e of max |y| %.2e  (rel %.1e, tol %.0e) %s\n",
+                basalt::ggml_type_name(type), n_out, n_in, row0, rows, err, mag, rel, tol, ok ? "ok" : "FAIL");
+    if (!ok) ++g_fail;
+}
 }  // namespace
 
 int main() {
@@ -135,6 +176,10 @@ int main() {
     run<4>(2560, 640, 3, 5);     // shared-expert gate / up
     run<4>(640, 2560, 1, 6);     // shared-expert down: Hadamard block 128
     run<3>(2560, 640, 4, 7);
+    run_dequant<6>(2560, 4096, 0, 4096, 8);
+    run_dequant<6>(6144, 2560, 1000, 700, 9);   // a row slice of a wide input
+    run_dequant<4>(640, 2560, 17, 300, 10);     // Hadamard block 128
+    run_dequant<3>(2560, 640, 0, 640, 11);
     std::printf(g_fail ? "ms_gpu_parity: %d FAILED\n" : "ms_gpu_parity: all ok\n", g_fail);
     return g_fail ? 1 : 0;
 }

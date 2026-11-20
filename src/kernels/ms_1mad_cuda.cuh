@@ -20,6 +20,13 @@ __host__ __device__ inline size_t ms_row_bytes(int in_features, int k) {
     return (4u + static_cast<size_t>(((in_features - 1) * k + 7) / 8) + 3u) & ~size_t{3};
 }
 
+// Largest power-of-two divisor of n, at most 512: the Hadamard block of an n-wide input.
+__host__ __device__ inline int ms_hadamard_block(int n) {
+    int b = 1;
+    while (b < 512 && n % (2 * b) == 0) b *= 2;
+    return b;
+}
+
 __device__ __forceinline__ float decode_1mad_dp4a(uint32_t state) {
     uint32_t x = state * kMadMul + kMadAdd;
     int32_t sum;
@@ -55,6 +62,19 @@ struct MsQ81 {  // ggml block_q8_1
     int8_t qs[32];
 };
 
+// In-place block Hadamard (unnormalized) of n values in shared memory, by the whole block.
+__device__ __forceinline__ void ms_fwht_smem(float* s, int n, int had_block) {
+    for (int h = 1, lg = 0; h < had_block; h <<= 1, ++lg) {
+        for (int p = threadIdx.x; p < n / 2; p += blockDim.x) {
+            const int lo = ((p >> lg) << (lg + 1)) | (p & (h - 1));
+            const float a = s[lo], b = s[lo + h];
+            s[lo] = a + b;
+            s[lo + h] = a - b;
+        }
+        __syncthreads();
+    }
+}
+
 // x_rot = H(signs * dequant(x_q8)) in shared memory, H the block Hadamard without its 1/sqrt(had_block).
 // Blocks of 32..512 values: one warp per Hadamard block, lane l holding values l + 32*i (i < had_block/32);
 // butterflies of distance >= 32 inside a lane in registers, shorter ones across lanes by shuffles (the stages
@@ -69,15 +89,7 @@ __device__ __forceinline__ void ms_stage_q8_rotated(
     if (had_block < 32) {
         for (int i = threadIdx.x; i < n; i += blockDim.x) s_x[i] = load(i);
         __syncthreads();
-        for (int h = 1, lg = 0; h < had_block; h <<= 1, ++lg) {
-            for (int p = threadIdx.x; p < n / 2; p += blockDim.x) {
-                const int lo = ((p >> lg) << (lg + 1)) | (p & (h - 1));
-                const float a = s_x[lo], b = s_x[lo + h];
-                s_x[lo] = a + b;
-                s_x[lo + h] = a - b;
-            }
-            __syncthreads();
-        }
+        ms_fwht_smem(s_x, n, had_block);
         return;
     }
     const int lane = threadIdx.x & 31;
@@ -220,6 +232,58 @@ __global__ void ms_1mad_gemv_fast_kernel(const MsGemvGroup group, int out_featur
     }
 }
 
+// One row of W = W_rot * H * diag(signs) per block: decode the row's states, block Hadamard, signs and scale.
+// Shared memory: the row as a big-endian bit stream (stride_words + 1 words), then in_features floats.
+template <int K, typename OutT>
+__global__ void ms_dequant_rows_kernel(const uint8_t* __restrict__ payload, int row0, int out_features, int in_features,
+                                       int had_block, OutT* __restrict__ out) {
+    extern __shared__ uint32_t s_dq[];
+    const int stride_words = static_cast<int>(ms_row_bytes(in_features, K) >> 2);
+    uint32_t* s_w = s_dq;
+    float* s_v = reinterpret_cast<float*>(s_dq + stride_words + 1);
+    const int row = row0 + blockIdx.x;
+    const uint32_t* g = reinterpret_cast<const uint32_t*>(payload) + static_cast<size_t>(row) * stride_words;
+    const uint32_t hdr = __ldg(g);
+    for (int w = threadIdx.x; w <= stride_words; w += blockDim.x) {
+        s_w[w] = w == 0 ? (hdr >> 16) & kStateMask : w < stride_words ? __byte_perm(__ldg(g + w), 0, 0x0123) : 0u;
+    }
+    __syncthreads();
+    for (int c = threadIdx.x; c < in_features; c += blockDim.x) {
+        const int bit = c * K + 18;
+        s_v[c] = decode_1mad_dp4a(__funnelshift_l(s_w[(bit >> 5) + 1], s_w[bit >> 5], bit & 31) >> 18);
+    }
+    __syncthreads();
+    ms_fwht_smem(s_v, in_features, had_block);
+    const float scale = __half2float(__ushort_as_half(static_cast<unsigned short>(hdr & 0xFFFFu))) *
+                        rsqrtf(static_cast<float>(had_block));
+    const int8_t* signs = reinterpret_cast<const int8_t*>(
+        payload + static_cast<size_t>(out_features) * ms_row_bytes(in_features, K));
+    OutT* o = out + static_cast<size_t>(blockIdx.x) * in_features;
+    for (int c = threadIdx.x; c < in_features; c += blockDim.x) {
+        const float v = s_v[c] * scale * static_cast<float>(__ldg(signs + c));
+        if constexpr (sizeof(OutT) == 4) o[c] = v;
+        else o[c] = __float2half_rn(v);
+    }
+}
+
+// Rows [row0, row0 + rows) of an MS payload's W (n_out x n_in, the input rotation undone) into out[rows][n_in].
+template <int K, typename OutT>
+inline cudaError_t launch_ms_dequant_rows(const uint8_t* payload, int row0, int rows, int out_features,
+                                          int in_features, OutT* out, cudaStream_t stream) {
+    if (in_features < 4 || in_features % 4 || row0 < 0 || rows <= 0 || row0 + rows > out_features) {
+        return cudaErrorInvalidValue;
+    }
+    const size_t smem = (ms_row_bytes(in_features, K) / 4 + 1) * 4 + static_cast<size_t>(in_features) * 4;
+    if (smem > 48u * 1024u) {
+        const cudaError_t err = cudaFuncSetAttribute(ms_dequant_rows_kernel<K, OutT>,
+                                                     cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
+        if (err != cudaSuccess) return err;
+    }
+    ms_dequant_rows_kernel<K, OutT><<<rows, 256, smem, stream>>>(payload, row0, out_features, in_features,
+                                                              ms_hadamard_block(in_features), out);
+    return cudaGetLastError();
+}
+
 template <int BLOCK_SIZE>
 __global__ void fwht_rotate_input_kernel(
     const float* __restrict__ x,
@@ -245,13 +309,6 @@ __global__ void fwht_rotate_input_kernel(
     }
 
     y[base + tid] = smem[tid] * rsqrtf(static_cast<float>(BLOCK_SIZE));
-}
-
-// Largest power-of-two divisor of n, at most 512: the Hadamard block of an n-wide input.
-__host__ __device__ inline int ms_hadamard_block(int n) {
-    int b = 1;
-    while (b < 512 && n % (2 * b) == 0) b *= 2;
-    return b;
 }
 
 // n same-shape GEMVs in launches of up to kMaxGroup. Pointer arrays are host memory.
