@@ -93,6 +93,14 @@ class Reference(unittest.TestCase):
             Hy4Flash().template("{{ messages }}")
         self.assertEqual(suffix_of(pack_template()), PACK_SUFFIX)
 
+    def test_max_falls_back_to_high_where_the_template_has_no_max(self):
+        d = Hy4Flash()
+        d.template(OFFICIAL)
+        self.assertEqual(d.effort_level("max"), "max")
+        d.template(OFFICIAL.replace("['max', 'high', 'no_think']", "['no_think', 'high']"))
+        self.assertEqual(d.effort_level("max"), "high")
+        self.assertEqual(d.effort_level("low"), "high")
+
 
 class Controls(unittest.TestCase):
     """The API's reasoning and thinking controls as the template's `reasoning_effort` and `preserved_thinking`."""

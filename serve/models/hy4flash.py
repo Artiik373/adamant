@@ -231,6 +231,7 @@ class Hy4Flash(Dialect):
 
     def __init__(self, suffix: str = OFFICIAL_SUFFIX):
         self.tags = Tags(suffix)
+        self.has_max = True             # the template takes `max` (some quants' templates allow only no_think/high)
         self._tokens()
 
     def _tokens(self) -> None:
@@ -241,10 +242,10 @@ class Hy4Flash(Dialect):
 
     def effort_level(self, level):
         """The frontend's level as the template takes it: `no_think` is the thinking switch's, `max` is its own, and
-        every other level is `high`."""
+        every other level is `high`; `max` too when the pack's template has no `max`."""
         if isinstance(level, int):
             raise ValueError(f"unknown reasoning effort {level!r}: use none, low, medium, high or max")
-        return "max" if level == "max" else "high"
+        return "max" if level == "max" and self.has_max else "high"
 
     def template_kwargs(self, kwargs):
         out = dict(kwargs)
@@ -256,6 +257,8 @@ class Hy4Flash(Dialect):
 
     def template(self, source):
         self.tags = Tags(suffix_of(source))
+        allowed = re.search(r"reasoning_effort not in \[([^\]]*)\]", source)
+        self.has_max = allowed is None or "'max'" in allowed.group(1) or '"max"' in allowed.group(1)
         self._tokens()
         return frontend.ChatTemplate(source)
 
