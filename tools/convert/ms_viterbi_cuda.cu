@@ -45,11 +45,7 @@ __global__ void viterbi_step0_kernel(
         int ps = prev_s[r];
         int base = (ps << k) & STATE_MASK;
         int mask = ~((1 << k) - 1);
-        if ((s & mask) == base) {
-            costs_out[idx] = branch;
-        } else {
-            costs_out[idx] = INFINITY;
-        }
+        costs_out[idx] = ((s & mask) == base) ? branch : INFINITY;
         backptr0[idx] = static_cast<int16_t>(ps);
     }
 }
@@ -105,7 +101,7 @@ __global__ void viterbi_step_kernel(
     }
 }
 
-// Backtrack best path for each row in parallel (1 thread per row)
+// Coalesced 256-thread block per row: parallel argmin across 16,384 states + backtrack
 __global__ void viterbi_backtrack_kernel(
     const float* __restrict__ costs_final,  // [rc, NUM_STATES]
     const int16_t* __restrict__ backptr,    // [w_len, rc, NUM_STATES]
@@ -114,25 +110,46 @@ __global__ void viterbi_backtrack_kernel(
     int step_commit,
     int32_t* __restrict__ out_states        // [rc, step_commit]
 ) {
-    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    int r = blockIdx.x;
     if (r >= rc) return;
 
-    const float* row_c = costs_final + r * NUM_STATES;
+    int tid = threadIdx.x;
+    const float* row_c = costs_final + static_cast<size_t>(r) * NUM_STATES;
+
     float best_c = INFINITY;
-    int cur = 0;
-    for (int s = 0; s < NUM_STATES; ++s) {
+    int best_s = 0;
+    for (int s = tid; s < NUM_STATES; s += 256) {
         float c = row_c[s];
         if (c < best_c) {
             best_c = c;
-            cur = s;
+            best_s = s;
         }
     }
 
-    for (int t = w_len - 1; t >= 0; --t) {
-        if (t < step_commit) {
-            out_states[r * step_commit + t] = cur;
+    __shared__ float smem_c[256];
+    __shared__ int smem_s[256];
+    smem_c[tid] = best_c;
+    smem_s[tid] = best_s;
+    __syncthreads();
+
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (smem_c[tid + stride] < smem_c[tid]) {
+                smem_c[tid] = smem_c[tid + stride];
+                smem_s[tid] = smem_s[tid + stride];
+            }
         }
-        cur = static_cast<int>(backptr[(t * rc + r) * NUM_STATES + cur]);
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        int cur = smem_s[0];
+        for (int t = w_len - 1; t >= 0; --t) {
+            if (t < step_commit) {
+                out_states[r * step_commit + t] = cur;
+            }
+            cur = static_cast<int>(backptr[(static_cast<size_t>(t) * rc + r) * NUM_STATES + cur]);
+        }
     }
 }
 
@@ -162,7 +179,6 @@ torch::Tensor viterbi_window_cuda(
     float* c_out = costs_b.data_ptr<float>();
     int16_t* bp_base = backptr.data_ptr<int16_t>();
 
-    // t == 0
     {
         dim3 block(256);
         dim3 grid((NUM_STATES + 255) / 256, rc);
@@ -178,7 +194,6 @@ torch::Tensor viterbi_window_cuda(
         );
     }
 
-    // t == 1 .. w_len - 1
     int n_rem = 1 << (STATE_BITS - k);
     dim3 block_step(256);
     dim3 grid_step((n_rem + 255) / 256, rc);
@@ -197,8 +212,7 @@ torch::Tensor viterbi_window_cuda(
     }
 
     auto out_states = torch::empty({rc, step_commit}, torch::dtype(torch::kInt32).device(w_win.device()));
-    int bt_blocks = (rc + 63) / 64;
-    viterbi_backtrack_kernel<<<bt_blocks, 64>>>(
+    viterbi_backtrack_kernel<<<rc, 256>>>(
         c_in,
         bp_base,
         rc,
