@@ -1,14 +1,14 @@
 """Deterministic calibration pool builder for Qwen3.8-Flash-Next MS conversion.
 
 Builds a [N_seq, 512] int32 tensor (default 2,048 x 512 = 1.05M tokens, or 4,096 x 512 = 2.1M)
-mixing FineWeb-Edu, Wikipedia, GitHub code, OpenWebMath, and zero-repeat on-policy
-`<think>...</think>` trajectories, and writes a SHA-256 manifest.
+mixing FineWeb-Edu, Wikipedia, The Stack Smol (30 languages), OpenWebMath, and zero-repeat
+on-policy `<think>...</think>` trajectories, and writes a SHA-256 manifest.
 
 Usage:
   python tools/convert/build_calib_pool.py \
       --tokenizer Qwen/Qwen3.8-Flash-Next \
       --think-jsonl data/selfgen_think.jsonl \
-      --out calib_1m.pt --total-seqs 2048
+      --out calib_2m.pt --total-seqs 4096
 """
 
 from __future__ import annotations
@@ -99,7 +99,7 @@ def main() -> None:
     sources = [
         ("fineweb_edu", "HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text"),
         ("wikipedia", "wikimedia/wikipedia", "20231101.en", "train", "text"),
-        ("github_code", "codeparrot/github-code-clean", "all-all", "train", "code"),
+        ("the_stack_smol", "bigcode/the-stack-smol", None, "train", "content"),
         ("open_web_math", "open-web-math/open-web-math", None, "train", "text"),
     ]
 
