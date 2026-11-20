@@ -66,6 +66,9 @@ def tensor_memmap(path: Path, key: str) -> np.memmap:
 
 
 def load_layer(cfg, hf: Path, wmap: dict, l: int, dev) -> Qwen4ExpTextDecoderLayer:
+    # built from the config, not from_pretrained: without this the eager attention adds the boolean causal
+    # mask to the scores instead of masking, and the full-attention layers see future tokens
+    cfg._attn_implementation = "sdpa"
     with torch.device("meta"):
         layer = Qwen4ExpTextDecoderLayer(cfg, l)
     pre = f"{PRE}layers.{l}."
@@ -94,6 +97,7 @@ def load_layer(cfg, hf: Path, wmap: dict, l: int, dev) -> Qwen4ExpTextDecoderLay
 def prelude(cfg, hf: Path, wmap: dict, ids: torch.Tensor, dev, batch: int):
     """Layer-0 inputs and the per-batch layer kwargs (masks, positions, PLE ids) from the model's own forward."""
     c1 = Qwen4ExpTextConfig(**{**cfg.to_dict(), "num_hidden_layers": 2, "layer_types": cfg.layer_types[:2]})  # 2 layers keep ple_layer_ids valid
+    c1._attn_implementation = "sdpa"  # the masks the layers get are built for sdpa (see load_layer)
     with torch.device("meta"):
         model = Qwen4ExpTextModel(c1)
     k = f"{PRE}embed_tokens.weight"
