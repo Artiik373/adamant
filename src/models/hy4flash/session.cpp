@@ -74,6 +74,8 @@ constexpr uint64_t kPromptRoom = 5ull << 29;   // the prompt path's workspaces b
 constexpr int kLookupK = core::ExpertTier::kMaxK;
 constexpr int kTypeNvfp4 = 40;                 // ggml's NVFP4: blobs end in the FP32 scales {s_gate, s_up, s_down, 0}
 constexpr int kTypeBf16 = 30;
+constexpr int kTypeF32 = 0;
+constexpr int kTypeQ8_0 = 8;
 
 // One group's GPU plan for the grouped expert kernel, uploaded with a single copy.
 struct WindowPlan {
@@ -874,6 +876,10 @@ private:
     // `xq`: x already quantized for w's type, a block of arows_ rows after another (gemm_n's), else quantized here
     void gemm(const DevTensor* w, const float* x, float* y, int n_in, int n_out, int R, const uint8_t* xq = nullptr) {
         namespace mmq = basalt::prefill::mmq;
+        if (w->type == kTypeF32) {   // a matrix a pack keeps as fp32 (an indexer projection)
+            f32_gemm_rows(x, (const float*) w->ptr, n_out, n_in, 1.0f, R, y, stream_);
+            return;
+        }
         if (R > kMaxWindow && mmq::built() && mmq::fits(w->type, n_out)) {   // a chunk: the tensor-core MMQ product, arows_ rows a time
             if (loaded_.insert({w->type, n_out}).second) mmq::load(w->type, n_out);
             const size_t blk = mmq::q8_bytes(arows_, n_in);
@@ -909,7 +915,8 @@ private:
     // over the rows of the step; a window keeps the kernel that rounds like the other single-row products.
     void heads_product(const DevTensor* w, const float* x, int x_head_stride, int x_tok_stride, int H, int rows, int k, int R, float* y) {
         namespace mmq = basalt::prefill::mmq;
-        if (R > kMaxWindow && R <= arows_ && mmq::built() && mmq::fits(w->type, rows)) {
+        // a window takes the Q8_0 per-head GEMV, which reads only Q8_0; another type takes MMQ at any row count
+        if ((R > kMaxWindow || w->type != kTypeQ8_0) && R <= arows_ && mmq::built() && mmq::fits(w->type, rows)) {
             if (loaded_.insert({w->type, rows}).second) mmq::load(w->type, rows);
             // every head is an "expert" of the product with the R rows of the step: one quantisation and one launch for all heads
             head_major_ids(heads_ids_, heads_bounds_, H, R, stream_);
