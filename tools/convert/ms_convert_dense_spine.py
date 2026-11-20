@@ -4,21 +4,21 @@ Designed to pair directly with Adamant's dense-spine + lm_head .basalt decode pa
 - Quantizes all VRAM-resident dense projections (QSA, GDN, shared expert) and lm_head to MS_C6.
 - Applies GDN-2 (l % 4 == 2) Early+Late Minimax positional weighting (0.40/0.10/0.10/0.40).
 - Supports optional ridge least-squares residual refitting for attn_output / shared_expert.down_proj.
-- Computes deterministic Hadamard block_size = min(512, largest_pow2_divisor(in_features))
-  and optional row-stride alignment (e.g., 16-byte alignment for CUDA uint4 loads).
+- Computes deterministic Hadamard block_size = min(512, largest_pow2_divisor(in_features)), the engine's rule.
+- Puts the GDN value heads into the GGUF order before coding (attn_qkv / attn_gate rows, ssm_out columns), and writes
+  one engine payload per tensor (ms_pack.write_record) for ms_pack.py to place into a .basalt.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import struct
 from pathlib import Path
-from typing import Dict, Tuple
 
 import torch
 
+import model_sections as msec
 import ms_moe_converter as ms
+from ms_pack import write_record
 from ms_safetensors_stream import SafetensorsLayerLoader
 
 
@@ -47,79 +47,45 @@ def ridge_refit(
     return w_t
 
 
-def pack_per_row_aligned(
-    scales_fp16: torch.Tensor,
-    states: torch.Tensor,
-    k: int,
-    align_bytes: int = 16,
-) -> Tuple[bytes, int]:
-    """Pack per-row MS trellis with optional row-stride alignment (e.g. 16 bytes for CUDA uint4)."""
-    scales_np = scales_fp16.cpu().numpy()
-    states_np = states.cpu().numpy()
-    out_f, in_f = states_np.shape
-    sym_mask = (1 << k) - 1
-    raw_row_bytes = 4 + ((in_f - 1) * k + 7) // 8
-    stride = ((raw_row_bytes + align_bytes - 1) // align_bytes) * align_bytes
-    pad_len = stride - raw_row_bytes
-
-    buf = bytearray()
-    pad = bytes(pad_len)
-    n_sym_bytes = raw_row_bytes - 4
-    for r in range(out_f):
-        buf += struct.pack("<eH", float(scales_np[r]), int(states_np[r, 0]) & ms.STATE_MASK)
-        row_bytes = bytearray(n_sym_bytes)
-        bit_pos = 0
-        for c in range(1, in_f):
-            sym = int(states_np[r, c]) & sym_mask
-            for b in range(k - 1, -1, -1):
-                if (sym >> b) & 1:
-                    row_bytes[bit_pos >> 3] |= 1 << (7 - (bit_pos & 7))
-                bit_pos += 1
-        buf += row_bytes
-        if pad_len:
-            buf += pad
-    return bytes(buf), stride
+def to_gguf_order(gguf_name: str, w: torch.Tensor, h: torch.Tensor):
+    """W [out, in] and H [in, in] in the GGUF's value-head order: attn_qkv / attn_gate permute output rows, ssm_out
+    permutes input columns (before the rotation mixes them)."""
+    rest = gguf_name.split(".", 2)[-1]
+    if rest in ("attn_qkv.weight", "attn_gate.weight"):
+        n = int(w.shape[0])
+        first = msec.GDN_QK_ROWS if n > msec.GDN_V_HEADS * msec.GDN_HEAD else 0
+        return w[torch.as_tensor(msec.gdn_index(n, first), device=w.device)], h
+    if rest == "ssm_out.weight":
+        idx = torch.as_tensor(msec.gdn_index(int(w.shape[1]), 0), device=w.device)
+        return w[:, idx], h[idx][:, idx]
+    return w, h
 
 
 def convert_single_dense_tensor(
-    name: str,
+    gguf_name: str,
     w: torch.Tensor,
     h: torch.Tensor,
     k: int,
     seed: int,
     device: torch.device,
     out_dir: Path,
-    align_bytes: int = 16,
 ) -> dict:
-    """Rotate, LDLQ+Viterbi code, and pack one dense-spine or lm_head tensor."""
-    in_f = int(w.shape[1])
+    """Rotate, LDLQ+Viterbi code, and write one dense-spine or lm_head tensor (HF W [out, in]) as an engine record."""
+    out_f, in_f = int(w.shape[0]), int(w.shape[1])
     blk_size = largest_pow2_divisor(in_f, cap=512)
     lut = ms.build_1mad_lut(device)
 
     w_f32 = w.to(device=device, dtype=torch.float32)
     h_f32 = h.to(device=device, dtype=torch.float32)
+    w_f32, h_f32 = to_gguf_order(gguf_name, w_f32, h_f32)
     w_rot, h_rot, signs = ms.rotate_weight_and_hessian(w_f32, h_f32, block_size=blk_size, seed=seed)
     hu = ms.cholesky_inv_upper(h_rot)
 
     scales_fp16, states, _ = ms.viterbi_code_matrix(w_rot, hu, k=k, lut=lut)
-    blob, stride = pack_per_row_aligned(scales_fp16, states, k=k, align_bytes=align_bytes)
-
-    safe_name = name.replace("/", "_").replace(".", "_")
-    weight_file = f"{safe_name}.ms{k}"
-    signs_file = f"{safe_name}.signs.i8"
-    (out_dir / weight_file).write_bytes(blob)
-    (out_dir / signs_file).write_bytes(signs.to(torch.int8).cpu().numpy().tobytes())
-
-    return {
-        "tensor": name,
-        "file": weight_file,
-        "signs_file": signs_file,
-        "k": k,
-        "shape": list(w.shape),
-        "row_stride_bytes": stride,
-        "hadamard_block": blk_size,
-        "hadamard_seed": seed,
-    }
+    rows = ms.pack_per_row_ms(scales_fp16, states, k=k)
+    rec = write_record(out_dir, gguf_name, k, in_f, out_f, rows, signs.to(torch.int8).cpu().numpy())
+    rec.update({"hadamard_block": blk_size, "hadamard_seed": seed})
+    return rec
 
 
 def main() -> None:
@@ -128,7 +94,6 @@ def main() -> None:
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--layer", type=int, default=0, help="Layer index to inspect/convert (or -1 for lm_head)")
     parser.add_argument("--k", type=int, default=6)
-    parser.add_argument("--align-bytes", type=int, default=16)
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)

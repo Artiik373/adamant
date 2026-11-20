@@ -24,6 +24,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from ms_pack import ms_row_bytes
+
 
 # QTIP 1MAD constants (arXiv:2406.11235)
 MAD_MUL = 34038481
@@ -249,11 +251,6 @@ def viterbi_code_matrix(
             col += step_commit
 
     return scales_fp16, states, w_quant
-
-
-def ms_row_bytes(in_f: int, k: int) -> int:
-    """Row stride: 4-byte header plus symbols, padded to 4 bytes (matches the C++ ms_row_bytes)."""
-    return (4 + ((in_f - 1) * k + 7) // 8 + 3) & ~3
 
 
 def pack_per_row_ms(scales_fp16: torch.Tensor, states: torch.Tensor, k: int) -> bytes:
