@@ -435,6 +435,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/wait_abort.cu
                         src/kernels/cuda/iq_kernels.cu
                         src/kernels/cuda/exl3_kernels.cu
+                        src/kernels/cuda/ms_mmvq.cu
                         src/kernels/cuda/gdn_window.cu
                         src/kernels/cuda/gdn_commit.cu
                         src/kernels/cuda/gdn_prompt.cu
@@ -1745,6 +1746,12 @@ if(BUILD_TESTING)
   target_link_libraries(exl3_gpu_parity PRIVATE kernels kernels_cpu ${_gpu_runtime_target})
   basalt_gpu_test(NAME exl3_gpu_parity COMMAND exl3_gpu_parity)
   set_tests_properties(exl3_gpu_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  # MS (1MAD trellis) dense projections through native_mmvq against the CPU kernels, random rows, dense geometry
+  add_executable(ms_gpu_parity tests/kernels/ms_gpu_parity.cpp)
+  target_include_directories(ms_gpu_parity PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(ms_gpu_parity PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})
+  basalt_gpu_test(NAME ms_gpu_parity COMMAND ms_gpu_parity)
+  set_tests_properties(ms_gpu_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # IQ1_S and the limited-SwiGLU expert pairs at the engine's expert geometry, GPU and CPU tiers against a double reference
   add_executable(iq1s_parity tests/kernels/iq1s_parity.cpp)
   target_include_directories(iq1s_parity PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src)
