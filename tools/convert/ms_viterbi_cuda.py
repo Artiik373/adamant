@@ -101,13 +101,11 @@ def viterbi_code_batched_cuda(
         states[:, :, col:c_end] = committed_s.view(n_mat, out_f, n)
         w_quant[:, :, col:c_end] = committed_q
 
-        # LDLQ: sequential inside the committed block, one batched GEMM for the columns after it.
-        err = torch.empty_like(committed_q)
-        for t in range(n):
-            c_idx = col + t
-            err[:, :, t] = (w_work[:, :, c_idx] - committed_q[:, :, t]) / hu_diag[:, c_idx : c_idx + 1]
-            if t + 1 < n:
-                w_work[:, :, c_idx + 1 : c_end] -= err[:, :, t : t + 1] * hu[:, c_idx : c_idx + 1, c_idx + 1 : c_end]
+        # LDLQ: the errors e of the committed block solve e U_blk = w - q (U_blk upper triangular), then one
+        # batched GEMM feeds them to the columns after it.
+        err = torch.linalg.solve_triangular(
+            hu[:, col:c_end, col:c_end], w_work[:, :, col:c_end] - committed_q, upper=True, left=False
+        )
         if c_end < in_f:
             w_work[:, :, c_end:] -= torch.bmm(err, hu[:, col:c_end, c_end:])
 
