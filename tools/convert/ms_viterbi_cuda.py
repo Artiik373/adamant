@@ -6,6 +6,7 @@ the binary. Delivers ~50-100x speedup over Python Viterbi on RTX 3090.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -21,10 +22,13 @@ def get_viterbi_ext():
     global _EXT
     if _EXT is None:
         cu_path = Path(__file__).resolve().parent / "ms_viterbi_cuda.cu"
+        cuda_flags = ["-O3", "--use_fast_math"]
+        if os.name == "nt":
+            cuda_flags += ["-Xcompiler", "/Zc:preprocessor"]
         _EXT = load(
             name="ms_viterbi_cuda_ext",
             sources=[str(cu_path)],
-            extra_cuda_cflags=["-O3", "--use_fast_math"],
+            extra_cuda_cflags=cuda_flags,
             verbose=False,
         )
     return _EXT
