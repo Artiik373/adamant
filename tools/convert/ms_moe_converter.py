@@ -114,13 +114,14 @@ def denoise_hessian_rmt(h: torch.Tensor, n_samples: int, base_damp: float = 0.01
 
 
 def cholesky_inv_upper(h: torch.Tensor) -> torch.Tensor:
-    """Compute upper Cholesky factor Hu of H^-1 with progressive damping fallback."""
+    """Compute upper Cholesky factor Hu of H^-1 with mandatory >=1% GPTQ/QTIP damping."""
     d = h.shape[0]
     eye = torch.eye(d, device=h.device, dtype=torch.float32)
+    h = 0.5 * (h + h.T)
     mean_diag = torch.diagonal(h).mean().clamp(min=1e-8)
-    for damp in (0.0, 0.01, 0.05, 0.2):
+    for damp in (0.01, 0.05, 0.2, 0.5):
         try:
-            h_d = h + (damp * mean_diag) * eye if damp > 0 else h
+            h_d = h + (damp * mean_diag) * eye
             l_fac = torch.linalg.cholesky(h_d)
             h_inv = torch.cholesky_inverse(l_fac)
             return torch.linalg.cholesky(h_inv, upper=True)
@@ -149,13 +150,7 @@ def viterbi_code_matrix(
     commit: int = 16,
     row_chunk: int = 256,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fast GPU-batched sliding-window 14-bit Viterbi search with LDLQ error feedback.
-
-    Optimized for 24 GB GPUs (RTX 3090):
-    - Processes `row_chunk=256` rows in parallel (8x fewer Python loops).
-    - Uses `window=24, commit=16` (~2.6x fewer DP steps than 32/8).
-    - Pre-allocates index buffers and uses zero-copy expand/reshape instead of repeat_interleave.
-    """
+    """Fast GPU-batched sliding-window 14-bit Viterbi search with LDLQ error feedback."""
     out_f, in_f = w_rot.shape
     device = w_rot.device
     w_work = w_rot.clone().to(torch.float32)
@@ -167,8 +162,8 @@ def viterbi_code_matrix(
     states = torch.empty((out_f, in_f), dtype=torch.int32, device=device)
     w_quant = torch.empty((out_f, in_f), dtype=torch.float32, device=device)
 
-    v2 = (lut * lut).unsqueeze(0)  # [1, 16384]
-    lut_row = lut.unsqueeze(0)     # [1, 16384]
+    v2 = (lut * lut).unsqueeze(0)
+    lut_row = lut.unsqueeze(0)
     shift_r = STATE_BITS - k
     n_pred = 1 << k
     n_rem = 1 << shift_r
@@ -181,9 +176,9 @@ def viterbi_code_matrix(
     for r0 in range(0, out_f, row_chunk):
         r1 = min(r0 + row_chunk, out_f)
         rc = r1 - r0
-        d_c = scales[r0:r1].unsqueeze(1)   # [rc, 1]
+        d_c = scales[r0:r1].unsqueeze(1)
         d2_c = d_c * d_c
-        w_c = w_work[r0:r1]                # [rc, in_f]
+        w_c = w_work[r0:r1]
         row_idx = torch.arange(rc, device=device, dtype=torch.int64)
         backptr = torch.empty((window, rc, NUM_STATES), dtype=torch.int16, device=device)
 
@@ -216,7 +211,7 @@ def viterbi_code_matrix(
                     backptr[0] = prev_state.unsqueeze(1).expand(rc, NUM_STATES).to(torch.int16)
                 else:
                     view = costs.view(rc, n_pred, n_rem)
-                    min_cost, best_a = view.min(dim=1)  # [rc, n_rem]
+                    min_cost, best_a = view.min(dim=1)
                     best_pred = ((best_a.to(torch.int32) << shift_r) | rem_arange).to(torch.int16)
                     costs = min_cost.unsqueeze(2).expand(rc, n_rem, n_pred).reshape(rc, NUM_STATES) + branch
                     backptr[t] = best_pred.unsqueeze(2).expand(rc, n_rem, n_pred).reshape(rc, NUM_STATES)
@@ -245,14 +240,7 @@ def viterbi_code_matrix(
 
 
 def pack_per_row_ms(scales_fp16: torch.Tensor, states: torch.Tensor, k: int) -> bytes:
-    """Pack per-row MS trellis without 512-weight padding.
-
-    Row layout (little-endian):
-      fp16   d          (2 bytes)
-      uint16 s0         (2 bytes, 14-bit initial state)
-      uint8  qs[...]    ceil((in_features - 1) * k / 8) bytes, MSB-first k-bit symbols
-      zero padding      to a 4-byte row stride (ms_row_bytes)
-    """
+    """Pack per-row MS trellis without 512-weight padding."""
     scales_np = scales_fp16.cpu().numpy()
     states_np = states.cpu().numpy()
     out_f, in_f = states_np.shape
