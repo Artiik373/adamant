@@ -64,9 +64,44 @@ static void bench_shape(const char* label, int out_f, int in_f, int iters, int n
     cudaFree(d_out);
 }
 
+// The engine path: Q8_1 input, signs and block Hadamard applied inside the kernel.
+template <int K>
+static void bench_q8(const char* label, int out_f, int in_f, int iters) {
+    const size_t w_bytes = static_cast<size_t>(out_f) * ms_row_bytes(in_f, K);
+    uint8_t* d_w = nullptr;
+    void* d_x = nullptr;
+    float* d_out = nullptr;
+    cudaMalloc(&d_w, w_bytes + in_f);
+    cudaMalloc(&d_x, static_cast<size_t>(in_f / 32) * 36);
+    cudaMalloc(&d_out, out_f * sizeof(float));
+    cudaMemset(d_w, 0x5A, w_bytes);
+    cudaMemset(d_w + w_bytes, 1, in_f);
+    cudaMemset(d_x, 0, static_cast<size_t>(in_f / 32) * 36);
+    for (int i = 0; i < 10; ++i) launch_ms_1mad_gemv_q8<K>(d_w, d_x, d_out, out_f, in_f, 1, nullptr);
+    cudaDeviceSynchronize();
+    cudaEvent_t ev0, ev1;
+    cudaEventCreate(&ev0);
+    cudaEventCreate(&ev1);
+    cudaEventRecord(ev0);
+    for (int i = 0; i < iters; ++i) launch_ms_1mad_gemv_q8<K>(d_w, d_x, d_out, out_f, in_f, 1, nullptr);
+    cudaEventRecord(ev1);
+    cudaEventSynchronize(ev1);
+    float ms_total = 0.0f;
+    cudaEventElapsedTime(&ms_total, ev0, ev1);
+    std::printf("[CUDA %-14s MS_C%d %5dx%-4d q8 ] %6.1f us | %.1f GB/s\n", label, K, out_f, in_f,
+                ms_total * 1000.0 / iters, static_cast<double>(w_bytes) * iters / (ms_total * 1e6));
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
+    cudaFree(d_w);
+    cudaFree(d_x);
+    cudaFree(d_out);
+}
+
 int main() {
     bench_shape<6>("Dense spine", 2560, 2560, 500);
     bench_shape<6>("lm_head",    32768, 2560, 100);
+    bench_q8<6>("Dense spine", 2560, 2560, 500);
+    bench_q8<6>("lm_head",    32768, 2560, 100);
     bench_shape<4>("Expert gate",  640, 2560, 500);
     bench_shape<4>("Expert down", 2560,  640, 500);
     bench_shape<3>("Expert gate",  640, 2560, 500);

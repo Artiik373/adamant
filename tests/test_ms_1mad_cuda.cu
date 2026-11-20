@@ -119,6 +119,79 @@ static bool test_cuda_gemv(int out_f, int in_f, uint32_t seed, int n_experts = 1
     return max_err < 1e-3f;
 }
 
+// The engine path: Q8_1 input columns of the unrotated x, signs at the end of the payload, rotation in the kernel.
+// Reference: the CPU GEMV on fwht_rotate_input(dequant(q8)).
+template <int K>
+static bool test_cuda_gemv_q8(int out_f, int in_f, int ncols, uint32_t seed) {
+    namespace ms = adamant::kernels::ms;
+    namespace mc = adamant::kernels::ms_cuda;
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> dist_x(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> dist_d(0.001f, 0.02f);
+    std::uniform_int_distribution<uint32_t> dist_s0(0, ms::kStateMask);
+    std::uniform_int_distribution<uint32_t> dist_sym(0, (1u << K) - 1u);
+
+    const size_t stride = ms::ms_row_bytes(in_f, K);
+    std::vector<uint8_t> payload(static_cast<size_t>(out_f) * stride + in_f, 0);
+    std::vector<uint32_t> row_states(in_f);
+    for (int r = 0; r < out_f; ++r) {
+        uint32_t s = dist_s0(rng);
+        row_states[0] = s;
+        for (int c = 1; c < in_f; ++c) row_states[c] = s = ((s << K) | dist_sym(rng)) & ms::kStateMask;
+        pack_row_ref(payload.data() + static_cast<size_t>(r) * stride, dist_d(rng), row_states, K);
+    }
+    int8_t* signs = reinterpret_cast<int8_t*>(payload.data() + static_cast<size_t>(out_f) * stride);
+    for (int c = 0; c < in_f; ++c) signs[c] = (rng() & 1u) ? 1 : -1;
+
+    struct Q81 { uint16_t d, s; int8_t qs[32]; };
+    const int nb = in_f / 32;
+    std::vector<Q81> xq(static_cast<size_t>(nb) * ncols);
+    std::vector<float> cpu_out(static_cast<size_t>(out_f) * ncols);
+    std::vector<float> x_deq(in_f), x_rot(in_f);
+    const int had = mc::ms_hadamard_block(in_f);
+    for (int j = 0; j < ncols; ++j) {
+        for (int b = 0; b < nb; ++b) {
+            float v[32], amax = 0.0f;
+            for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(v[i] = dist_x(rng)));
+            const uint16_t d16 = fp32_to_fp16(amax / 127.0f);
+            const float d = ms::fp16_to_fp32(d16);
+            Q81& q = xq[static_cast<size_t>(j) * nb + b];
+            q.d = d16;
+            q.s = 0;
+            for (int i = 0; i < 32; ++i) {
+                q.qs[i] = static_cast<int8_t>(std::lrint(d > 0 ? v[i] / d : 0.0f));
+                x_deq[b * 32 + i] = d * q.qs[i];
+            }
+        }
+        ms::fwht_rotate_input(x_deq.data(), signs, x_rot.data(), in_f, had);
+        ms::ms_1mad_gemv<K>(payload.data(), x_rot.data(), cpu_out.data() + static_cast<size_t>(j) * out_f, out_f, in_f);
+    }
+
+    uint8_t* d_w = nullptr;
+    void* d_x = nullptr;
+    float* d_out = nullptr;
+    cudaMalloc(&d_w, payload.size());
+    cudaMalloc(&d_x, xq.size() * sizeof(Q81));
+    cudaMalloc(&d_out, cpu_out.size() * sizeof(float));
+    cudaMemcpy(d_w, payload.data(), payload.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_x, xq.data(), xq.size() * sizeof(Q81), cudaMemcpyHostToDevice);
+    const bool launched = mc::launch_ms_1mad_gemv_q8<K>(d_w, d_x, d_out, out_f, in_f, ncols, nullptr) == cudaSuccess &&
+                          cudaDeviceSynchronize() == cudaSuccess;
+    std::vector<float> gpu_out(cpu_out.size(), 0.0f);
+    cudaMemcpy(gpu_out.data(), d_out, gpu_out.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_w);
+    cudaFree(d_x);
+    cudaFree(d_out);
+    if (!launched) {
+        std::printf("[CUDA q8 MS_C%d %dx%d c%d] launch failed\n", K, out_f, in_f, ncols);
+        return false;
+    }
+    float max_err = 0.0f;
+    for (size_t i = 0; i < gpu_out.size(); ++i) max_err = std::max(max_err, std::fabs(gpu_out[i] - cpu_out[i]));
+    std::printf("[CUDA q8 MS_C%d %dx%d c%d had=%d] max_abs_err vs CPU = %.6g\n", K, out_f, in_f, ncols, had, max_err);
+    return max_err < 1e-3f;
+}
+
 int main() {
     bool ok = true;
     ok &= test_cuda_gemv<3>(64, 2560, 201);
@@ -135,6 +208,11 @@ int main() {
     ok &= test_cuda_gemv<4>(640, 2560, 209, 8);
     ok &= test_cuda_gemv<4>(2560, 640, 210, 8);
     ok &= test_cuda_gemv<3>(640, 2560, 211, 40);
+    ok &= test_cuda_gemv_q8<6>(2560, 2560, 1, 213);
+    ok &= test_cuda_gemv_q8<6>(4096, 2560, 3, 214);
+    ok &= test_cuda_gemv_q8<4>(2560, 640, 8, 215);
+    ok &= test_cuda_gemv_q8<3>(640, 2560, 2, 216);
+    ok &= test_cuda_gemv_q8<4>(256, 96, 1, 217);   // Hadamard block 32
     if (!ok) {
         std::fprintf(stderr, "CUDA TESTS FAILED\n");
         return 1;
