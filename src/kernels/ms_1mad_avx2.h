@@ -11,6 +11,8 @@
 #include <cmath>
 #include <cstring>
 
+#include "basalt/platform/compiler.hpp"
+
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
@@ -20,14 +22,6 @@ namespace adamant::kernels::ms {
 constexpr uint32_t kMadMul = 34038481u;
 constexpr uint32_t kMadAdd = 76625530u;
 constexpr uint32_t kStateMask = 0x3FFFu; // 14-bit state
-
-inline uint64_t bswap64_portable(uint64_t x) noexcept {
-#if defined(_MSC_VER)
-    return _byteswap_uint64(x);
-#else
-    return __builtin_bswap64(x);
-#endif
-}
 
 inline float fp16_to_fp32(uint16_t h) noexcept {
 #if defined(__F16C__) && defined(__AVX2__)
@@ -200,7 +194,7 @@ inline float ms_1mad_row_dot(
 
         uint64_t raw_le;
         std::memcpy(&raw_le, qs + byte0, 8);
-        uint64_t bits = bswap64_portable(raw_le) << bit_off;
+        uint64_t bits = basalt::platform::bswap64(raw_le) << bit_off;
 
         __m256i vs = extract_8_states_avx2<K>(bits, v_shifts, v_smask);
         __m256i vx = _mm256_add_epi32(_mm256_mullo_epi32(vs, v_mul), v_add);

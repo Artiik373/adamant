@@ -1,5 +1,5 @@
 // Standalone round-trip verification for adamant::kernels::ms (AVX2 + scalar 1MAD & FWHT).
-// Build: g++ -O3 -march=native -std=c++20 -Isrc tests/test_ms_1mad.cpp -o build/test_ms_1mad && ./build/test_ms_1mad
+// Build: g++ -O3 -march=native -std=c++20 -Isrc -Iinclude tests/test_ms_1mad.cpp -o build/test_ms_1mad && ./build/test_ms_1mad
 
 #include "kernels/ms_1mad_avx2.h"
 

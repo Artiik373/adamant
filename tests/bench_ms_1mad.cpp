@@ -1,6 +1,6 @@
 // Pre-conversion DDR5 tok/s micro-benchmark for Qwen3.8-Flash-Next MS MoE (48 layers, top-10 active).
 // Uses persistent MsCpuMoEExecutor (zero per-layer thread spawn / malloc overhead).
-// Build: g++ -O3 -march=native -std=c++20 -pthread -Isrc tests/bench_ms_1mad.cpp -o build/bench_ms_1mad
+// Build: g++ -O3 -march=native -std=c++20 -pthread -Isrc -Iinclude tests/bench_ms_1mad.cpp -o build/bench_ms_1mad
 // Run:   ./build/bench_ms_1mad [num_threads]
 
 #include "kernels/ms_moe_cpu.h"

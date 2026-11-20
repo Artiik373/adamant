@@ -31,11 +31,11 @@ uint8  qs[...]  ceil((in_features - 1) * K / 8) bytes, MSB-first K-bit symbols
 
 ```sh
 # 1. Verify AVX2 1MAD + FWHT CPU kernels
-g++ -O3 -march=native -std=c++20 -Isrc tests/test_ms_1mad.cpp -o build/test_ms_1mad
+g++ -O3 -march=native -std=c++20 -Isrc -Iinclude tests/test_ms_1mad.cpp -o build/test_ms_1mad
 ./build/test_ms_1mad
 
 # 2. Verify Ampere sm_86 CUDA 1MAD kernels against CPU reference
-nvcc -O3 -arch=sm_86 -std=c++20 -Isrc tests/test_ms_1mad_cuda.cu -o build/test_ms_1mad_cuda
+nvcc -O3 -arch=sm_86 -std=c++20 -Isrc -Iinclude tests/test_ms_1mad_cuda.cu -o build/test_ms_1mad_cuda
 ./build/test_ms_1mad_cuda
 
 # 3. Verify Python converter (Viterbi + LDLQ + RMT denoising + bit-exact packing)

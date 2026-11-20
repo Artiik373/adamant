@@ -13,9 +13,7 @@
 #include <thread>
 #include <vector>
 
-#if defined(__AVX2__) || defined(_MSC_VER)
-#include <immintrin.h>
-#endif
+#include "basalt/platform/compiler.hpp"
 
 namespace adamant::kernels::ms {
 
@@ -28,11 +26,7 @@ struct MsExpertView {
     MsQuantType    quant_type;
 };
 
-inline void cpu_pause() noexcept {
-#if defined(__AVX2__) || defined(_MSC_VER)
-    _mm_pause();
-#endif
-}
+inline void cpu_pause() noexcept { basalt::platform::cpu_relax(); }
 
 inline void run_single_ms_expert(
     const MsExpertView& ex,

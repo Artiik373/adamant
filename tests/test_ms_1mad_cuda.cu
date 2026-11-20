@@ -1,5 +1,5 @@
 // Standalone Ampere (sm_86) CUDA round-trip test for adamant::kernels::ms_cuda.
-// Build: nvcc -O3 -arch=sm_86 -std=c++20 -Isrc tests/test_ms_1mad_cuda.cu -o build/test_ms_1mad_cuda && ./build/test_ms_1mad_cuda
+// Build: nvcc -O3 -arch=sm_86 -std=c++20 -Isrc -Iinclude tests/test_ms_1mad_cuda.cu -o build/test_ms_1mad_cuda && ./build/test_ms_1mad_cuda
 
 #include "kernels/ms_1mad_avx2.h"
 #include "kernels/ms_1mad_cuda.cuh"

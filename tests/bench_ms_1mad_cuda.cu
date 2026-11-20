@@ -1,5 +1,5 @@
 // Ampere (sm_86) RTX 3090 VRAM bandwidth benchmark for MS_C6 dense spine + MS_C4 hot experts.
-// Build: nvcc -O3 -arch=sm_86 -std=c++20 -Isrc tests/bench_ms_1mad_cuda.cu -o build/bench_ms_1mad_cuda
+// Build: nvcc -O3 -arch=sm_86 -std=c++20 -Isrc -Iinclude tests/bench_ms_1mad_cuda.cu -o build/bench_ms_1mad_cuda
 // Run:   ./build/bench_ms_1mad_cuda
 
 #include "kernels/ms_1mad_cuda.cuh"
