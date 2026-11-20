@@ -1,8 +1,8 @@
 #pragma once
 
 // CUDA 1MAD bitshift-trellis GEMV and block FWHT kernels.
-// Rows are staged through shared memory and decoded with dp4a.u32.u32; reads of unaligned
-// 32-bit windows use two word loads plus a funnel shift.
+// Rows are staged through shared memory as a big-endian bit stream and decoded with
+// a funnel shift plus dp4a.u32.u32.
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -26,38 +26,11 @@ __device__ __forceinline__ float decode_1mad_dp4a(uint32_t state) {
     return __int2float_rn(sum);
 }
 
-// Fast 32-bit big-endian unaligned read from shared memory using 2 word loads + funnel shift.
-__device__ __forceinline__ uint32_t load_be32_smem(const uint32_t* __restrict__ s_u32, int byte_idx) {
-    const int w = byte_idx >> 2;
-    const int b = byte_idx & 3;
-    uint32_t lo = __byte_perm(s_u32[w], 0, 0x0123);     // bswap32(w)
-    if (b == 0) return lo;
-    uint32_t hi = __byte_perm(s_u32[w + 1], 0, 0x0123); // bswap32(w + 1)
-    return __funnelshift_l(hi, lo, b * 8);
-}
-
-template <int K>
-__device__ __forceinline__ uint32_t decode_state_smem_u32(
-    uint16_t s0,
-    const uint32_t* __restrict__ s_qs_u32,
-    int col
-) {
-    if (col == 0) return static_cast<uint32_t>(s0) & kStateMask;
-    const int start_bit = col * K;
-    if (start_bit < 14) {
-        uint32_t hi = (static_cast<uint32_t>(s0) & kStateMask) << start_bit;
-        uint32_t lo = load_be32_smem(s_qs_u32, 0) >> (32 - start_bit);
-        return (hi | lo) & kStateMask;
-    }
-    const int qs_bit = start_bit - 14;
-    const int byte_idx = qs_bit >> 3;
-    const int bit_off = qs_bit & 7;
-    uint32_t raw = load_be32_smem(s_qs_u32, byte_idx);
-    return (raw >> (32 - bit_off - 14)) & kStateMask;
-}
-
 // Grid-stride warp-per-row GEMV. x_rot is staged once per block in shared memory; each warp
 // prefetches its next row into registers while it decodes the current row from shared memory.
+// The staged row is a big-endian bit stream: word 0 holds s0 in its low 14 bits, so the state
+// of column c is the 14 bits at stream bit c*K + 18. For one lane the bit offset inside a word
+// is constant and the word index advances by K per column step.
 // Rows must be 4-byte aligned and at most kMaxRowWords words (checked by the launcher).
 constexpr int kMaxRowWords = 512;
 constexpr int kWordsPerLane = kMaxRowWords / 32;
@@ -70,7 +43,7 @@ __global__ void ms_1mad_gemv_fast_kernel(
     int out_features,
     int in_features
 ) {
-    __shared__ uint32_t smem_rows[WARPS_PER_BLOCK][kMaxRowWords];
+    __shared__ uint32_t smem_rows[WARPS_PER_BLOCK][kMaxRowWords + 1];  // +1: window read past the last word
     extern __shared__ float s_x[];
 
     for (int i = threadIdx.x; i < in_features; i += blockDim.x) s_x[i] = __ldg(x_rot + i);
@@ -96,25 +69,27 @@ __global__ void ms_1mad_gemv_fast_kernel(
     };
     fetch(row);
 
+    const int lane_bit = lane * K + 18;
+    const int bit_off = lane_bit & 31;
+
     for (; row < out_features; row += warp_stride) {
+        const uint32_t hdr = __shfl_sync(0xFFFFFFFFu, buf[0], 0);
+        const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(hdr & 0xFFFFu)));
         __syncwarp();
         #pragma unroll
         for (int j = 0; j < kWordsPerLane; ++j) {
             const int w = lane + 32 * j;
-            if (w < stride_words) s_row[w] = buf[j];
+            if (w < stride_words) s_row[w] = (w == 0) ? (hdr >> 16) & kStateMask : __byte_perm(buf[j], 0, 0x0123);
         }
         __syncwarp();
         if (row + warp_stride < out_features) fetch(row + warp_stride);
 
-        const uint32_t hdr = s_row[0];
-        const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(hdr & 0xFFFFu)));
-        const uint16_t s0 = static_cast<uint16_t>(hdr >> 16);
-        const uint32_t* s_qs_u32 = s_row + 1;
-
         float acc = 0.0f;
+        int w = lane_bit >> 5;
         #pragma unroll 4
-        for (int c = lane; c < in_features; c += 32) {
-            acc = fmaf(decode_1mad_dp4a(decode_state_smem_u32<K>(s0, s_qs_u32, c)), s_x[c], acc);
+        for (int c = lane; c < in_features; c += 32, w += K) {
+            const uint32_t state = __funnelshift_l(s_row[w + 1], s_row[w], bit_off) >> 18;
+            acc = fmaf(decode_1mad_dp4a(state), s_x[c], acc);
         }
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
