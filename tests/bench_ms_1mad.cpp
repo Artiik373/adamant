@@ -1,5 +1,5 @@
 // Pre-conversion DDR5 tok/s micro-benchmark for Qwen3.8-Flash-Next MS MoE (48 layers, top-10 active).
-// Simulates streaming 37 MS_C3 layers + 11 MS_C4 layers from DDR5 on CPU (e.g. i5-13600KF).
+// Uses persistent MsCpuMoEExecutor (zero per-layer thread spawn / malloc overhead).
 // Build: g++ -O3 -march=native -std=c++20 -pthread -Isrc tests/bench_ms_1mad.cpp -o build/bench_ms_1mad
 // Run:   ./build/bench_ms_1mad [num_threads]
 
@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <random>
+#include <tuple>
 #include <vector>
 
 using namespace adamant::kernels::ms;
@@ -18,12 +18,12 @@ int main(int argc, char** argv) {
     constexpr int kHidden = 2560;
     constexpr int kInter  = 640;
     constexpr int kActive = 10;
-    constexpr int kPool   = 32; // distinct experts in DDR5 to defeat L3 cache reuse
+    constexpr int kPool   = 32;
     constexpr int kLayersC3 = 37;
     constexpr int kLayersC4 = 11;
     constexpr int kIters = 10;
 
-    int threads = (argc > 1) ? std::atoi(argv[1]) : 0;
+    int threads = (argc > 1) ? std::atoi(argv[1]) : 10;
     if (threads <= 0) threads = static_cast<int>(std::thread::hardware_concurrency());
 
     auto alloc_pool = [&](int k_bits) {
@@ -50,16 +50,18 @@ int main(int argc, char** argv) {
                         pool_c4.data() + off4 + 2 * g4, down_signs.data(), 0.1f, MsQuantType::MS_C4};
     }
 
+    MsCpuMoEExecutor exec(threads, kHidden, kInter, kActive);
+
     // Warmup
-    run_ms_moe_layer_cpu(active_c3.data(), kActive, x_in.data(), in_signs.data(), y_out.data(), kHidden, kInter, 512, 128, threads);
+    exec.run_layer(active_c3.data(), kActive, x_in.data(), in_signs.data(), y_out.data());
 
     auto t0 = std::chrono::steady_clock::now();
     for (int it = 0; it < kIters; ++it) {
         for (int l = 0; l < kLayersC3; ++l) {
-            run_ms_moe_layer_cpu(active_c3.data(), kActive, x_in.data(), in_signs.data(), y_out.data(), kHidden, kInter, 512, 128, threads);
+            exec.run_layer(active_c3.data(), kActive, x_in.data(), in_signs.data(), y_out.data());
         }
         for (int l = 0; l < kLayersC4; ++l) {
-            run_ms_moe_layer_cpu(active_c4.data(), kActive, x_in.data(), in_signs.data(), y_out.data(), kHidden, kInter, 512, 128, threads);
+            exec.run_layer(active_c4.data(), kActive, x_in.data(), in_signs.data(), y_out.data());
         }
     }
     auto t1 = std::chrono::steady_clock::now();

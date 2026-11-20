@@ -1,15 +1,17 @@
 #pragma once
 
-// Multi-threaded AVX2 MoE SwiGLU FFN dispatcher for DDR5-offloaded experts (i5-13600KF).
-// Parallelizes across the active routed experts (e.g. top-10) using std::thread
-// (or OpenMP when compiled with -fopenmp) to saturate dual-channel DDR5 bandwidth.
+// Persistent-thread-pool AVX2 MoE SwiGLU FFN dispatcher for DDR5-offloaded experts (i5-13600KF).
+// Eliminates per-layer std::thread spawn/join and heap allocation overhead (48 layers/token).
 
 #include "kernels/ms_1mad_avx2.h"
 #include "kernels/ms_dispatch.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -24,14 +26,13 @@ struct MsExpertView {
     MsQuantType    quant_type;
 };
 
-// Execute one routed expert FFN: y += router_weight * (W_down (R_down^T (silu(W_gate x_rot) * (W_up x_rot))))
 inline void run_single_ms_expert(
     const MsExpertView& ex,
-    const float* __restrict x_rot,   // already rotated with R_in^T (length = hidden_size = 2560)
-    float* __restrict scratch_gate,  // length = inter_size (640)
-    float* __restrict scratch_up,    // length = inter_size (640)
-    float* __restrict scratch_mid,   // length = inter_size (640)
-    float* __restrict scratch_out,   // length = hidden_size (2560)
+    const float* __restrict x_rot,
+    float* __restrict scratch_gate,
+    float* __restrict scratch_up,
+    float* __restrict scratch_mid,
+    float* __restrict scratch_out,
     int hidden_size,
     int inter_size,
     int down_hadamard_block
@@ -49,67 +50,125 @@ inline void run_single_ms_expert(
     dispatch_ms_cpu_gemv(ex.quant_type, ex.down_w, scratch_mid, scratch_out, hidden_size, inter_size);
 }
 
-// Parallel top-K MoE routed FFN over DDR5-resident experts.
-inline void run_ms_moe_layer_cpu(
-    const MsExpertView* experts,
-    int num_active,
-    const float* __restrict x_in,
-    const int8_t* __restrict in_signs,
-    float* __restrict y_out,
-    int hidden_size,
-    int inter_size,
-    int in_hadamard_block = 512,
-    int down_hadamard_block = 128,
-    int num_threads = 0
-) {
-    std::vector<float> x_rot(hidden_size);
-    fwht_rotate_input(x_in, in_signs, x_rot.data(), hidden_size, in_hadamard_block);
-
-    if (num_threads <= 0) {
-        num_threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+// Persistent worker pool with pre-allocated per-thread scratch buffers (zero mallocs per layer).
+class MsCpuMoEExecutor {
+public:
+    MsCpuMoEExecutor(int num_threads, int hidden_size, int inter_size, int max_active = 16)
+        : num_threads_(std::max(1, num_threads)),
+          hidden_size_(hidden_size),
+          inter_size_(inter_size),
+          x_rot_(hidden_size),
+          partial_outs_(max_active, std::vector<float>(hidden_size, 0.0f)),
+          s_gate_(num_threads_, std::vector<float>(inter_size)),
+          s_up_(num_threads_, std::vector<float>(inter_size)),
+          s_mid_(num_threads_, std::vector<float>(inter_size)) {
+        workers_.reserve(num_threads_ - 1);
+        for (int t = 1; t < num_threads_; ++t) {
+            workers_.emplace_back([this, t]() { worker_loop(t); });
+        }
     }
-    num_threads = std::min(num_threads, num_active);
 
-    std::vector<std::vector<float>> partial_outs(num_active, std::vector<float>(hidden_size, 0.0f));
+    ~MsCpuMoEExecutor() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stop_ = true;
+            ++gen_;
+        }
+        cv_.notify_all();
+        for (auto& w : workers_) w.join();
+    }
 
-    auto worker = [&](int tid) {
-        std::vector<float> s_gate(inter_size);
-        std::vector<float> s_up(inter_size);
-        std::vector<float> s_mid(inter_size);
-        for (int idx = tid; idx < num_active; idx += num_threads) {
+    void run_layer(
+        const MsExpertView* experts,
+        int num_active,
+        const float* __restrict x_in,
+        const int8_t* __restrict in_signs,
+        float* __restrict y_out,
+        int in_hadamard_block = 512,
+        int down_hadamard_block = 128
+    ) {
+        fwht_rotate_input(x_in, in_signs, x_rot_.data(), hidden_size_, in_hadamard_block);
+
+        if (num_threads_ == 1) {
+            run_slice(0, experts, num_active, down_hadamard_block);
+        } else {
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                cur_experts_ = experts;
+                cur_active_ = num_active;
+                cur_down_blk_ = down_hadamard_block;
+                remaining_.store(num_threads_ - 1, std::memory_order_release);
+                ++gen_;
+            }
+            cv_.notify_all();
+            run_slice(0, experts, num_active, down_hadamard_block);
+            while (remaining_.load(std::memory_order_acquire) > 0) {
+                std::this_thread::yield();
+            }
+        }
+
+        std::fill(y_out, y_out + hidden_size_, 0.0f);
+        for (int idx = 0; idx < num_active; ++idx) {
+            const float w = experts[idx].router_weight;
+            const float* p = partial_outs_[idx].data();
+            for (int i = 0; i < hidden_size_; ++i) {
+                y_out[i] += w * p[i];
+            }
+        }
+    }
+
+private:
+    void run_slice(int tid, const MsExpertView* experts, int num_active, int down_blk) noexcept {
+        for (int idx = tid; idx < num_active; idx += num_threads_) {
             run_single_ms_expert(
                 experts[idx],
-                x_rot.data(),
-                s_gate.data(),
-                s_up.data(),
-                s_mid.data(),
-                partial_outs[idx].data(),
-                hidden_size,
-                inter_size,
-                down_hadamard_block
+                x_rot_.data(),
+                s_gate_[tid].data(),
+                s_up_[tid].data(),
+                s_mid_[tid].data(),
+                partial_outs_[idx].data(),
+                hidden_size_,
+                inter_size_,
+                down_blk
             );
         }
-    };
-
-    if (num_threads == 1) {
-        worker(0);
-    } else {
-        std::vector<std::thread> threads;
-        threads.reserve(num_threads);
-        for (int t = 0; t < num_threads; ++t) {
-            threads.emplace_back(worker, t);
-        }
-        for (auto& th : threads) th.join();
     }
 
-    std::fill(y_out, y_out + hidden_size, 0.0f);
-    for (int idx = 0; idx < num_active; ++idx) {
-        const float w = experts[idx].router_weight;
-        const float* p = partial_outs[idx].data();
-        for (int i = 0; i < hidden_size; ++i) {
-            y_out[i] += w * p[i];
+    void worker_loop(int tid) {
+        uint64_t seen = 0;
+        while (true) {
+            std::unique_lock<std::mutex> lk(mu_);
+            cv_.wait(lk, [&]() { return gen_ != seen; });
+            seen = gen_;
+            if (stop_) return;
+            const MsExpertView* ex = cur_experts_;
+            const int n_act = cur_active_;
+            const int d_blk = cur_down_blk_;
+            lk.unlock();
+
+            run_slice(tid, ex, n_act, d_blk);
+            remaining_.fetch_sub(1, std::memory_order_release);
         }
     }
-}
+
+    int num_threads_;
+    int hidden_size_;
+    int inter_size_;
+    std::vector<float> x_rot_;
+    std::vector<std::vector<float>> partial_outs_;
+    std::vector<std::vector<float>> s_gate_;
+    std::vector<std::vector<float>> s_up_;
+    std::vector<std::vector<float>> s_mid_;
+
+    std::vector<std::thread> workers_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    uint64_t gen_ = 0;
+    bool stop_ = false;
+    const MsExpertView* cur_experts_ = nullptr;
+    int cur_active_ = 0;
+    int cur_down_blk_ = 128;
+    std::atomic<int> remaining_{0};
+};
 
 } // namespace adamant::kernels::ms
