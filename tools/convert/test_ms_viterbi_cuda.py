@@ -8,6 +8,7 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
 import torch
 
 HERE = Path(__file__).resolve().parent
@@ -50,6 +51,55 @@ class ViterbiCudaParity(unittest.TestCase):
         for i, (w, hu) in enumerate(((w0, hu0), (w1, hu1))):
             _, s1, _ = self.mv.viterbi_code_matrix_cuda(w, hu, k=4, lut=self.lut)
             self.assertTrue(torch.equal(s[i], s1))
+
+
+class PackRows(unittest.TestCase):
+    def test_matches_reference_packer(self):
+        from ms_flashnext_convert import pack_rows
+
+        g = torch.Generator().manual_seed(3)
+        for k in (3, 4, 6):
+            states = torch.randint(0, ms.NUM_STATES, (5, 64), generator=g, dtype=torch.int32)
+            scales = torch.rand(5, generator=g).to(torch.float16)
+            self.assertEqual(pack_rows(states, scales, k), ms.pack_per_row_ms(scales, states, k), f"k={k}")
+
+
+def decode_payload(rows: bytes, signs: np.ndarray, n_out: int, n_in: int, k: int, lut: torch.Tensor) -> torch.Tensor:
+    """W from MS rows as the format describes them: states from the start state and k-bit symbols, 1MAD value times the
+    row scale, then the inverse of the input rotation."""
+    from ms_convert_dense_spine import largest_pow2_divisor
+    from ms_pack import ms_row_bytes
+
+    rb = ms_row_bytes(n_in, k)
+    buf = np.frombuffer(rows, dtype=np.uint8).reshape(n_out, rb)
+    scale = torch.from_numpy(buf[:, 0:2].copy().view(np.float16).astype(np.float32)).reshape(n_out)
+    state = buf[:, 2:4].copy().view(np.uint16).astype(np.int64).reshape(n_out)
+    bits = np.unpackbits(buf[:, 4:], axis=1)[:, : (n_in - 1) * k].reshape(n_out, n_in - 1, k)
+    sym = (bits * (1 << np.arange(k - 1, -1, -1))).sum(-1)
+    states = np.empty((n_out, n_in), dtype=np.int64)
+    states[:, 0] = state & ms.STATE_MASK
+    for c in range(1, n_in):
+        states[:, c] = ((states[:, c - 1] << k) | sym[:, c - 1]) & ms.STATE_MASK
+    w_rot = lut.cpu()[torch.from_numpy(states)] * scale.unsqueeze(1)
+    blk = largest_pow2_divisor(n_in, cap=512)
+    return ms.fwht_blocks(w_rot, block_size=blk) * torch.from_numpy(signs.astype(np.float32)).unsqueeze(0)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+class ConverterPayload(unittest.TestCase):
+    def test_payload_decodes_to_coded_weights(self):
+        from ms_flashnext_convert import code
+
+        dev = torch.device("cuda")
+        lut = ms.build_1mad_lut(dev)
+        g = torch.Generator(device=dev).manual_seed(5)
+        for k, (n_out, n_in) in ((3, (16, 640)), (4, (24, 512)), (6, (8, 1024))):
+            w = torch.randn(2, n_out, n_in, device=dev, generator=g)
+            x = torch.randn(4 * n_in, n_in, device=dev, generator=g)
+            h = (x.T @ x).expand(2, n_in, n_in).contiguous()
+            for rows, signs, deq in code(w, h, k, lut, [7, 8]):
+                got = decode_payload(rows, signs, n_out, n_in, k, lut)
+                self.assertLess((got - deq.cpu()).abs().max().item(), 1e-3 * deq.abs().max().item(), f"k={k}")
 
 
 if __name__ == "__main__":
