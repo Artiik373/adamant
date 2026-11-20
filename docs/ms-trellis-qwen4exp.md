@@ -36,9 +36,9 @@ Hadamard of size `largest_pow2_divisor(n_in)`, at most 512. `n_in` must be a mul
 
 - **Decode, dense spine and head:** `native_mmvq` runs MS tensors (`src/kernels/cuda/ms_mmvq.cu`) on the shared Q8_1
   input, 1 to 8 columns. Each CTA applies the signs and the Hadamard in shared memory; long rows are decoded in chunks.
-- **Not yet:** routed experts in `.basalt` (the grouped GEMV `launch_ms_1mad_gemv_grouped` exists), the prompt path
-  (prefill, verify windows above 8 columns), CPU tiers. A prompt through an MS tensor stops with
-  `dequant: unsupported type`.
+- **Prompt:** `Gemm::native` dequantizes MS rows to fp16 with the rotation undone (`ms_dequant_dense_f16`), then
+  runs the fp16 GEMM.
+- **Not yet:** routed experts in `.basalt` (the grouped GEMV `launch_ms_1mad_gemv_grouped` exists), CPU tiers.
 
 ## Building a Pack
 
