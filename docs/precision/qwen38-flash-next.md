@@ -1,7 +1,5 @@
 # Qwen3.8-Flash-Next precision
 
-[简体中文](../zh/precision/qwen38-flash-next.md)
-
 Where Flash-Next rounds and what each rounding costs. Method and reference: [quality](quality.md). Guide:
 [Flash-Next](../models/qwen38-flash-next.md).
 
@@ -52,7 +50,7 @@ which experts sit where changes the last bits. Pin `--adapt-swaps 0 --peer-adapt
 ### Prefill
 
 Prefill is a different computation from decode: fp16 and BF16 GEMMs and int8 MMQ. The gate scores the decode path. NVFP4 prompt
-experts run integer MMQ at every chunk size ([Ada](ada.md)).
+experts run integer MMQ at every chunk size ([Ampere](ampere.md)).
 
 | Path | Format | Rounding |
 |---|---|---|

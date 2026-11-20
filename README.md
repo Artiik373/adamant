@@ -1,20 +1,12 @@
 # Adamant
 
-[简体中文](README.zh-CN.md)
+Adamant is a fork of [Basalt](https://github.com/jesdga95/basalt), itself based on Strata: a local inference engine for
+large mixture-of-experts models (**Hy4-flash**, **Qwen3.8-Flash-Next**) on NVIDIA **Ampere** (RTX 30-series, sm_86) GPUs.
+Ada Lovelace (sm_89) still builds and runs, but Ampere is the target every change is measured on.
 
-Adamant is a fork of
-[Basalt](https://github.com/jesdga95/basalt), the local inference engine for the
-**Qwen3.8-Flash-Next** mixture-of-experts model, itself based on Strata. It targets NVIDIA Ada
-Lovelace (RTX 40-series, sm_89) and Ampere (RTX 30-series, sm_86) GPUs; the Ampere port builds
-but is not yet validated.
-
-> **Status: early development.** The Ada port builds and passes its Linux test
-> suite on an RTX 4090, but numerical quality and headline performance are still
-> open gates — see [Ada execution and validation](docs/precision/ada.md). The
-> performance numbers below are development runs on one card, not the
-> maintainer's headline numbers. Expect breakage; flags, defaults and the pack
-> layout can still change. Linux and Windows platform support is retained as a
-> port requirement.
+> **Status: early development.** Expect breakage; flags, defaults and the pack layout can still change. The numbers below
+> are development runs on one card, not the maintainer's headline numbers. Open validation work is listed in
+> [Ampere execution and validation](docs/precision/ampere.md). Linux and Windows platform support is retained.
 
 Experts that do not fit in VRAM live in system RAM, and optionally on a second GPU used as a peer expert tier.
 A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compatible API.
@@ -26,9 +18,7 @@ A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compa
 ## Requirements
 
 - Linux x86-64 with AVX2 (AVX-512 is used when present), or Windows 10 1903+ x64 ([platforms](docs/platforms.md)).
-- An NVIDIA Ada Lovelace (compute capability 8.9) or Ampere (8.6) GPU with CUDA 13. Ampere is not
-  yet validated: the sm_86 build compiles, but parity, quality and performance on Ampere are still
-  to be measured.
+- An NVIDIA Ampere (compute capability 8.6) GPU with CUDA 13; Ada Lovelace (8.9) also builds.
 - CMake 3.24 or newer, GCC 13 or newer (Linux), Python 3.10 or newer, and enough system RAM for the experts that do not fit in VRAM.
 
 ## Quick start
@@ -38,15 +28,14 @@ git clone <adamant remote> && cd adamant
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j                  # bin/basalt, bin/basalt-bench, bin/basalt-probe, bin/basalt-vision
                                         # Windows: add -G Ninja to the first line, from an x64 VS 2022 prompt ([platforms](docs/platforms.md#building-on-windows))
-                                        # one model only: -DBASALT_MODELS=qwen4exp, deepseek41 or qwen35 ([building](docs/building.md#building-only-some-models))
+                                        # one model only: -DBASALT_MODELS=qwen4exp or hy4flash ([building](docs/building.md#building-only-some-models))
 pip install -r requirements.txt
 hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt --local-dir models
 ```
 
-The build targets sm_89 by default and also builds for sm_86; `-DCMAKE_CUDA_ARCHITECTURES`
-accepts `86`, `89` or `86;89`, and anything else is refused. The toolchain and test invocations
-used for the results below are in [Ada execution and validation](docs/precision/ada.md), which
-also lists what is still open on Ampere.
+The build targets sm_86 by default; `-DCMAKE_CUDA_ARCHITECTURES` accepts `86`, `89` or `86;89`, and anything else is
+refused. What the port changes against upstream and what is still open is in
+[Ampere execution and validation](docs/precision/ampere.md).
 
 The binary and file-format names stay `basalt` and `.basalt`: the packs are the
 same files Basalt reads, so a fork that renamed them would break every existing
@@ -71,46 +60,43 @@ bin/basalt serve --config basalt_config.json
 The server listens on 127.0.0.1. Every setting: [configuration](docs/configuration/index.md). More examples:
 [example configurations](docs/configuration/examples.md).
 
-## Measured on Ada
+## Measured on Ampere
 
-Development measurements, not the maintainer's headline runs: one RTX 4090 at a
-**450 W** power limit, the GSQ-RCO IQ3_S pack converted with `tools/convert`,
-int8 KV, expert cache auto — all experts held in 17.4 GiB of VRAM and 29.4 GiB of
-page-locked RAM, none read from the SSD.
+Development measurements, not the maintainer's headline runs: one RTX 3090 (24 GB) at a **304 W** power limit,
+`basalt-bench` fixtures, expert cache auto, the rest of the experts in page-locked RAM.
 
-A measured Adamant-versus-Strata development comparison across three fixtures
-and two prompt lengths is documented in [the comparison report](docs/benchmarks/strata-comparison.md).
+| Pack | Prefill 16k | Decode conv | struct | prose |
+| --- | ---: | ---: | ---: | ---: |
+| Hy4-flash AD-IQ2_S-IQ2_XXS, DFly2 drafter on | 1,377 t/s | 50 tok/s | 81 tok/s | 46 tok/s |
 
-`basalt-bench` fixtures, MTP drafter off → on: conv 115 → 190, struct 116 → 372,
-prose 116 → 169 tok/s (draft acceptance 69%, 94%, 60%). The spread is drafting
-acceptance per content, not engine speed. No accuracy-reducing option is enabled
-(`--route-tail-skip`, `--route-prior`, `--relaxed-drafting` are off).
+Draft acceptance 70%, 99.9% and 58%: the spread is drafting acceptance per content, not engine speed.
+
+On Ada (RTX 4090 at 450 W, the GSQ-RCO IQ3_S Qwen3.8-Flash-Next pack, int8 KV), MTP drafter off → on: conv 115 → 190,
+struct 116 → 372, prose 116 → 169 tok/s. An Adamant-versus-Strata comparison from those runs is in
+[the comparison report](docs/benchmarks/strata-comparison.md).
 
 ## Models
 
-| | Qwen3.8-Flash-Next |
-|---|---|
-| Packs | default `Qwen3.8-FN-NVFP4-DQ6_K`, [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) |
-| Context | default 8,192; `--max-context` sets it |
-| Drafting | MTP drafter in the pack, on; `--spec` default 8 |
-| Images | yes |
-| Guide | [guide](docs/models/qwen38-flash-next.md) |
-| Precision | [precision](docs/precision/qwen38-flash-next.md) |
+| | Hy4-flash | Qwen3.8-Flash-Next |
+|---|---|---|
+| Packs | built locally from a `hy_v4_flash` GGUF with `tools/convert/convert.py --hf-dir` ([pack](docs/models/hy4-flash/pack.md)) | [Hugging Face](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) |
+| Context | default 8,192; `--max-context` sets it | default 8,192; `--max-context` sets it |
+| Drafting | DFly2 drafter, appended with `convert.py --dfly FILE --into PACK`; `--spec` default 6 | MTP drafter in the pack, on; `--spec` default 8 |
+| Guide | [guide](docs/models/hy4-flash.md) | [guide](docs/models/qwen38-flash-next.md) |
+| Precision | | [precision](docs/precision/qwen38-flash-next.md) |
 
 All models compared, with each one's context limit, flags and cards: [models](docs/models/index.md).
 
 ## Video
 
-Qwen3.8-Flash-Next and Qwen3.8-27B read video; DeepSeek and Hy4-flash do not. A video is named like an image in a chat message, and needs
+Qwen3.8-Flash-Next reads video; Hy4-flash does not. A video is named like an image in a chat message, and needs
 `--vision` and FFmpeg on the machine. Flash-Next decodes frames on the GPU with NVDEC; the 27B decodes them on the CPU.
 How a request names a video, and the limits: [video](docs/running.md#video).
 
-On Ada the NVFP4 packs run through the integer MMQ path rather than native FP4
-tensor instructions, so their numerics differ from a Blackwell run; the IQ3_S,
-Q4_K and Q5_K formats use the same kernels. `Qwen3.8-FN-GSQ-RCO-IQ3_S` is the
-quant the measurements above used, and the recommended starting point on a
-24 GB card. A pack can be built locally from a GGUF, drafter included
-([model file](docs/model-file.md), [precision on Ada](docs/precision/ada.md)).
+On Ampere the NVFP4 packs run through the integer MMQ path rather than native FP4
+tensor instructions, so their numerics differ from a Blackwell run; the IQ and K-quant
+formats use the same kernels as upstream. A pack can be built locally from a GGUF, drafter included
+([model file](docs/model-file.md), [Ampere execution](docs/precision/ampere.md)).
 
 ## Documentation
 
@@ -118,7 +104,7 @@ quant the measurements above used, and the recommended starting point on a
   [sampling](docs/configuration/sampling.md), [image sources](docs/configuration/image-sources.md),
   [documents](docs/configuration/documents.md),
   [diagnostics](docs/configuration/diagnostics.md), [basalt-probe](docs/probe.md), [platforms](docs/platforms.md).
-- **Models:** [models](docs/models/index.md), [Flash-Next](docs/models/qwen38-flash-next.md),
+- **Models:** [models](docs/models/index.md), [Hy4-flash](docs/models/hy4-flash.md), [Flash-Next](docs/models/qwen38-flash-next.md),
   [the `.basalt` file](docs/model-file.md), [file format changes](docs/basalt-file-changelog.md).
 - **Quality:** [precision](docs/precision/index.md), [method](docs/precision/quality.md).
 - **Build and develop:** [building](docs/building.md), [adding a model](docs/adding-a-model.md), [community runs](docs/community.md),

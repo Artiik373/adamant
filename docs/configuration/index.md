@@ -1,7 +1,5 @@
 # Configuration reference
 
-[简体中文](../zh/configuration/index.md)
-
 Every setting: server options, engine flags, and the sampling fields. Effects on speed and precision: [running](../running.md),
 [precision](../precision/index.md).
 
@@ -85,7 +83,7 @@ Command line `--name`; the Where column says which config block takes it.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `gpu` | entry, `basalt`, `basalt-bench`, `basalt-probe` | `"0"`, `"0,1"`, `"auto"` | GPU 0 alone | Cards, numbered as `nvidia-smi`. The first is the main card. `auto` takes every Ada (sm_89) or Ampere (sm_86) card and makes the fastest main. [GPUs](gpus.md) |
+| `gpu` | entry, `basalt`, `basalt-bench`, `basalt-probe` | `"0"`, `"0,1"`, `"auto"` | GPU 0 alone | Cards, numbered as `nvidia-smi`. The first is the main card. `auto` takes every Ampere (sm_86) or Ada (sm_89) card and makes the fastest main. [GPUs](gpus.md) |
 | `peer-reserve-mib` | engine | MiB | 600 | VRAM the second card keeps free after its experts and prompt buffers. Raise it when the start says the peer's buffers do not fit. [GPUs](gpus.md#two-16-gb-cards) |
 
 ## Context and KV cache

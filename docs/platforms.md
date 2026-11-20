@@ -1,24 +1,16 @@
 # Platforms
 
-[简体中文](zh/platforms.md)
-
-Adamant runs natively on Linux x64 and Windows x64, on NVIDIA Ada Lovelace (sm_89) and Ampere (sm_86). Linux is where
-the engine is tested and benchmarked. CI builds both and runs the CPU tests on each. The GPU
-tests and the quality gate run on a machine with a card. The sm_86 build compiles; parity, quality
-and performance on Ampere are still to be measured.
+Adamant runs natively on Linux x64 and Windows x64, on NVIDIA Ampere (sm_86); Ada Lovelace (sm_89) still builds. CI
+builds both platforms and runs the CPU tests on each. The GPU tests and the quality gate run on a machine with a card.
 
 ## Requirements
-
-The main card is always sm_120, with one exception in the multi-GPU tier: when built with `-DPEER_ADA=ON`, a second card of sm_89 (Ada) can hold and
-compute the expert tier ([GPUs](configuration/gpus.md#an-older-peer-card)); every other path and every other
-architecture is Blackwell-only.
 
 | | Linux | Windows |
 | --- | --- | --- |
 | OS | x86-64, AVX2 (AVX-512 used when present) | Windows 10 1903+ x64 |
 | Compiler, build | GCC 13+, CMake 3.24+ | MSVC 19.44 (VS 2022), CMake 3.24+, Ninja |
 | CUDA, Python | 13, 3.10+ | 13, 3.10+ |
-| GPU | NVIDIA Ada Lovelace (sm_89) or Ampere (sm_86); optional second GPU as a peer expert tier (`gpu 0,1`) | NVIDIA Ada Lovelace (sm_89) or Ampere (sm_86); optional second GPU as a peer expert tier (`gpu 0,1`) |
+| GPU | NVIDIA Ampere (sm_86), or Ada Lovelace (sm_89); optional second GPU as a peer expert tier (`gpu 0,1`) | NVIDIA Ampere (sm_86), or Ada Lovelace (sm_89); optional second GPU as a peer expert tier (`gpu 0,1`) |
 
 ## Release archives
 
