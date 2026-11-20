@@ -33,8 +33,8 @@ __device__ __forceinline__ float decode_1mad_dp4a(uint32_t state) {
 // of column c is the 14 bits at stream bit c*K + 18. Each lane decodes 4 adjacent columns from
 // one 32-bit window (3*K + 14 <= 32); its bit offset inside a word is constant and the word index
 // advances by 4*K per step.
-// Rows must be 4-byte aligned, at most kMaxRowWords words, and in_features a multiple of 4
-// (checked by the launcher).
+// in_features must be a multiple of 4 (checked by the launcher); rows longer than kMaxRowWords
+// words are decoded in chunks.
 constexpr int kMaxRowWords = 512;
 constexpr int kWordsPerLane = kMaxRowWords / 32;
 
@@ -140,40 +140,65 @@ __global__ void ms_1mad_gemv_fast_kernel(const MsGemvGroup group, int out_featur
     int row = blockIdx.x * WARPS_PER_BLOCK + (threadIdx.x >> 5);
     if (row >= out_features) return;
 
+    // A row is decoded in chunks of kChunkSteps steps of 128 columns. A chunk starts at stream word
+    // ch * kChunkWords with the same in-word bit offsets as the row start and needs kChunkWords + 1 words.
+    constexpr int kChunkSteps = (kMaxRowWords - 1) / (4 * K);
+    constexpr int kChunkWords = kChunkSteps * 4 * K;
+    const int n_steps = (in_features + 127) / 128;
+    const int n_chunks = (n_steps + kChunkSteps - 1) / kChunkSteps;
     const int stride_words = static_cast<int>(ms_row_bytes(in_features, K) >> 2);
     const uint32_t* g_u32 = reinterpret_cast<const uint32_t*>(weights);
     uint32_t* s_row = smem_rows[threadIdx.x >> 5];
 
     uint32_t buf[kWordsPerLane];
-    auto fetch = [&](int r) {
-        const uint32_t* g = g_u32 + static_cast<size_t>(r) * stride_words;
+    auto fetch = [&](int r, int ch) {
+        const int w0 = ch * kChunkWords;
+        const uint32_t* g = g_u32 + static_cast<size_t>(r) * stride_words + w0;
         #pragma unroll
         for (int j = 0; j < kWordsPerLane; ++j) {
             const int w = lane + 32 * j;
-            if (w < stride_words) buf[j] = __ldg(g + w);
+            if (w <= kChunkWords && w0 + w < stride_words) buf[j] = __ldg(g + w);
         }
     };
-    fetch(row);
+    int ch = 0;
+    fetch(row, 0);
 
     const int lane_bit = 4 * lane * K + 18;
     const int bit_off = lane_bit & 31;
+    const int lane_steps = (in_features / 4 - lane + 31) / 32;  // steps where this lane's 4 columns exist
+    float acc = 0.0f, d = 0.0f;
 
-    for (; row < out_features; row += warp_stride) {
-        const uint32_t hdr = __shfl_sync(0xFFFFFFFFu, buf[0], 0);
-        const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(hdr & 0xFFFFu)));
+    while (row < out_features) {
+        const int w0 = ch * kChunkWords;
+        uint32_t s0_word = 0;
+        if (ch == 0) {
+            const uint32_t hdr = __shfl_sync(0xFFFFFFFFu, buf[0], 0);
+            d = __half2float(__ushort_as_half(static_cast<unsigned short>(hdr & 0xFFFFu)));
+            s0_word = (hdr >> 16) & kStateMask;
+        }
         __syncwarp();
         #pragma unroll
         for (int j = 0; j < kWordsPerLane; ++j) {
             const int w = lane + 32 * j;
-            if (w < stride_words) s_row[w] = (w == 0) ? (hdr >> 16) & kStateMask : __byte_perm(buf[j], 0, 0x0123);
+            if (w <= kChunkWords && w0 + w < stride_words) {
+                s_row[w] = (w0 + w == 0) ? s0_word : __byte_perm(buf[j], 0, 0x0123);
+            }
         }
         __syncwarp();
-        if (row + warp_stride < out_features) fetch(row + warp_stride);
 
-        float acc = 0.0f;
+        int next_row = row, next_ch = ch + 1;
+        if (next_ch == n_chunks) {
+            next_ch = 0;
+            next_row += warp_stride;
+        }
+        if (next_row < out_features) fetch(next_row, next_ch);
+
+        const int s_begin = ch * kChunkSteps;
+        const int s_end = min(min(s_begin + kChunkSteps, n_steps), lane_steps);
         int w = lane_bit >> 5;
         #pragma unroll 2
-        for (int c4 = lane; 4 * c4 < in_features; c4 += 32, w += 4 * K) {
+        for (int st = s_begin; st < s_end; ++st, w += 4 * K) {
+            const int c4 = lane + 32 * st;
             const uint32_t v = __funnelshift_l(s_row[w + 1], s_row[w], bit_off);
             const float4 x = s_x4[c4];
             acc = fmaf(decode_1mad_dp4a((v >> 18) & kStateMask), x.x, acc);
@@ -181,11 +206,17 @@ __global__ void ms_1mad_gemv_fast_kernel(const MsGemvGroup group, int out_featur
             acc = fmaf(decode_1mad_dp4a((v >> (18 - 2 * K)) & kStateMask), x.z, acc);
             acc = fmaf(decode_1mad_dp4a((v >> (18 - 3 * K)) & kStateMask), x.w, acc);
         }
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            acc += __shfl_down_sync(0xFFFFFFFFu, acc, offset);
+
+        if (next_ch == 0) {
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                acc += __shfl_down_sync(0xFFFFFFFFu, acc, offset);
+            }
+            if (lane == 0) out[row] = acc * (d * out_scale);
+            acc = 0.0f;
         }
-        if (lane == 0) out[row] = acc * (d * out_scale);
+        row = next_row;
+        ch = next_ch;
     }
 }
 
@@ -237,9 +268,8 @@ inline cudaError_t launch_ms_group(
 ) {
     constexpr int kWarpsPerBlock = 8;
     constexpr int kThreads = kWarpsPerBlock * 32;
-    const size_t row_bytes = ms_row_bytes(in_features, K);
     if (in_features < 4 || (in_features & 3) != 0 || (kQ8In && (in_features & 31) != 0) ||
-        row_bytes > kMaxRowWords * 4u || out_features <= 0 || n < 0) {
+        out_features <= 0 || n < 0) {
         return cudaErrorInvalidValue;
     }
     int dev = 0, sms = 0;
@@ -247,6 +277,13 @@ inline cudaError_t launch_ms_group(
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
     const int needed = (out_features + kWarpsPerBlock - 1) / kWarpsPerBlock;
     const int had_block = ms_hadamard_block(in_features);
+    const size_t x_bytes = static_cast<size_t>(in_features) * sizeof(float);
+    if (x_bytes > 32u * 1024u) {  // past the default dynamic shared-memory limit with the row buffers
+        const cudaError_t err = cudaFuncSetAttribute(ms_1mad_gemv_fast_kernel<K, kWarpsPerBlock, kQ8In>,
+                                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                     static_cast<int>(x_bytes));
+        if (err != cudaSuccess) return err;
+    }
     for (int base = 0; base < n; base += kMaxGroup) {
         const int count = (n - base < kMaxGroup) ? n - base : kMaxGroup;
         MsGemvGroup group{};
@@ -259,7 +296,7 @@ inline cudaError_t launch_ms_group(
         int per_matrix = (sms * 4 + count - 1) / count;
         if (per_matrix > needed) per_matrix = needed;
         ms_1mad_gemv_fast_kernel<K, kWarpsPerBlock, kQ8In>
-            <<<dim3(per_matrix, count), kThreads, in_features * sizeof(float), stream>>>(
+            <<<dim3(per_matrix, count), kThreads, x_bytes, stream>>>(
                 group, out_features, in_features, had_block);
         const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) return err;

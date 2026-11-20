@@ -116,7 +116,7 @@ static bool test_cuda_gemv(int out_f, int in_f, uint32_t seed, int n_experts = 1
         max_err = std::max(max_err, std::fabs(gpu_out[i] - cpu_out[i]));
     }
     std::printf("[CUDA MS_C%d %dx%d x%d] max_abs_err vs CPU = %.6g\n", K, out_f, in_f, n_experts, max_err);
-    return max_err < 1e-3f;
+    return max_err < 1e-3f * std::sqrt(std::max(1.0f, in_f / 2560.0f));  // fp32 sum-order error grows with width
 }
 
 // The engine path: Q8_1 input columns of the unrotated x, signs at the end of the payload, rotation in the kernel.
@@ -189,7 +189,7 @@ static bool test_cuda_gemv_q8(int out_f, int in_f, int ncols, uint32_t seed) {
     float max_err = 0.0f;
     for (size_t i = 0; i < gpu_out.size(); ++i) max_err = std::max(max_err, std::fabs(gpu_out[i] - cpu_out[i]));
     std::printf("[CUDA q8 MS_C%d %dx%d c%d had=%d] max_abs_err vs CPU = %.6g\n", K, out_f, in_f, ncols, had, max_err);
-    return max_err < 1e-3f;
+    return max_err < 1e-3f * std::sqrt(std::max(1.0f, in_f / 2560.0f));  // fp32 sum-order error grows with width
 }
 
 int main() {
@@ -213,6 +213,11 @@ int main() {
     ok &= test_cuda_gemv_q8<4>(2560, 640, 8, 215);
     ok &= test_cuda_gemv_q8<3>(640, 2560, 2, 216);
     ok &= test_cuda_gemv_q8<4>(256, 96, 1, 217);   // Hadamard block 32
+    // Rows past one shared-memory chunk: the GDN / attention output projections take 6144 inputs.
+    ok &= test_cuda_gemv<6>(64, 6144, 218);
+    ok &= test_cuda_gemv_q8<6>(2560, 6144, 2, 219);
+    ok &= test_cuda_gemv_q8<4>(512, 6144, 1, 220);
+    ok &= test_cuda_gemv_q8<3>(512, 12288, 1, 221);
     if (!ok) {
         std::fprintf(stderr, "CUDA TESTS FAILED\n");
         return 1;
