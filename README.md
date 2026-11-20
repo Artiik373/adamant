@@ -112,6 +112,7 @@ formats use the same kernels as upstream. A pack can be built locally from a GGU
 
 ## Credits
 
+- [Adamant](https://github.com/nixcat-dev/adamant): the OG Adamant (MIT).
 - [Basalt](https://github.com/jesdga95/basalt): the project Adamant forks (MIT).
 - [Strata](https://github.com/Niko1221/Strata): the project Basalt forks (MIT).
 - [Qwen](https://huggingface.co/Qwen/Qwen3.8-Flash-Next): the model. The packs are under the [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE), not Basalt's MIT license.
