@@ -42,7 +42,6 @@ __global__ void __launch_bounds__(NUM_STATES / PT) viterbi_window_kernel(
     constexpr int k = K;
     constexpr int shift_r = STATE_BITS - K;
     constexpr int n_rem = 1 << shift_r;
-    constexpr int lg_pt = PT == 16 ? 4 : 6;
     constexpr int n_sub = PT >> K;        // remainders owned per thread
     static_assert(PT >= (1 << K), "a thread must own all predecessors of its remainders");
     const int r = blockIdx.x;
@@ -73,16 +72,25 @@ __global__ void __launch_bounds__(NUM_STATES / PT) viterbi_window_kernel(
     for (int t = 1; t < w_len; ++t) {
         float* mc = min_c + (t & 1) * n_rem;
         uint8_t* bp_t = bp_row + static_cast<size_t>(t) * n_rem;
-        // m = (pred_top << (lg_pt - k)) | sub, remainder j = tid + sub * T
+        // m = pred_top * n_sub + sub, remainder j = tid + sub * T
         #pragma unroll
         for (int sub = 0; sub < n_sub; ++sub) {
-            float best = INFINITY;
-            int best_a = 0;
+            // pairwise tree over the 2^k predecessors; the right side wins only when strictly smaller, so ties
+            // keep the lowest index
+            constexpr int A = 1 << K;
+            float tv[A];
+            int ta[A];
             #pragma unroll
-            for (int m = 0; m < PT; ++m) {
-                if ((m & (n_sub - 1)) != sub) continue;
-                if (c[m] < best) { best = c[m]; best_a = m >> (lg_pt - k); }
+            for (int a = 0; a < A; ++a) { tv[a] = c[a * n_sub + sub]; ta[a] = a; }
+            #pragma unroll
+            for (int w = 1; w < A; w *= 2) {
+                #pragma unroll
+                for (int a = 0; a + w < A; a += 2 * w) {
+                    if (tv[a + w] < tv[a]) { tv[a] = tv[a + w]; ta[a] = ta[a + w]; }
+                }
             }
+            float best = tv[0];
+            int best_a = ta[0];
             int j = tid + sub * T;
             mc[j] = best;
             bp_t[j] = static_cast<uint8_t>(best_a);
