@@ -29,9 +29,11 @@ __device__ __forceinline__ float decode_1mad_dp4a(uint32_t state) {
 // Grid-stride warp-per-row GEMV. x_rot is staged once per block in shared memory; each warp
 // prefetches its next row into registers while it decodes the current row from shared memory.
 // The staged row is a big-endian bit stream: word 0 holds s0 in its low 14 bits, so the state
-// of column c is the 14 bits at stream bit c*K + 18. For one lane the bit offset inside a word
-// is constant and the word index advances by K per column step.
-// Rows must be 4-byte aligned and at most kMaxRowWords words (checked by the launcher).
+// of column c is the 14 bits at stream bit c*K + 18. Each lane decodes 4 adjacent columns from
+// one 32-bit window (3*K + 14 <= 32); its bit offset inside a word is constant and the word index
+// advances by 4*K per step.
+// Rows must be 4-byte aligned, at most kMaxRowWords words, and in_features a multiple of 4
+// (checked by the launcher).
 constexpr int kMaxRowWords = 512;
 constexpr int kWordsPerLane = kMaxRowWords / 32;
 
@@ -44,7 +46,9 @@ __global__ void ms_1mad_gemv_fast_kernel(
     int in_features
 ) {
     __shared__ uint32_t smem_rows[WARPS_PER_BLOCK][kMaxRowWords + 1];  // +1: window read past the last word
-    extern __shared__ float s_x[];
+    static_assert(K >= 1 && 3 * K + 14 <= 32, "4 states must fit one 32-bit window");
+    extern __shared__ float4 s_x4[];
+    float* s_x = reinterpret_cast<float*>(s_x4);
 
     for (int i = threadIdx.x; i < in_features; i += blockDim.x) s_x[i] = __ldg(x_rot + i);
     __syncthreads();
@@ -69,7 +73,7 @@ __global__ void ms_1mad_gemv_fast_kernel(
     };
     fetch(row);
 
-    const int lane_bit = lane * K + 18;
+    const int lane_bit = 4 * lane * K + 18;
     const int bit_off = lane_bit & 31;
 
     for (; row < out_features; row += warp_stride) {
@@ -86,10 +90,14 @@ __global__ void ms_1mad_gemv_fast_kernel(
 
         float acc = 0.0f;
         int w = lane_bit >> 5;
-        #pragma unroll 4
-        for (int c = lane; c < in_features; c += 32, w += K) {
-            const uint32_t state = __funnelshift_l(s_row[w + 1], s_row[w], bit_off) >> 18;
-            acc = fmaf(decode_1mad_dp4a(state), s_x[c], acc);
+        #pragma unroll 2
+        for (int c4 = lane; 4 * c4 < in_features; c4 += 32, w += 4 * K) {
+            const uint32_t v = __funnelshift_l(s_row[w + 1], s_row[w], bit_off);
+            const float4 x = s_x4[c4];
+            acc = fmaf(decode_1mad_dp4a((v >> 18) & kStateMask), x.x, acc);
+            acc = fmaf(decode_1mad_dp4a((v >> (18 - K)) & kStateMask), x.y, acc);
+            acc = fmaf(decode_1mad_dp4a((v >> (18 - 2 * K)) & kStateMask), x.z, acc);
+            acc = fmaf(decode_1mad_dp4a((v >> (18 - 3 * K)) & kStateMask), x.w, acc);
         }
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -138,7 +146,9 @@ inline cudaError_t launch_ms_1mad_gemv(
     constexpr int kWarpsPerBlock = 8;
     constexpr int kThreads = kWarpsPerBlock * 32;
     const size_t row_bytes = ms_row_bytes(in_features, K);
-    if ((row_bytes & 3u) != 0u || row_bytes > kMaxRowWords * 4u) return cudaErrorInvalidValue;
+    if ((row_bytes & 3u) != 0u || row_bytes > kMaxRowWords * 4u || (in_features & 3) != 0) {
+        return cudaErrorInvalidValue;
+    }
     int dev = 0, sms = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
