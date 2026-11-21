@@ -297,7 +297,8 @@ def main() -> None:
                 continue
             ref = chunk_logprobs(i, dev)
             nll -= lp.gather(1, tgt[:, None]).sum().item()
-            kld += (ref.exp() * (ref - lp)).sum().item()
+            # as the engine gate (ppl_gate.hpp): terms the base clamped to its -16 floor are left out
+            kld += torch.where(ref > -16.0, ref.exp() * (ref - lp), 0.0).sum().item()
             top1 += (ref.argmax(-1) == lp.argmax(-1)).sum().item()
             rows_n += lp.shape[0]
     if writing:
