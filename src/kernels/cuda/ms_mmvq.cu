@@ -16,72 +16,112 @@ namespace mc = adamant::kernels::ms_cuda;
 
 constexpr int kWarps = 8;
 constexpr int kMaxCols = 8;
-constexpr int kSub = 16;                     // steps of 128 columns whose loads are issued together
-constexpr size_t kSmem = 48 * 1024;          // the staged columns of a block
+constexpr int kRowWords = 512;               // a warp's staged row chunk, in 32-bit words
+constexpr int kWordsPerLane = kRowWords / 32;
+constexpr size_t kSmem = 48 * 1024 - kWarps * (kRowWords + 1) * 4;   // the staged columns: two blocks an SM
 
 // y[c][r] = W[r] . x_c for the columns [c0, c0 + nc) of blockIdx.x's chunk, a warp a row (grid-stride over rows).
-// The block stages its columns rotated, H(signs * x_c), in shared memory; a lane decodes 4 columns a step from one
-// 32-bit window of the row's big-endian stream (its bit offset is the same every step, its words advance by 4 K) and
-// takes every staged column from the same decoded values.  A column's sum has one order whatever columns ride along.
-template <int K>
+// The block stages its columns rotated, H(signs * x_c), in shared memory.  Each warp stages its row in shared memory
+// as a big-endian bit stream, prefetching the next row (or chunk of a long row) into registers while it decodes the
+// current one; a lane decodes 4 adjacent columns a step from one 32-bit window and takes every staged column from
+// the same decoded values.  A column's sum has one order whatever columns ride along.
+template <int K, int NC>
 __global__ void __launch_bounds__(kWarps * 32) ms_gemv_cols_kernel(const uint8_t* __restrict__ w,
                                                                    const mc::MsQ81* __restrict__ x,
                                                                    float* __restrict__ y, int n_in, int n_out,
-                                                                   int ncols, int cpb) {
+                                                                   int col0) {
+    __shared__ uint32_t s_rows[kWarps][kRowWords + 1];   // +1: the window reads past the last word
     extern __shared__ float4 s_x4[];
     float* s_x = reinterpret_cast<float*>(s_x4);
-    const int c0 = blockIdx.x * cpb, nc = min(cpb, ncols - c0);
+    const int c0 = col0 + blockIdx.x * NC;
     const int stride_words = (int) (mc::ms_row_bytes(n_in, K) >> 2);
     const int hb = mc::ms_hadamard_block(n_in);
     const int8_t* signs = reinterpret_cast<const int8_t*>(w + (size_t) n_out * stride_words * 4);
-    for (int j = 0; j < nc; ++j)
+    for (int j = 0; j < NC; ++j)
         mc::ms_stage_q8_rotated(s_x + j * n_in, x + (size_t) (c0 + j) * (n_in / 32), signs, n_in, hb);
     const float rs = rsqrtf((float) hb);
-    const int lane = threadIdx.x & 31, n4 = n_in / 4, steps = (n_in + 127) / 128;
-    const int lane_bit = 4 * lane * K + 18, w_lane = lane_bit >> 5, b_lane = lane_bit & 31;
-    for (int r = blockIdx.y * kWarps + (threadIdx.x >> 5); r < n_out; r += gridDim.y * kWarps) {
-        const uint32_t* g32 = reinterpret_cast<const uint32_t*>(w) + (size_t) r * stride_words;
-        const uint32_t hdr = __ldg(g32);
-        float acc[kMaxCols] = {};
-        for (int s0 = 0; s0 < steps; s0 += kSub) {
-            // lane i holds word i of each step's 4 K + 2 stream words; a lane's window is two of them
-            uint32_t lw[kSub];
-            #pragma unroll
-            for (int i = 0; i < kSub; ++i) {
-                const int wi = 4 * K * (s0 + i) + lane;
-                lw[i] = s0 + i < steps && lane < 4 * K + 2 && wi < stride_words
-                            ? (wi == 0 ? (hdr >> 16) & mc::kStateMask : __byte_perm(__ldg(g32 + wi), 0, 0x0123))
-                            : 0u;
-            }
-            #pragma unroll
-            for (int i = 0; i < kSub; ++i) {
-                const int st = s0 + i, c4 = lane + 32 * st;
-                if (st >= steps) break;
-                const uint32_t a = __shfl_sync(0xFFFFFFFFu, lw[i], w_lane);
-                const uint32_t b = __shfl_sync(0xFFFFFFFFu, lw[i], w_lane + 1);
-                if (c4 >= n4) continue;
-                const uint32_t v = __funnelshift_l(b, a, b_lane);
-                const float d0 = mc::decode_1mad_dp4a((v >> 18) & mc::kStateMask);
-                const float d1 = mc::decode_1mad_dp4a((v >> (18 - K)) & mc::kStateMask);
-                const float d2 = mc::decode_1mad_dp4a((v >> (18 - 2 * K)) & mc::kStateMask);
-                const float d3 = mc::decode_1mad_dp4a((v >> (18 - 3 * K)) & mc::kStateMask);
-                #pragma unroll
-                for (int j = 0; j < kMaxCols; ++j) {
-                    if (j < nc) {
-                        const float4 xv = s_x4[j * n4 + c4];
-                        acc[j] = fmaf(d0, xv.x, fmaf(d1, xv.y, fmaf(d2, xv.z, fmaf(d3, xv.w, acc[j]))));
-                    }
-                }
-            }
-        }
-        const float scale = __half2float(__ushort_as_half((unsigned short) (hdr & 0xFFFFu))) * rs;
+    const int lane = threadIdx.x & 31, n4 = n_in / 4;
+    const int warp_stride = gridDim.y * kWarps;
+    int row = blockIdx.y * kWarps + (threadIdx.x >> 5);
+    if (row >= n_out) return;
+
+    // a row in chunks of kChunkSteps steps of 128 columns: a chunk starts at word ch * kChunkWords with the row
+    // start's in-word bit offsets and needs kChunkWords + 1 words
+    constexpr int kChunkSteps = (kRowWords - 1) / (4 * K);
+    constexpr int kChunkWords = kChunkSteps * 4 * K;
+    const int n_steps = (n_in + 127) / 128;
+    const int n_chunks = (n_steps + kChunkSteps - 1) / kChunkSteps;
+    const uint32_t* g_u32 = reinterpret_cast<const uint32_t*>(w);
+    uint32_t* s_row = s_rows[threadIdx.x >> 5];
+    uint32_t buf[kWordsPerLane];
+    auto fetch = [&](int r, int ch) {
+        const int w0 = ch * kChunkWords;
+        const uint32_t* g = g_u32 + (size_t) r * stride_words + w0;
         #pragma unroll
-        for (int j = 0; j < kMaxCols; ++j) {
-            float s = acc[j];
-            #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xFFFFFFFFu, s, o);
-            if (lane == 0 && j < nc) y[(size_t) (c0 + j) * n_out + r] = s * scale;
+        for (int j = 0; j < kWordsPerLane; ++j) {
+            const int wi = lane + 32 * j;
+            if (wi <= kChunkWords && w0 + wi < stride_words) buf[j] = __ldg(g + wi);
         }
+    };
+    int ch = 0;
+    fetch(row, 0);
+    const int lane_bit = 4 * lane * K + 18, bit_off = lane_bit & 31;
+    const int lane_steps = (n4 - lane + 31) / 32;   // steps where this lane's 4 columns exist
+    float acc[NC] = {};
+    float d = 0.0f;
+    while (row < n_out) {
+        const int w0 = ch * kChunkWords;
+        uint32_t s0_word = 0;
+        if (ch == 0) {
+            const uint32_t hdr = __shfl_sync(0xFFFFFFFFu, buf[0], 0);
+            d = __half2float(__ushort_as_half((unsigned short) (hdr & 0xFFFFu)));
+            s0_word = (hdr >> 16) & mc::kStateMask;
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int j = 0; j < kWordsPerLane; ++j) {
+            const int wi = lane + 32 * j;
+            if (wi <= kChunkWords) {
+                s_row[wi] = w0 + wi >= stride_words ? 0u : (w0 + wi == 0) ? s0_word : __byte_perm(buf[j], 0, 0x0123);
+            }
+        }
+        __syncwarp();
+        int next_row = row, next_ch = ch + 1;
+        if (next_ch == n_chunks) {
+            next_ch = 0;
+            next_row += warp_stride;
+        }
+        if (next_row < n_out) fetch(next_row, next_ch);
+
+        const int s_begin = ch * kChunkSteps;
+        const int s_end = min(min(s_begin + kChunkSteps, n_steps), lane_steps);
+        int wl = lane_bit >> 5;
+        for (int st = s_begin; st < s_end; ++st, wl += 4 * K) {
+            const uint32_t v = __funnelshift_l(s_row[wl + 1], s_row[wl], bit_off);
+            const float d0 = mc::decode_1mad_dp4a((v >> 18) & mc::kStateMask);
+            const float d1 = mc::decode_1mad_dp4a((v >> (18 - K)) & mc::kStateMask);
+            const float d2 = mc::decode_1mad_dp4a((v >> (18 - 2 * K)) & mc::kStateMask);
+            const float d3 = mc::decode_1mad_dp4a((v >> (18 - 3 * K)) & mc::kStateMask);
+            const int c4 = lane + 32 * st;
+            #pragma unroll
+            for (int j = 0; j < NC; ++j) {
+                const float4 xv = s_x4[j * n4 + c4];
+                acc[j] = fmaf(d0, xv.x, fmaf(d1, xv.y, fmaf(d2, xv.z, fmaf(d3, xv.w, acc[j]))));
+            }
+        }
+        if (next_ch == 0) {
+            const float scale = d * rs;
+            #pragma unroll
+            for (int j = 0; j < NC; ++j) {
+                float sum = acc[j];
+                #pragma unroll
+                for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xFFFFFFFFu, sum, o);
+                if (lane == 0) y[(size_t) (c0 + j) * n_out + row] = sum * scale;
+                acc[j] = 0.0f;
+            }
+        }
+        row = next_row;
+        ch = next_ch;
     }
 }
 
@@ -95,17 +135,38 @@ int sm_count() {
     return n;
 }
 
+template <int K, int NC>
+void launch_nc(const uint8_t* w, const void* x, float* y, int n_in, int n_out, int col0, int chunks, cudaStream_t s) {
+    // the chunks of a row block are neighbours in the grid, so they read its rows from L2 while they are there
+    const int need = (n_out + kWarps - 1) / kWarps, want = sm_count() * 4 / chunks;
+    const int gy = want < 1 ? 1 : want > need ? need : want;
+    ms_gemv_cols_kernel<K, NC><<<dim3(chunks, gy), kWarps * 32, (size_t) NC * n_in * 4, s>>>(
+        w, static_cast<const mc::MsQ81*>(x), y, n_in, n_out, col0);
+}
+
+template <int K>
+void launch_n(int nc, const uint8_t* w, const void* x, float* y, int n_in, int n_out, int col0, int chunks,
+              cudaStream_t s) {
+    switch (nc) {
+    case 1: launch_nc<K, 1>(w, x, y, n_in, n_out, col0, chunks, s); break;
+    case 2: launch_nc<K, 2>(w, x, y, n_in, n_out, col0, chunks, s); break;
+    case 3: launch_nc<K, 3>(w, x, y, n_in, n_out, col0, chunks, s); break;
+    case 4: launch_nc<K, 4>(w, x, y, n_in, n_out, col0, chunks, s); break;
+    case 5: launch_nc<K, 5>(w, x, y, n_in, n_out, col0, chunks, s); break;
+    case 6: launch_nc<K, 6>(w, x, y, n_in, n_out, col0, chunks, s); break;
+    case 7: launch_nc<K, 7>(w, x, y, n_in, n_out, col0, chunks, s); break;
+    default: launch_nc<K, 8>(w, x, y, n_in, n_out, col0, chunks, s); break;
+    }
+}
+
+// whole chunks of cpb columns (as many as the staged inputs' shared memory takes), then the rest in one launch
 template <int K>
 cudaError_t launch_cols(const uint8_t* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
     const int fit = (int) (kSmem / ((size_t) n_in * 4));
     if (fit < 1) return cudaErrorInvalidValue;
-    const int cpb = fit < ncols ? fit : ncols;
-    const int chunks = (ncols + cpb - 1) / cpb;
-    // the chunks of a row block are neighbours in the grid, so they read its rows from L2 while they are there
-    const int need = (n_out + kWarps - 1) / kWarps, want = sm_count() * 4 / chunks;
-    const int gy = want < 1 ? 1 : want > need ? need : want;
-    ms_gemv_cols_kernel<K><<<dim3(chunks, gy), kWarps * 32, (size_t) cpb * n_in * 4, s>>>(
-        w, static_cast<const mc::MsQ81*>(x), y, n_in, n_out, ncols, cpb);
+    const int cpb = fit < ncols ? fit : ncols, full = ncols / cpb, rest = ncols - full * cpb;
+    launch_n<K>(cpb, w, x, y, n_in, n_out, 0, full, s);
+    if (rest > 0) launch_n<K>(rest, w, x, y, n_in, n_out, full * cpb, 1, s);
     return cudaGetLastError();
 }
 

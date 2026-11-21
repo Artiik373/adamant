@@ -71,6 +71,44 @@ __global__ void __launch_bounds__(kThreads) ms_swiglu_rot_kernel(
     }
 }
 
+// One row (its words loaded) against NE entries from c0: the entry count is a constant, so the accumulators and the
+// input loads are exactly the entries'.
+template <int K, bool GU, int STEPS, int NE>
+__device__ __forceinline__ void row_entries(const uint32_t (&wa)[STEPS], const uint32_t (&wb)[STEPS], uint32_t hdr,
+                                            float scale, const float* __restrict__ xr,
+                                            const int32_t* __restrict__ ent_dst, float* __restrict__ out, int c0,
+                                            int r, int n_out, int lane, int w_lane, int b_lane) {
+    constexpr int N_IN = 128 * STEPS;
+    const float4* xv4[NE];
+    #pragma unroll
+    for (int j = 0; j < NE; ++j)
+        xv4[j] = reinterpret_cast<const float4*>(xr + (GU ? (size_t) (c0 + j) * 2 + blockIdx.z : (size_t) (c0 + j)) * N_IN);
+    float acc[NE] = {};
+    #pragma unroll
+    for (int st = 0; st < STEPS; ++st) {
+        const int wi = w_lane + 4 * K * st;
+        const uint32_t a = wi == 0 ? (hdr >> 16) & mc::kStateMask : __byte_perm(wa[st], 0, 0x0123);
+        const uint32_t v = __funnelshift_l(__byte_perm(wb[st], 0, 0x0123), a, b_lane);
+        const float d0 = mc::decode_1mad_dp4a((v >> 18) & mc::kStateMask);
+        const float d1 = mc::decode_1mad_dp4a((v >> (18 - K)) & mc::kStateMask);
+        const float d2 = mc::decode_1mad_dp4a((v >> (18 - 2 * K)) & mc::kStateMask);
+        const float d3 = mc::decode_1mad_dp4a((v >> (18 - 3 * K)) & mc::kStateMask);
+        const int c4 = lane + 32 * st;
+        #pragma unroll
+        for (int j = 0; j < NE; ++j) {
+            const float4 xv = __ldg(xv4[j] + c4);
+            acc[j] = fmaf(d0, xv.x, fmaf(d1, xv.y, fmaf(d2, xv.z, fmaf(d3, xv.w, acc[j]))));
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < NE; ++j) {
+        float sum = acc[j];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xFFFFFFFFu, sum, o);
+        if (lane == 0) out[(GU ? (size_t) (c0 + j) : (size_t) ent_dst[c0 + j]) * n_out + r] = sum * scale;
+    }
+}
+
 // Rows of one payload for every entry of every group, a warp a row.  GU: payload z = blockIdx.z (gate, up) at offset
 // off_z, input xr[e][z], output row e of out_z; down: input xr[e], output row ent_dst[e] of out0.  A lane decodes 4
 // columns a step from one 32-bit window of the row's big-endian stream; its bit offset is the same every step and its
@@ -104,40 +142,11 @@ __global__ void __launch_bounds__(kThreads) ms_rows_kernel(
         const float scale = __half2float(__ushort_as_half((unsigned short) (hdr & 0xFFFFu))) * rs;
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
         for (int c0 = e0; c0 < e1; c0 += kNe) {
-            const int ne = min(kNe, e1 - c0);
-            const float4* xv4[kNe];
-            #pragma unroll
-            for (int j = 0; j < kNe; ++j)
-                xv4[j] = reinterpret_cast<const float4*>(
-                    xr + (GU ? ((size_t) (c0 + min(j, ne - 1)) * 2 + blockIdx.z) : (size_t) (c0 + min(j, ne - 1))) * N_IN);
-            float acc[kNe] = {};
-            #pragma unroll
-            for (int st = 0; st < STEPS; ++st) {
-                const int wi = w_lane + 4 * K * st;
-                const uint32_t a = wi == 0 ? (hdr >> 16) & mc::kStateMask : __byte_perm(wa[st], 0, 0x0123);
-                const uint32_t v = __funnelshift_l(__byte_perm(wb[st], 0, 0x0123), a, b_lane);
-                const float d0 = mc::decode_1mad_dp4a((v >> 18) & mc::kStateMask);
-                const float d1 = mc::decode_1mad_dp4a((v >> (18 - K)) & mc::kStateMask);
-                const float d2 = mc::decode_1mad_dp4a((v >> (18 - 2 * K)) & mc::kStateMask);
-                const float d3 = mc::decode_1mad_dp4a((v >> (18 - 3 * K)) & mc::kStateMask);
-                const int c4 = lane + 32 * st;
-                #pragma unroll
-                for (int j = 0; j < kNe; ++j) {
-                    if (j < ne) {
-                        const float4 xv = __ldg(xv4[j] + c4);
-                        acc[j] = fmaf(d0, xv.x, fmaf(d1, xv.y, fmaf(d2, xv.z, fmaf(d3, xv.w, acc[j]))));
-                    }
-                }
-            }
-            #pragma unroll
-            for (int j = 0; j < kNe; ++j) {
-                float s = acc[j];
-                #pragma unroll
-                for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xFFFFFFFFu, s, o);
-                if (lane == 0 && j < ne) {
-                    const size_t row = GU ? (size_t) (c0 + j) : (size_t) ent_dst[c0 + j];
-                    out[row * n_out + r] = s * scale;
-                }
+            switch (min(kNe, e1 - c0)) {   // warp-uniform
+            case 1: row_entries<K, GU, STEPS, 1>(wa, wb, hdr, scale, xr, ent_dst, out, c0, r, n_out, lane, w_lane, b_lane); break;
+            case 2: row_entries<K, GU, STEPS, 2>(wa, wb, hdr, scale, xr, ent_dst, out, c0, r, n_out, lane, w_lane, b_lane); break;
+            case 3: row_entries<K, GU, STEPS, 3>(wa, wb, hdr, scale, xr, ent_dst, out, c0, r, n_out, lane, w_lane, b_lane); break;
+            default: row_entries<K, GU, STEPS, 4>(wa, wb, hdr, scale, xr, ent_dst, out, c0, r, n_out, lane, w_lane, b_lane); break;
             }
         }
     }

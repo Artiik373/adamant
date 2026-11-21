@@ -160,9 +160,11 @@ void run_cols(int n_in, int n_out, uint32_t seed) {
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0));
     CK(cudaEventCreate(&e1));
-    double us[2];
-    for (int k = 0; k < 2; ++k) {
-        const int nc = k ? NC : 1, it = 50;
+    const double mb = (double) payload.size() / 1e6;
+    std::printf("  %s %5dx%-5d columns alone vs 8: %s; bench", basalt::ggml_type_name(type), n_out, n_in,
+                diff ? "DIFF FAIL" : "bitwise equal");
+    for (int nc : {1, 2, 3, 4, 8}) {
+        const int it = 50;
         gpu::native_mmvq(type, dw, dq, dy, n_in, n_out, nc, s);
         CK(cudaEventRecord(e0, s));
         for (int i = 0; i < it; ++i) gpu::native_mmvq(type, dw, dq, dy, n_in, n_out, nc, s);
@@ -170,12 +172,10 @@ void run_cols(int n_in, int n_out, uint32_t seed) {
         CK(cudaEventSynchronize(e1));
         float ms_ = 0;
         CK(cudaEventElapsedTime(&ms_, e0, e1));
-        us[k] = ms_ * 1e3 / it;
+        const double us = ms_ * 1e3 / it;
+        std::printf(" c%d %.1f us (%.0f GB/s)", nc, us, mb / us * 1e3);
     }
-    const double mb = (double) payload.size() / 1e6;
-    std::printf("  %s %5dx%-5d columns alone vs 8: %s; bench c1 %.1f us (%.0f GB/s), c8 %.1f us (%.0f GB/s)\n",
-                basalt::ggml_type_name(type), n_out, n_in, diff ? "DIFF FAIL" : "bitwise equal", us[0],
-                mb / us[0] * 1e3, us[1], mb / us[1] * 1e3);
+    std::printf("\n");
     if (diff) ++g_fail;
     for (void* p : {dw, dq, (void*) dx_, (void*) dy, (void*) d1}) cudaFree(p);
     CK(cudaStreamDestroy(s));
