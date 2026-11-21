@@ -27,7 +27,7 @@ build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 
 | Routed experts (NVFP4) | NVIDIA's E2M1 codes and UE4M3 scales, 4.5 bits/weight; FP32 tail `{s_gate, s_up, s_down}` | q8_1 activations, exact int32 per 16-value sub-block, fp32 scales; tails applied in fp32 |
 | Routed experts (EXL3) | QTIP trellis tiles (16x16, 3 or 3.5 bits/weight) with fp16 `suh`/`svh`, exactly as the EXL3 checkpoint stores them | CPU: with AVX-VNNI, int8 activations with one fp32 scale a 128-block, the hashed weight bytes times the activation bytes summed exactly in int32 over the block (`vpdpbusd`), fp32 across blocks; without it fp16 activations, fp32 accumulation. The int8 activations measure KLD 0.0978 against 0.0979 for fp16 (paired dKLD -0.0001, 95% CI [-0.0011, +0.0008], 100 chunks). GPU decode: q8_1 activations, on the tensor cores with the decoded weights exact in fp16 and each transformed activation as an fp16 pair (high part plus remainder), fp32 accumulation, partial sums joined in a fixed order; the dense EXL3 projections use the same arithmetic. With an EXL3 head the drafter ranks its token subset on a Q8_0 copy of the dequantized head rows; the head itself verifies every draft. In decode a layer's CPU-tier experts are split between the CPU and a PCIe copy computed on the GPU, so which of the two kernels computes an expert varies by window. Prompt: W dequantized to fp16 with both Hadamard transforms applied. Sign placement is a flag (`--exl3-variant`), not yet checked against model output |
 | Dense projections (attention, GDN qkv/z/out, QSA) | Q8_0 (or Q6_K in the NVFP4 pack; Q4_K/Q5_K/Q6_K in others) | q8_1 activations, int8 tensor-core dot, exact int32 per 32 block |
-| Dense projections and head (MS) | 1MAD bitshift trellis per row (MS_C3/C4/C6: 3, 4 or 6 bits/weight), fp16 row scale, int8 input signs; [format](../ms-trellis-qwen4exp.md) | GPU decode only: q8_1 activations dequantized to fp32, signs and block Hadamard (up to 512) in fp32, each weight decoded exactly to an integer, fp32 multiply-add per lane, fixed-order warp sum, row scale times 1/sqrt(block) last. Prompt: W dequantized to fp16 with the rotation undone (fp32 Hadamard), fp16 GEMM. No CPU path yet. Not yet measured against the BF16 reference |
+| Routed experts, dense projections and head (MS) | 1MAD bitshift trellis per row (MS_C3/C4/C6: 3, 4 or 6 bits/weight), fp16 row scale, int8 input signs; [format](../ms-trellis-qwen4exp.md) | GPU decode: q8_1 activations dequantized to fp32, signs and block Hadamard (up to 512) in fp32, each weight decoded exactly to an integer, fp32 multiply-add per lane, fixed-order warp sum, row scale times 1/sqrt(block) last; a dense column's value does not depend on the window width. The expert SwiGLU output stays fp32 into the down projection. CPU tier: fp32 activations, rotated in fp32, int8 per 128 columns, exact int32 byte dots per 128-block, fp32 across blocks. With an MS head the drafter ranks its token subset on a Q8_0 copy of the dequantized head rows. Prompt: dense W dequantized to fp16 with the rotation undone, fp16 GEMM; routed experts dequantized to Q8_0 (`quantize_row_q8_0`'s scale, nearest rounding), int8 MMQ |
 | Router, GDN alpha/beta, indexer, PLE key/value | BF16 as stored | fp32 activations and sums |
 | Hyper-connections | int8 copy, one fp16 scale per 32 inputs (`hc8`); the hc read takes fp32 activations | fp32 sums; the up product uses fp16 hi/lo mma |
 | Token embedding | GGUF type; one row dequantized to fp32 per token | fp32 |
@@ -90,6 +90,23 @@ MXFP8 projections and NVFP4 shared experts to Q6_K. Gate: 100 chunks, 400 W + 18
 QAD against NVFP4, paired: dKLD +0.0205 [+0.0175, +0.0236], dNLL -0.048 [-0.055, -0.041]. The Q6_K re-quantization is
 +0.0039 [+0.0025, +0.0053] of that KLD; the rest is the checkpoint, which the distillation made sharper on wikitext and
 further from the BF16 model. On one RTX 5090 decode is the same (355 against 357 tok/s).
+
+## MS pack
+
+The MS pack (`Qwen3.8-FN-MS-60.basalt`, [format](../ms-trellis-qwen4exp.md)) codes the routed experts MS_C4 on 36 layers and
+MS_C3 on 12, the dense spine and the head MS_C6; the n-gram table and the hyper-connections are the IQ4_XS pack's. Gate:
+100 chunks, T 3, int8 KV, one RTX 3090 at 290 W, against a local BF16 base (the BF16 checkpoint layer by layer,
+`ms_flashnext_eval.py --write-base`; wikitext-2 base PPL 3.2756, gsm8k 1.4628).
+
+| Pack | experts | wiki2 KLD | wiki2 top-1 | gsm8k KLD | gsm8k top-1 |
+| --- | --- | --- | --- | --- | --- |
+| MS (60 GB plan) | 53.2 GiB | 0.0741 | 91.13% | 0.0356 | 96.55% |
+| UD-IQ4_XS | 56.2 GiB | 0.0835 | 90.69% | 0.0402 | 96.39% |
+| EXL3 3.18 bpw | | 0.0983 | 89.72% | 0.0481 | 96.16% |
+| WV-v5 3.5 bpw | | 0.2400 | 84.15% | 0.1144 | 93.33% |
+
+The CPU tier's fp32 activations and the prompt path's Q8_0 experts against the fp16 / fp16-GEMM build before them, paired on
+wikitext: dKLD +0.0006 [-0.0009, +0.0021].
 
 ## Measured costs
 

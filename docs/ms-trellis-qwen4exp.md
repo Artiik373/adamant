@@ -35,10 +35,16 @@ Hadamard of size `largest_pow2_divisor(n_in)`, at most 512. `n_in` must be a mul
 ## Engine Support
 
 - **Decode, dense spine and head:** `native_mmvq` runs MS tensors (`src/kernels/cuda/ms_mmvq.cu`) on the shared Q8_1
-  input, 1 to 8 columns. Each CTA applies the signs and the Hadamard in shared memory; long rows are decoded in chunks.
-- **Prompt:** `Gemm::native` dequantizes MS rows to fp16 with the rotation undone (`ms_dequant_dense_f16`), then
-  runs the fp16 GEMM.
-- **Not yet:** routed experts in `.basalt` (the grouped GEMV `launch_ms_1mad_gemv_grouped` exists), CPU tiers.
+  input, 1 to 8 columns in one kernel: each row is decoded once for all columns of a chunk, and a column's sum has one
+  order whatever rides along (the verifier's requirement). The block stages its columns rotated in shared memory.
+- **Routed experts:** an expert blob is three MS payloads `[gate | up | down]`; `experts.layout` v8 with type 120 + K.
+  GPU: `native_expert_grouped` (`src/kernels/cuda/ms_experts.cu`), the input rotated once per entry. CPU tier:
+  `src/kernels/cpu/ms_expert.cpp`, fp32 activations rotated and quantized to int8 per 128 columns, AVX-VNNI byte dots.
+  With an MS head the drafter ranks its token subset on a Q8_0 copy of the dequantized head rows.
+- **Prompt:** dense MS rows are dequantized to fp16 with the rotation undone, then an fp16 GEMM. Routed experts are
+  converted to Q8_0 per gather group (`ms_experts_to_q8_0`) and run on the int8 MMQ kernels.
+- **Parity tests:** `ms_cpu_test` (CPU rows against plain C and W x in double, the whole expert), `ms_gpu_parity`
+  (dense columns bitwise alone vs 8, grouped experts, dequant layout, Q8_0 within half a step); both print bench lines.
 
 ## Converter Search
 
@@ -63,7 +69,9 @@ Windows of 24 committing 16 measured MS_C3 KLD 0.0423 against 0.0378 for 32 / 8 
 ## Building a Pack
 
 `ms_convert_dense_spine.py` codes one tensor into a record (`<name>.json` + payload) with the GDN value heads already in
-the GGUF order. `ms_pack.py` copies a base `.basalt` and replaces the recorded `gguf` tensors:
+the GGUF order; `ms_flashnext_convert.py` codes the whole model layer by layer (spine, head and routed experts, at the
+widths of a `--plan`). `ms_pack.py` copies a base `.basalt` and replaces the recorded `gguf` tensors; with an `experts/`
+folder of per-layer records it rebuilds `experts` and `experts.layout` too:
 
 ```sh
 python3 tools/convert/ms_pack.py --base models/Qwen3.8-FN-UD-IQ3_XXS.basalt --ms-dir out_ms --out models/Qwen3.8-FN-MS.basalt --verify
@@ -83,8 +91,9 @@ nvcc -O3 -arch=sm_86 -std=c++20 -Isrc -Iinclude tests/test_ms_1mad_cuda.cu -o bu
 # 3. Verify Python converter (Viterbi + LDLQ + RMT denoising + bit-exact packing)
 python3 tests/test_ms_converter.py
 
-# 4. The engine path (native_mmvq on MS types) and the pack writer
-build/Release/ms_gpu_parity        # needs -DBUILD_TESTING=ON
+# 4. The engine paths (dense, routed experts on CPU and GPU, prompt conversion) and the pack writer
+build/Release/ms_cpu_test          # needs -DBUILD_TESTING=ON
+build/Release/ms_gpu_parity
 python3 -m unittest discover -s tools/convert -p "test_ms_pack.py"
 
 # 5. Inspect the default <= 55 GB layer bit plan
