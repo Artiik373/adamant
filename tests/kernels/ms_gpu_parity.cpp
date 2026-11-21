@@ -269,7 +269,28 @@ void bench_dequant_expert() {
         CK(cudaEventSynchronize(q1));
         float qms = 0;
         CK(cudaEventElapsedTime(&qms, q0, q1));
-        std::printf("  bench %s expert to Q8_0: %.1f us an expert\n", basalt::ggml_type_name(type), qms * 10.0);
+        std::printf("  bench %s expert to Q8_0: %.1f us an expert alone", basalt::ggml_type_name(type), qms * 10.0);
+        {   // a prompt group: 16 blobs in one launch (the same blob 16 times; the timing is what counts here)
+            void *g16, *d16;
+            CK(cudaMalloc(&g16, bgu * 16));
+            CK(cudaMalloc(&d16, bd * 16));
+            const uint8_t* bl[16];
+            for (auto& p : bl) p = (const uint8_t*) db;
+            gpu::ms_experts_to_q8_0(type, bl, 16, H, FF, L.up_off, L.down_off, g16, bgu, d16, bd, s);
+            CK(cudaEventRecord(q0, s));
+            for (int i = 0; i < 20; ++i) gpu::ms_experts_to_q8_0(type, bl, 16, H, FF, L.up_off, L.down_off, g16, bgu, d16, bd, s);
+            CK(cudaEventRecord(q1, s));
+            CK(cudaEventSynchronize(q1));
+            CK(cudaEventElapsedTime(&qms, q0, q1));
+            std::vector<uint8_t> last(bgu);   // the 16th slot holds the same rows as the single conversion
+            CK(cudaMemcpy(last.data(), (uint8_t*) g16 + 15 * bgu, bgu, cudaMemcpyDeviceToHost));
+            const bool same = last == hq;
+            std::printf(", %.1f us an expert in a group of 16 (slot 16 %s)\n", qms * 1e3 / (20 * 16),
+                        same ? "bitwise equal" : "DIFF FAIL");
+            if (!same) ++g_fail;
+            cudaFree(g16);
+            cudaFree(d16);
+        }
         cudaFree(qgu);
         cudaFree(qd);
     }

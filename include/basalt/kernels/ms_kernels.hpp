@@ -25,9 +25,14 @@ void ms_dequant_expert_f16(int ggml_type, const void* blob, int64_t n_embd, int6
 
 /// One MS expert blob (device) as the prompt path's Q8_0 matrices (ggml block_q8_0, quantize_row_q8_0's rounding of the
 /// weights with the input rotation undone): gu_dst = [gate rows | up rows] (2 n_ff rows of n_embd), d_dst = down rows
-/// (n_embd rows of n_ff).  n_embd and n_ff need Hadamard blocks of 32 or more.
+/// (n_embd rows of n_ff).  The experts' geometry, 2560 x 640.
 void ms_expert_to_q8_0(int ggml_type, const void* blob, int64_t n_embd, int64_t n_ff, size_t up_off, size_t down_off,
                        void* gu_dst, void* d_dst, void* stream);
+/// The same for n (1..16) blobs in one launch each for gate/up and down: blob i's matrices at gu_dst + i * gu_stride
+/// and d_dst + i * d_stride bytes.
+void ms_experts_to_q8_0(int ggml_type, const uint8_t* const* blobs, int n, int64_t n_embd, int64_t n_ff,
+                        size_t up_off, size_t down_off, void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride,
+                        void* stream);
 
 /// Whether ms_expert_grouped covers an MS expert layer of this type and geometry.
 bool ms_expert_supported(int type, int64_t n_embd, int64_t n_ff) noexcept;

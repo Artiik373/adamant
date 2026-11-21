@@ -18,6 +18,7 @@ constexpr int kWarps = 8;
 constexpr int kMaxCols = 8;
 constexpr int kRowWords = 192;               // a warp's staged row chunk, in 32-bit words
 constexpr int kWordsPerLane = kRowWords / 32;
+constexpr int kMsGroupMax = 16;              // blobs a Q8_0 conversion launch takes
 constexpr size_t kSmem = 48 * 1024 - kWarps * (kRowWords + 1) * 4;   // the staged columns: two blocks an SM
 
 // y[c][r] = W[r] . x_c for the columns [c0, c0 + nc) of blockIdx.x's chunk, a warp a row (grid-stride over rows).
@@ -139,6 +140,81 @@ __global__ void __launch_bounds__(kWarps * 32, 4) ms_gemv_cols_kernel(const uint
     }
 }
 
+// Q8_0 rows of W = W_rot H diag(signs) for a group of MS expert blobs, a warp a row over all of them: expert e's
+// rows are its P payloads (at off[0..P)) of N_EACH rows each, written to dst + e * dst_stride bytes, row r of the
+// expert at r * (N_IN / 32) blocks.  The row is staged in shared memory as a big-endian bit stream with the warp's
+// next row in flight; each Hadamard block is decoded, transformed and quantized by the warp (a Q8_0 block of 32
+// values is one i across the 32 lanes; quantize_row_q8_0's scale, round to nearest).  One launch for a whole group, so the GPU has
+// enough rows to hide each row's latency.
+struct MsBlobs {
+    const uint8_t* blob[kMsGroupMax];
+};
+
+template <int K, int N_IN, int N_EACH, int P>
+__global__ void __launch_bounds__(kWarps * 32) ms_q80_rows_kernel(const MsBlobs g, int n_exp, size_t off0, size_t off1,
+                                                                  uint8_t* __restrict__ dst, size_t dst_stride) {
+    constexpr int kStride = (int) (((4 + ((N_IN - 1) * K + 7) / 8) + 3) & ~3) / 4;
+    constexpr int kWords = (kStride + 1 + 31) / 32;
+    constexpr int kHb = N_IN % 512 == 0 ? 512 : N_IN % 256 == 0 ? 256 : N_IN % 128 == 0 ? 128 : N_IN % 64 == 0 ? 64 : 32;
+    constexpr int kRowsExp = P * N_EACH;
+    static_assert(N_IN % 32 == 0 && kHb >= 32, "whole warps");
+    __shared__ uint32_t s_rows[kWarps][kStride + 1];
+    const int lane = threadIdx.x & 31;
+    uint32_t* s_row = s_rows[threadIdx.x >> 5];
+    const int n_rows = n_exp * kRowsExp, stride_all = gridDim.x * kWarps;
+    // the payload of row r: its expert's blob at off0 or off1
+    auto payload = [&](int r) {
+        const int lr = r % kRowsExp;
+        return g.blob[r / kRowsExp] + (P == 2 && lr >= N_EACH ? off1 : off0);
+    };
+    uint32_t buf[kWords];
+    auto fetch = [&](int r) {
+        const uint32_t* w = reinterpret_cast<const uint32_t*>(payload(r)) + (size_t) (r % kRowsExp % N_EACH) * kStride;
+        #pragma unroll
+        for (int j = 0; j < kWords; ++j) {
+            const int wi = lane + 32 * j;
+            buf[j] = wi < kStride ? __ldg(w + wi) : 0u;
+        }
+    };
+    int row = blockIdx.x * kWarps + (threadIdx.x >> 5);
+    if (row < n_rows) fetch(row);
+    const float rs = rsqrtf((float) kHb);
+    for (; row < n_rows; row += stride_all) {
+        const uint32_t hdr = __shfl_sync(0xFFFFFFFFu, buf[0], 0);
+        __syncwarp();
+        #pragma unroll
+        for (int j = 0; j < kWords; ++j) {
+            const int wi = lane + 32 * j;
+            if (wi <= kStride) s_row[wi] = wi == 0 ? (hdr >> 16) & mc::kStateMask : __byte_perm(buf[j], 0, 0x0123);
+        }
+        __syncwarp();
+        const uint8_t* p = payload(row);
+        const int8_t* signs = reinterpret_cast<const int8_t*>(p + (size_t) N_EACH * kStride * 4);
+        mc::MsQ80* o = reinterpret_cast<mc::MsQ80*>(dst + (size_t) (row / kRowsExp) * dst_stride) +
+                       (size_t) (row % kRowsExp) * (N_IN / 32);
+        if (row + stride_all < n_rows) fetch(row + stride_all);
+        const float scale = __half2float(__ushort_as_half((unsigned short) (hdr & 0xFFFFu))) * rs;
+        for (int first = 0; first < N_IN; first += kHb) {
+            mc::ms_hadamard_warp(
+                [&](int c) {
+                    const int bit = c * K + 18;
+                    return mc::decode_1mad_dp4a(__funnelshift_l(s_row[(bit >> 5) + 1], s_row[bit >> 5], bit & 31) >> 18);
+                },
+                [&](int c, float v) {
+                    v *= scale * (float) __ldg(signs + c);
+                    float amax = fabsf(v);
+                    #pragma unroll
+                    for (int m = 16; m > 0; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, m));
+                    const float d = amax * (1.0f / 127.0f), id = amax > 0.0f ? __fdividef(127.0f, amax) : 0.0f;
+                    mc::MsQ80* q = o + c / 32;
+                    q->qs[lane] = (int8_t) __float2int_rn(v * id);   // nearest (ties to even), within half a step
+                    if (lane == 0) q->d = __float2half_rn(d);
+                },
+                first, kHb);
+        }
+    }
+}
+
 int sm_count() {
     static const int n = [] {
         int dev = 0, sms = 0;
@@ -252,29 +328,43 @@ void ms_dequant_expert_f16(int ggml_type, const void* blob, int64_t n_embd, int6
     if (err != cudaSuccess) throw std::runtime_error(std::string("ms_dequant_expert_f16: ") + cudaGetErrorString(err));
 }
 
-void ms_expert_to_q8_0(int ggml_type, const void* blob, int64_t n_embd, int64_t n_ff, size_t up_off, size_t down_off,
-                       void* gu_dst, void* d_dst, void* stream) {
-    if (!basalt::ms_tensor_type((uint32_t) ggml_type) || n_embd <= 0 || n_embd % 32 || n_ff <= 0 || n_ff % 32 ||
-        blob == nullptr || gu_dst == nullptr || d_dst == nullptr)
-        throw std::invalid_argument("ms_expert_to_q8_0: unsupported type, shape or pointer");
-    const auto* b = static_cast<const uint8_t*>(blob);
-    auto* gu = static_cast<mc::MsQ80*>(gu_dst);
-    auto* d = static_cast<mc::MsQ80*>(d_dst);
+void ms_experts_to_q8_0(int ggml_type, const uint8_t* const* blobs, int n, int64_t n_embd, int64_t n_ff,
+                        size_t up_off, size_t down_off, void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride,
+                        void* stream) {
+    if (!basalt::ms_tensor_type((uint32_t) ggml_type) || n_embd != 2560 || n_ff != 640 || n < 1 || n > kMsGroupMax ||
+        blobs == nullptr || gu_dst == nullptr || d_dst == nullptr)
+        throw std::invalid_argument("ms_experts_to_q8_0: unsupported type, shape, count or pointer");
+    MsBlobs g{};
+    for (int i = 0; i < n; ++i) {
+        if (blobs[i] == nullptr) throw std::invalid_argument("ms_experts_to_q8_0: a null blob");
+        g.blob[i] = blobs[i];
+    }
     const auto s = static_cast<cudaStream_t>(stream);
-    const int ne = (int) n_embd, nf = (int) n_ff;
-    cudaError_t err = cudaSuccess;
+    auto* gu = static_cast<uint8_t*>(gu_dst);
+    auto* d = static_cast<uint8_t*>(d_dst);
+    // about four blocks an SM, fewer when the group has fewer rows than that
+    auto grid = [&](int rows) {
+        const int want = sm_count() * 4, need = (rows + kWarps - 1) / kWarps;
+        return (unsigned) (want < need ? want : need);
+    };
     auto run = [&](auto kc) {
         constexpr int K = decltype(kc)::value;
-        if (err == cudaSuccess) err = mc::launch_ms_dequant_rows<K>(b, 0, nf, nf, ne, gu, s);
-        if (err == cudaSuccess) err = mc::launch_ms_dequant_rows<K>(b + up_off, 0, nf, nf, ne, gu + (size_t) nf * (ne / 32), s);
-        if (err == cudaSuccess) err = mc::launch_ms_dequant_rows<K>(b + down_off, 0, ne, ne, nf, d, s);
+        ms_q80_rows_kernel<K, 2560, 640, 2><<<grid(n * 1280), kWarps * 32, 0, s>>>(g, n, 0, up_off, gu, gu_stride);
+        ms_q80_rows_kernel<K, 640, 2560, 1><<<grid(n * 2560), kWarps * 32, 0, s>>>(g, n, down_off, down_off, d, d_stride);
     };
     switch (basalt::ms_bits((uint32_t) ggml_type)) {
     case 3: run(std::integral_constant<int, 3>{}); break;
     case 4: run(std::integral_constant<int, 4>{}); break;
     default: run(std::integral_constant<int, 6>{}); break;
     }
-    if (err != cudaSuccess) throw std::runtime_error(std::string("ms_expert_to_q8_0: ") + cudaGetErrorString(err));
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) throw std::runtime_error(std::string("ms_experts_to_q8_0: ") + cudaGetErrorString(err));
+}
+
+void ms_expert_to_q8_0(int ggml_type, const void* blob, int64_t n_embd, int64_t n_ff, size_t up_off, size_t down_off,
+                       void* gu_dst, void* d_dst, void* stream) {
+    const uint8_t* b = static_cast<const uint8_t*>(blob);
+    ms_experts_to_q8_0(ggml_type, &b, 1, n_embd, n_ff, up_off, down_off, gu_dst, 0, d_dst, 0, stream);
 }
 
 }  // namespace basalt::kernels

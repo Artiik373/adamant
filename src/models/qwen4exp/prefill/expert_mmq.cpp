@@ -48,7 +48,11 @@ void Prefill::Run::Chunk::Experts::Group::flush() {
     for (int i = 0; i < gg_nslots; ++i)
         cudaStreamWaitEvent(m.cs, m.copied[gg_slots[i]], 0);
     float* sc = f.tail ? grp_scales(m.grp_d) : nullptr;
-    if (!mmq::gather_native_group(gg, f.up_off, mmq_gb, f.down_off, mmq_db, m.grp_gu, mmq_gub,
+    if (f.ms_k) {   // MS: the group's Q8_0 slots from the trellis, one launch
+        basalt::kernels::ms_experts_to_q8_0(f.gu_type, gg.blob + gg.first, gg.n - gg.first, f.n_embd, f.n_ff, f.up_off,
+                                            f.down_off, m.grp_gu + gg.first * mmq_gub, mmq_gub,
+                                            m.grp_d + gg.first * mmq_db, mmq_db, m.cs);
+    } else if (!mmq::gather_native_group(gg, f.up_off, mmq_gb, f.down_off, mmq_db, m.grp_gu, mmq_gub,
                                   m.grp_d, mmq_db, m.cs, sc ? f.bytes - f.tail : 0, sc, mmq_ub)) {
         for (int i = gg.first; i < gg.n; ++i) {   // not 16-byte aligned: one at a time
             const uint8_t* b = gg.blob[i];

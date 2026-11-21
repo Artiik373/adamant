@@ -217,7 +217,7 @@ struct Prefill::Run::Chunk::Experts::Group {
     // wait and a record per expert would put a GPU bubble each on the compute stream.  The same bytes into the same group slots.  A ring
     // entry the routing skipped inside an open group first gathers what the group holds so far
     // (`flush`), so no more than a group's entries are ever held back from the issuer.
-    const bool group_gather = stream_all && use_mmq && lay.native && !experts.ms_l &&
+    const bool group_gather = stream_all && use_mmq && lay.native &&
                               MMQ_GROUP <= mmq::kGatherGroupMax;
     mmq::GatherGroup gg;
     int gg_slots[MMQ_GROUP];
