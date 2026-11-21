@@ -436,6 +436,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/iq_kernels.cu
                         src/kernels/cuda/exl3_kernels.cu
                         src/kernels/cuda/ms_mmvq.cu
+                        src/kernels/cuda/ms_experts.cu
                         src/kernels/cuda/gdn_window.cu
                         src/kernels/cuda/gdn_commit.cu
                         src/kernels/cuda/gdn_prompt.cu

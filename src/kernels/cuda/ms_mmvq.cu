@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace basalt::kernels {
 
@@ -45,6 +46,32 @@ void ms_dequant_dense_f16(int ggml_type, const void* weights, int64_t k, int64_t
     default: err = mc::launch_ms_dequant_rows<6>(w, r0, nr, no, ni, o, s); break;
     }
     if (err != cudaSuccess) throw std::runtime_error(std::string("ms_dequant_dense_f16: ") + cudaGetErrorString(err));
+}
+
+void ms_dequant_expert_f16(int ggml_type, const void* blob, int64_t n_embd, int64_t n_ff, size_t up_off,
+                           size_t down_off, uint16_t* dq_gu, uint16_t* dq_d, void* stream) {
+    if (!basalt::ms_tensor_type((uint32_t) ggml_type) || n_embd <= 0 || n_embd % 32 || n_ff <= 0 || n_ff % 32 ||
+        blob == nullptr || dq_gu == nullptr || dq_d == nullptr || stream == nullptr)
+        throw std::invalid_argument("ms_dequant_expert_f16: unsupported type, shape or pointer");
+    namespace mc = adamant::kernels::ms_cuda;
+    const auto* b = static_cast<const uint8_t*>(blob);
+    auto* gu = reinterpret_cast<__half*>(dq_gu);
+    auto* d = reinterpret_cast<__half*>(dq_d);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const int ne = (int) n_embd, nf = (int) n_ff;
+    cudaError_t err = cudaSuccess;
+    auto run = [&](auto kc) {
+        constexpr int K = decltype(kc)::value;
+        if (err == cudaSuccess) err = mc::launch_ms_dequant_rows<K>(b, 0, nf, nf, ne, gu, s, 2 * ne);
+        if (err == cudaSuccess) err = mc::launch_ms_dequant_rows<K>(b + up_off, 0, nf, nf, ne, gu + ne, s, 2 * ne);
+        if (err == cudaSuccess) err = mc::launch_ms_dequant_rows<K>(b + down_off, 0, ne, ne, nf, d, s);
+    };
+    switch (basalt::ms_bits((uint32_t) ggml_type)) {
+    case 3: run(std::integral_constant<int, 3>{}); break;
+    case 4: run(std::integral_constant<int, 4>{}); break;
+    default: run(std::integral_constant<int, 6>{}); break;
+    }
+    if (err != cudaSuccess) throw std::runtime_error(std::string("ms_dequant_expert_f16: ") + cudaGetErrorString(err));
 }
 
 }  // namespace basalt::kernels

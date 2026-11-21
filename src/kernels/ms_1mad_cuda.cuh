@@ -75,17 +75,12 @@ __device__ __forceinline__ void ms_fwht_smem(float* s, int n, int had_block) {
     }
 }
 
-// x_rot = H(signs * dequant(x_q8)) in shared memory, H the block Hadamard without its 1/sqrt(had_block).
+// s_x = H(load(i)) in shared memory, H the block Hadamard without its 1/sqrt(had_block); load(i) is the signed input.
 // Blocks of 32..512 values: one warp per Hadamard block, lane l holding values l + 32*i (i < had_block/32);
 // butterflies of distance >= 32 inside a lane in registers, shorter ones across lanes by shuffles (the stages
 // commute). Smaller blocks use a shared-memory loop.
-__device__ __forceinline__ void ms_stage_q8_rotated(
-    float* s_x, const MsQ81* __restrict__ xq, const int8_t* __restrict__ signs, int n, int had_block
-) {
-    auto load = [&](int i) {
-        const MsQ81& b = xq[i >> 5];
-        return __half2float(b.d) * static_cast<float>(b.qs[i & 31]) * static_cast<float>(__ldg(signs + i));
-    };
+template <typename Load>
+__device__ __forceinline__ void ms_stage_rotated(float* s_x, Load load, int n, int had_block) {
     if (had_block < 32) {
         for (int i = threadIdx.x; i < n; i += blockDim.x) s_x[i] = load(i);
         __syncthreads();
@@ -125,6 +120,16 @@ __device__ __forceinline__ void ms_stage_q8_rotated(
         for (int i = 0; i < 16; ++i) if (i < v) s_x[base + 32 * i] = r[i];
     }
     __syncthreads();
+}
+
+// x_rot = H(signs * dequant(x_q8)) in shared memory.
+__device__ __forceinline__ void ms_stage_q8_rotated(
+    float* s_x, const MsQ81* __restrict__ xq, const int8_t* __restrict__ signs, int n, int had_block
+) {
+    ms_stage_rotated(s_x, [&](int i) {
+        const MsQ81& b = xq[i >> 5];
+        return __half2float(b.d) * static_cast<float>(b.qs[i & 31]) * static_cast<float>(__ldg(signs + i));
+    }, n, had_block);
 }
 
 template <int K, int WARPS_PER_BLOCK, bool kQ8In>
@@ -236,7 +241,7 @@ __global__ void ms_1mad_gemv_fast_kernel(const MsGemvGroup group, int out_featur
 // Shared memory: the row as a big-endian bit stream (stride_words + 1 words), then in_features floats.
 template <int K, typename OutT>
 __global__ void ms_dequant_rows_kernel(const uint8_t* __restrict__ payload, int row0, int out_features, int in_features,
-                                       int had_block, OutT* __restrict__ out) {
+                                       int had_block, OutT* __restrict__ out, int out_stride) {
     extern __shared__ uint32_t s_dq[];
     const int stride_words = static_cast<int>(ms_row_bytes(in_features, K) >> 2);
     uint32_t* s_w = s_dq;
@@ -258,7 +263,7 @@ __global__ void ms_dequant_rows_kernel(const uint8_t* __restrict__ payload, int 
                         rsqrtf(static_cast<float>(had_block));
     const int8_t* signs = reinterpret_cast<const int8_t*>(
         payload + static_cast<size_t>(out_features) * ms_row_bytes(in_features, K));
-    OutT* o = out + static_cast<size_t>(blockIdx.x) * in_features;
+    OutT* o = out + static_cast<size_t>(blockIdx.x) * out_stride;
     for (int c = threadIdx.x; c < in_features; c += blockDim.x) {
         const float v = s_v[c] * scale * static_cast<float>(__ldg(signs + c));
         if constexpr (sizeof(OutT) == 4) o[c] = v;
@@ -266,10 +271,11 @@ __global__ void ms_dequant_rows_kernel(const uint8_t* __restrict__ payload, int 
     }
 }
 
-// Rows [row0, row0 + rows) of an MS payload's W (n_out x n_in, the input rotation undone) into out[rows][n_in].
+// Rows [row0, row0 + rows) of an MS payload's W (n_out x n_in, the input rotation undone) into out, row i at
+// out + i * out_stride (0: n_in).
 template <int K, typename OutT>
 inline cudaError_t launch_ms_dequant_rows(const uint8_t* payload, int row0, int rows, int out_features,
-                                          int in_features, OutT* out, cudaStream_t stream) {
+                                          int in_features, OutT* out, cudaStream_t stream, int out_stride = 0) {
     if (in_features < 4 || in_features % 4 || row0 < 0 || rows <= 0 || row0 + rows > out_features) {
         return cudaErrorInvalidValue;
     }
@@ -280,7 +286,8 @@ inline cudaError_t launch_ms_dequant_rows(const uint8_t* payload, int row0, int 
         if (err != cudaSuccess) return err;
     }
     ms_dequant_rows_kernel<K, OutT><<<rows, 256, smem, stream>>>(payload, row0, out_features, in_features,
-                                                              ms_hadamard_block(in_features), out);
+                                                              ms_hadamard_block(in_features), out,
+                                                              out_stride > 0 ? out_stride : in_features);
     return cudaGetLastError();
 }
 

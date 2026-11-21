@@ -6,6 +6,8 @@
 // THIRD_PARTY_LICENSES).  The block structs and codebook grids are basalt/ggml/ggml_common.h.
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/exl3_kernels.hpp"
+#include "basalt/kernels/ms_kernels.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/kernels/cpu/exl3.hpp"
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/packed_byte.hpp"
@@ -3262,6 +3264,8 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
 }
 
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type) noexcept {
+    if (basalt::ms_tensor_type((uint32_t) gu_type) || basalt::ms_tensor_type((uint32_t) d_type))
+        return d_type == gu_type && (up_type < 0 || up_type == gu_type) && ms_expert_supported(gu_type, n_embd, n_ff);
     if (cpu::exl3_type(gu_type) || cpu::exl3_type(d_type))
         return (up_type < 0 || up_type == gu_type) && exl3_expert_supported(gu_type, n_embd, n_ff) &&
                exl3_expert_supported(d_type, n_embd, n_ff);   // gate/up and down may differ in rate (the drafter's)
@@ -3286,6 +3290,15 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     L.d_type = d_type;
     L.n_embd = n_embd;
     L.n_ff = n_ff;
+    if (basalt::ms_tensor_type((uint32_t) gu_type)) {   // three MS payloads: rows, then the input signs
+        const int k = basalt::ms_bits((uint32_t) gu_type);
+        L.gu_row = L.up_row = (size_t) basalt::ms_row_bytes((uint64_t) n_embd, k);
+        L.d_row = (size_t) basalt::ms_row_bytes((uint64_t) n_ff, k);
+        L.up_off = (size_t) n_ff * L.gu_row + (size_t) n_embd;
+        L.down_off = 2 * L.up_off;
+        L.bytes = L.down_off + (size_t) n_embd * L.d_row + (size_t) n_ff;
+        return L;
+    }
     if (cpu::exl3_type(gu_type)) {   // three projection records (kernels/cpu/exl3.hpp); the row sizes are not used
         const int w = cpu::exl3_words(gu_type), wd = cpu::exl3_words(d_type);
         L.up_off = cpu::exl3_proj_bytes((int) n_embd, (int) n_ff, w);
@@ -3306,8 +3319,10 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     const size_t f = (size_t) cap * (size_t) n_ff * sizeof(float);
     // EXL3 keeps the fp16 inputs of gate/up (4 n_ff halves a projection and entry) and their block sums after the three regions
     const size_t exl3_in = ((size_t) cap * (size_t) n_ff * 17 + 255) & ~(size_t) 255;
+    // MS keeps the rotated gate and up inputs, 2 x n_embd floats an entry, n_embd = 4 n_ff (ms_expert_supported)
+    const size_t ms_in = (size_t) cap * (size_t) n_ff * 32;
     return 3 * ((f + 255) & ~(size_t) 255) +
-           std::max((((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255), exl3_in);
+           std::max({(((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255), exl3_in, ms_in});
 }
 
 
@@ -3352,6 +3367,11 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
                   int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                   int64_t grid_groups, [[maybe_unused]] float limit) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
+    if (basalt::ms_tensor_type((uint32_t) L.gu_type)) {
+        ms_expert_grouped(L, CLAMP ? limit : 0.0f, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups,
+                          cap_entries, x_q8_1, scratch, out, stream, grid_groups);
+        return;
+    }
     if (cpu::exl3_type(L.gu_type)) {
         exl3_expert_grouped(L, CLAMP ? limit : 0.0f, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups,
                             cap_entries, x_q8_1, scratch, out, stream, grid_groups);
