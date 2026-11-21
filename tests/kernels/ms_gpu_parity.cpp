@@ -200,6 +200,32 @@ void bench_dequant_expert() {
     cudaStream_t s;
     CK(cudaStreamCreate(&s));
     gpu::ms_dequant_expert_f16(type, db, H, FF, L.up_off, L.down_off, gu, dd, s);
+    // the layout the prompt path's GEMMs read: gate row r at 2 r, up row r at 2 r + 1, then down, each the bits of
+    // the single-tensor dequantizer
+    {
+        uint16_t* one;
+        CK(cudaMalloc(&one, (size_t) H * H * 2));
+        std::vector<uint16_t> got((size_t) 2 * FF * H), gd((size_t) H * FF), ref((size_t) H * H);
+        CK(cudaStreamSynchronize(s));
+        CK(cudaMemcpy(got.data(), gu, got.size() * 2, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(gd.data(), dd, gd.size() * 2, cudaMemcpyDeviceToHost));
+        int bad = 0;
+        for (int p = 0; p < 2; ++p) {
+            gpu::ms_dequant_dense_f16(type, (const uint8_t*) db + (p ? L.up_off : 0), H, FF, 0, FF, one, s);
+            CK(cudaStreamSynchronize(s));
+            CK(cudaMemcpy(ref.data(), one, (size_t) FF * H * 2, cudaMemcpyDeviceToHost));
+            for (int r = 0; r < FF; ++r)
+                bad += std::memcmp(&got[(size_t) (2 * r + p) * H], &ref[(size_t) r * H], (size_t) H * 2) != 0;
+        }
+        gpu::ms_dequant_dense_f16(type, (const uint8_t*) db + L.down_off, FF, H, 0, H, one, s);
+        CK(cudaStreamSynchronize(s));
+        CK(cudaMemcpy(ref.data(), one, (size_t) H * FF * 2, cudaMemcpyDeviceToHost));
+        bad += std::memcmp(gd.data(), ref.data(), gd.size() * 2) != 0;
+        std::printf("  %s expert dequant layout (gate/up interleaved, down): %s\n", basalt::ggml_type_name(type),
+                    bad ? "FAIL" : "bitwise equal");
+        if (bad) ++g_fail;
+        cudaFree(one);
+    }
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0));
     CK(cudaEventCreate(&e1));

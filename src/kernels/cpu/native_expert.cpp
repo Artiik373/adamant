@@ -112,8 +112,7 @@ struct MsIn {
 };
 
 const MsAct* const* ms_inputs(MsIn& c, const int8_t* signs, const void* const* act, int nt, int n) {
-    thread_local std::vector<float> x;
-    const size_t bytes = (size_t) n * 2;
+    const size_t bytes = (size_t) n * 4;
     bool same = (int) c.signs.size() == n && std::memcmp(c.signs.data(), signs, (size_t) n) == 0 &&
                 (int) c.raw.size() == nt;
     for (int t = 0; same && t < nt; ++t) same = std::memcmp(c.raw[(size_t) t].data(), act[t], bytes) == 0;
@@ -122,11 +121,9 @@ const MsAct* const* ms_inputs(MsIn& c, const int8_t* signs, const void* const* a
     c.raw.resize((size_t) nt);
     c.act.resize((size_t) nt);
     c.ptr.resize((size_t) nt);
-    x.resize((size_t) n);
     for (int t = 0; t < nt; ++t) {
         c.raw[(size_t) t].assign((const uint8_t*) act[t], (const uint8_t*) act[t] + bytes);
-        exl3_unpack_act((const uint16_t*) act[t], n, x.data());
-        ms_act_prepare(x.data(), signs, n, c.act[(size_t) t]);
+        ms_act_prepare((const float*) act[t], signs, n, c.act[(size_t) t]);
         c.ptr[(size_t) t] = &c.act[(size_t) t];
     }
     return c.ptr.data();
@@ -291,8 +288,8 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
         f.down_off = 2 * f.up_off;
         f.bytes = f.down_off + f.d_row * (size_t) n_embd + (size_t) n_ff;
         f.tail = 0;
-        f.act_bytes = (size_t) n_embd * 2;
-        f.h_bytes = (size_t) n_ff * 2;
+        f.act_bytes = (size_t) n_embd * 4;   // fp32: no range limit before the int8 rotated input
+        f.h_bytes = (size_t) n_ff * 4;
         if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes || n_ff > kNativeMaxFF) {
             err = "native experts: activation larger than the pool's buffers";
             return false;
@@ -390,7 +387,11 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 }
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
-    if (f.exl3_w || f.ms_k) {
+    if (f.ms_k) {
+        std::memcpy(dst, x, (size_t) f.n_embd * 4);
+        return;
+    }
+    if (f.exl3_w) {
         exl3_pack_act(x, (int) f.n_embd, (uint16_t*) dst);
         return;
     }
@@ -407,7 +408,11 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
 }
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
-    if (f.exl3_w || f.ms_k) {
+    if (f.ms_k) {
+        std::memcpy(dst, h, (size_t) f.n_ff * 4);
+        return;
+    }
+    if (f.exl3_w) {
         exl3_pack_act(h, (int) f.n_ff, (uint16_t*) dst);
         return;
     }

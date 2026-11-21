@@ -21,6 +21,8 @@ struct MsAct {
 
 /// n_in a multiple of 128.  `signs` are the payload's (after its n_out rows).
 void ms_act_prepare(const float* x, const int8_t* signs, int n_in, MsAct& a);
+/// The same in plain C, bit for bit (the reference of the parity test).
+void ms_act_prepare_ref(const float* x, const int8_t* signs, int n_in, MsAct& a);
 
 /// out[t][r] = row r of the payload's rows times token t, for rows [r0, r1); K is 3, 4 or 6.
 void ms_rows(int k, const uint8_t* rows, int n_in, const MsAct* const* a, int nt, float* const* out, int r0, int r1);

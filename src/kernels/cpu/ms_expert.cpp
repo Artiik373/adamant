@@ -20,6 +20,66 @@ void rows_vnni(int k, const uint8_t* rows, int n_in, const MsAct* const* a, int 
 
 void ms_act_prepare(const float* x, const int8_t* signs, int n_in, MsAct& a) {
     const int hb = (int) basalt::ms_hadamard_block((uint64_t) n_in);
+    if (hb < 8 || n_in % 128) {
+        ms_act_prepare_ref(x, signs, n_in, a);
+        return;
+    }
+    // ms_act_prepare_ref's butterflies and rounding, 8 lanes at a time: the same bits
+    thread_local std::vector<float> v;
+    v.resize((size_t) n_in);
+    float* p = v.data();
+    for (int i = 0; i < n_in; i += 8) {
+        const __m128i s8 = _mm_loadl_epi64((const __m128i*) (signs + i));
+        __m256 y = _mm256_mul_ps(_mm256_loadu_ps(x + i), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(s8)));
+        // distances 1, 2, 4 inside the vector: the upper lane of each pair takes partner - itself
+        __m256 t = _mm256_permute_ps(y, 0xB1);
+        y = _mm256_blend_ps(_mm256_add_ps(y, t), _mm256_sub_ps(t, y), 0xAA);
+        t = _mm256_permute_ps(y, 0x4E);
+        y = _mm256_blend_ps(_mm256_add_ps(y, t), _mm256_sub_ps(t, y), 0xCC);
+        t = _mm256_permute2f128_ps(y, y, 1);
+        y = _mm256_blend_ps(_mm256_add_ps(y, t), _mm256_sub_ps(t, y), 0xF0);
+        _mm256_storeu_ps(p + i, y);
+    }
+    for (int h = 8; h < hb; h <<= 1)
+        for (int i = 0; i < n_in; i += 2 * h)
+            for (int j = i; j < i + h; j += 8) {
+                const __m256 u = _mm256_loadu_ps(p + j), w = _mm256_loadu_ps(p + j + h);
+                _mm256_storeu_ps(p + j, _mm256_add_ps(u, w));
+                _mm256_storeu_ps(p + j + h, _mm256_sub_ps(u, w));
+            }
+    a.rep.resize((size_t) n_in);
+    a.sc.resize((size_t) (n_in / 128));
+    a.rscale = 1.f / std::sqrt((float) hb);
+    const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    double corr = 0.0;
+    for (int b = 0; b < n_in / 128; ++b) {
+        const float* q = p + b * 128;
+        __m256 m = _mm256_setzero_ps();
+        for (int i = 0; i < 128; i += 8) m = _mm256_max_ps(m, _mm256_and_ps(_mm256_loadu_ps(q + i), absmask));
+        __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
+        m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+        const float amax = _mm_cvtss_f32(_mm_max_ss(m4, _mm_movehdup_ps(m4)));
+        const float s = amax / 127.f, inv = amax > 0.f ? 127.f / amax : 0.f;
+        const __m256 vinv = _mm256_set1_ps(inv);
+        __m256i sum8 = _mm256_setzero_si256();
+        for (int i = 0; i < 128; i += 8) {
+            const __m256i qi = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(q + i), vinv));   // nearest, as nearbyint
+            sum8 = _mm256_add_epi32(sum8, qi);
+            const __m256i rep = _mm256_mullo_epi32(_mm256_and_si256(qi, _mm256_set1_epi32(0xFF)), _mm256_set1_epi32(0x01010101));
+            _mm256_storeu_si256((__m256i*) (a.rep.data() + b * 128 + i), rep);
+        }
+        alignas(32) int32_t lanes[8];
+        _mm256_store_si256((__m256i*) lanes, sum8);
+        int sum = 0;
+        for (int l = 0; l < 8; ++l) sum += lanes[l];
+        a.sc[(size_t) b] = s;
+        corr += (double) s * sum;
+    }
+    a.corr = (float) (-510.0 * corr);
+}
+
+void ms_act_prepare_ref(const float* x, const int8_t* signs, int n_in, MsAct& a) {
+    const int hb = (int) basalt::ms_hadamard_block((uint64_t) n_in);
     thread_local std::vector<float> v;
     v.resize((size_t) n_in);
     for (int i = 0; i < n_in; ++i) v[(size_t) i] = x[i] * (float) signs[i];

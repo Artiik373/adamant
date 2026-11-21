@@ -190,6 +190,31 @@ void check_expert(std::mt19937& g, int k) {
     expect(std::sqrt(num / den) < 2e-2, "expert vs double", k, H, nt, std::sqrt(num / den));
 }
 
+// ms_act_prepare against ms_act_prepare_ref, bit for bit (one 128-block all zeros), and its time.
+void check_prepare(std::mt19937& g, int n) {
+    std::normal_distribution<float> nd;
+    std::vector<float> x((size_t) n);
+    std::vector<int8_t> s((size_t) n);
+    for (int i = 0; i < n; ++i) {
+        x[(size_t) i] = i >= 128 && i < 256 ? 0.f : nd(g) * 3.f;
+        s[(size_t) i] = (g() & 1) ? 1 : -1;
+    }
+    MsAct a, b;
+    ms_act_prepare(x.data(), s.data(), n, a);
+    ms_act_prepare_ref(x.data(), s.data(), n, b);
+    const bool same = a.rep == b.rep && a.sc == b.sc && std::memcmp(&a.corr, &b.corr, 4) == 0 && a.rscale == b.rscale;
+    expect(same, "prepare vs ref (bits)", 0, n, 1, 0);
+    const int reps = 2000;
+    for (int i = 0; i < reps; ++i) ms_act_prepare(x.data(), s.data(), n, a);   // warm: clocks and caches
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < reps; ++i) ms_act_prepare(x.data(), s.data(), n, a);
+    const double us = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / reps * 1e6;
+    const auto t1 = std::chrono::steady_clock::now();
+    for (int i = 0; i < reps; ++i) ms_act_prepare_ref(x.data(), s.data(), n, b);
+    const double ur = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count() / reps * 1e6;
+    std::printf("ms_cpu bench: prepare %d inputs: %.2f us (plain C %.2f us), one thread\n", n, us, ur);
+}
+
 void bench(std::mt19937& g, int k, int n_in, int n_out) {
     const auto p = payload(g, k, n_in, n_out);
     const int8_t* signs = (const int8_t*) p.data() + (size_t) n_out * basalt::ms_row_bytes((uint64_t) n_in, k);
@@ -226,6 +251,8 @@ int main() {
         check(g, k, 640, 256);   // down rows
         check_expert(g, k);
     }
+    check_prepare(g, 2560);
+    check_prepare(g, 640);
     for (int k : {3, 4}) {
         bench(g, k, 2560, 640);
         bench(g, k, 640, 2560);

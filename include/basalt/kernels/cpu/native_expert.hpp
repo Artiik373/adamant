@@ -13,8 +13,8 @@
 
 namespace basalt::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (5120 values as Q8_K: 20 x 292).
-inline constexpr size_t kNativeActBytes = 6144;
+/// Bytes of the largest activation any native layer uses (5120 values as Q8_K: 20 x 292; 2560 fp32 values: MS).
+inline constexpr size_t kNativeActBytes = 10240;
 /// The widest expert intermediate a native layer may have (the float buffers between gate/up and down).
 inline constexpr int kNativeMaxFF = 2304;
 /// Bytes of the largest quantized down activation (2304 values as Q8_K: 9 x 292, or Q8_0 72 x 34).
@@ -37,7 +37,7 @@ struct NativeFmt {
     int exl3_w = 0;                     ///< EXL3 layer: 16-bit words per 16x16 tile (0: a GGUF layer); the blob is three
                                         ///< EXL3 projection records [gate | up | down] (exl3.hpp), activations are fp16
     int ms_k = 0;                       ///< MS layer: K bits a weight (0: another format); the blob is three MS payloads
-                                        ///< [gate | up | down] (ms_expert.hpp), activations are fp16
+                                        ///< [gate | up | down] (ms_expert.hpp), activations are fp32
 };
 
 /// Fills `f` for a layer (`swiglu_limit`: the model's SwiGLU limit, 0 for none; `up_type`: the up rows' type, -1 for
