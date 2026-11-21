@@ -115,8 +115,9 @@ const MmqPlan& mmq_plan() {
         p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
         p.fallback = !on || layers <= 0;
         for (int64_t l = 0; on && l < layers; ++l) {
-            const int gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42, dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
-            const int ut = lay.native ? lay.fmt[(size_t) l].up_type : 42;
+            const int gt = lay.native ? mmq_type_of(lay.fmt[(size_t) l].gu_type) : 42;
+            const int dt = lay.native ? mmq_type_of(lay.fmt[(size_t) l].d_type) : 42;
+            const int ut = lay.native ? mmq_type_of(lay.fmt[(size_t) l].up_type) : 42;
             // a tile on every GPU for these shapes (gate+up: 1280 rows, or 640 each when their types differ; down: N
             // rows), else the FP16 path
             if (!mmq::fits(gt, ut == gt ? 1280 : 640) || !mmq::fits(ut, 640) || !mmq::fits(dt, N)) {

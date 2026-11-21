@@ -4,6 +4,7 @@
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/models/qwen4exp/prefill/gemm.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
+#include "basalt/kernels/ms_kernels.hpp"
 #include "basalt/models/qwen4exp/prefill/kernels.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>
@@ -75,6 +76,10 @@ bool Prefill::Run::Chunk::Experts::Group::compute_mmq(size_t j, const uint8_t* b
         if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
         flush();
         gg = mmq::GatherGroup{};
+    } else if (lay.native && lay.fmt[(size_t) l].ms_k) {   // MS: the slot's Q8_0 rows from the trellis
+        const auto& f = lay.fmt[(size_t) l];
+        basalt::kernels::ms_expert_to_q8_0(f.gu_type, blob_dev, f.n_embd, f.n_ff, f.up_off, f.down_off,
+                                           m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
     } else if (lay.native) {
         const auto& f = lay.fmt[(size_t) l];
         mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gb, blob_dev + f.down_off,

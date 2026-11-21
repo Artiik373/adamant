@@ -252,4 +252,29 @@ void ms_dequant_expert_f16(int ggml_type, const void* blob, int64_t n_embd, int6
     if (err != cudaSuccess) throw std::runtime_error(std::string("ms_dequant_expert_f16: ") + cudaGetErrorString(err));
 }
 
+void ms_expert_to_q8_0(int ggml_type, const void* blob, int64_t n_embd, int64_t n_ff, size_t up_off, size_t down_off,
+                       void* gu_dst, void* d_dst, void* stream) {
+    if (!basalt::ms_tensor_type((uint32_t) ggml_type) || n_embd <= 0 || n_embd % 32 || n_ff <= 0 || n_ff % 32 ||
+        blob == nullptr || gu_dst == nullptr || d_dst == nullptr)
+        throw std::invalid_argument("ms_expert_to_q8_0: unsupported type, shape or pointer");
+    const auto* b = static_cast<const uint8_t*>(blob);
+    auto* gu = static_cast<mc::MsQ80*>(gu_dst);
+    auto* d = static_cast<mc::MsQ80*>(d_dst);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const int ne = (int) n_embd, nf = (int) n_ff;
+    cudaError_t err = cudaSuccess;
+    auto run = [&](auto kc) {
+        constexpr int K = decltype(kc)::value;
+        if (err == cudaSuccess) err = mc::launch_ms_dequant_rows<K>(b, 0, nf, nf, ne, gu, s);
+        if (err == cudaSuccess) err = mc::launch_ms_dequant_rows<K>(b + up_off, 0, nf, nf, ne, gu + (size_t) nf * (ne / 32), s);
+        if (err == cudaSuccess) err = mc::launch_ms_dequant_rows<K>(b + down_off, 0, ne, ne, nf, d, s);
+    };
+    switch (basalt::ms_bits((uint32_t) ggml_type)) {
+    case 3: run(std::integral_constant<int, 3>{}); break;
+    case 4: run(std::integral_constant<int, 4>{}); break;
+    default: run(std::integral_constant<int, 6>{}); break;
+    }
+    if (err != cudaSuccess) throw std::runtime_error(std::string("ms_expert_to_q8_0: ") + cudaGetErrorString(err));
+}
+
 }  // namespace basalt::kernels

@@ -70,7 +70,8 @@ bool Prefill::Run::Chunk::Experts::Group::group() {
         ++m.cnt[(size_t) e];
     }
     // multi-GPU: the rows of the experts the peer computes go last, as one block [rows_local, T*K)
-    if (ppc && pre_mmq) {
+    // (MS layers stay here: the peer would gather their bytes as the Q8_0 they are converted to)
+    if (ppc && pre_mmq && !(lay.native && lay.fmt[(size_t) l].ms_k)) {
         on_peer.assign((size_t) m.g->n_expert, 0);
         for (int32_t e = 0; e < m.g->n_expert; ++e) {
             const int32_t c = m.cnt[(size_t) e];

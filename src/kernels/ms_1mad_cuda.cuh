@@ -248,6 +248,11 @@ __global__ void ms_1mad_gemv_fast_kernel(const MsGemvGroup group, int out_featur
 // The row is staged in shared memory as a big-endian bit stream (stride_words + 1 words).  Blocks of 32..512 values:
 // one warp per Hadamard block, lane l holding columns l + 32*i, butterflies in registers and by shuffles (the
 // stages commute); smaller blocks run in shared memory after the stream.
+struct MsQ80 {  // ggml block_q8_0: the output type of the Q8_0 conversion
+    __half d;
+    int8_t qs[32];
+};
+
 template <int K, typename OutT>
 __global__ void ms_dequant_rows_kernel(const uint8_t* __restrict__ payload, int row0, int out_features, int in_features,
                                        int had_block, OutT* __restrict__ out, int out_stride) {
@@ -273,14 +278,28 @@ __global__ void ms_dequant_rows_kernel(const uint8_t* __restrict__ payload, int 
     auto put = [&](int c, float v) {
         v *= scale * static_cast<float>(__ldg(signs + c));
         if constexpr (sizeof(OutT) == 4) o[c] = v;
-        else o[c] = __float2half_rn(v);
+        else if constexpr (sizeof(OutT) == 2) o[c] = __float2half_rn(v);
     };
+    // Q8_0: the 32 values of block (c / 32) sit in the 32 lanes at the same i; ggml's quantize_row_q8_0 rounding
+    auto put_q8 = [&](int c, float v) {
+        v *= scale * static_cast<float>(__ldg(signs + c));
+        float amax = fabsf(v);
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, m));
+        const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+        MsQ80* b = reinterpret_cast<MsQ80*>(o) + c / 32;
+        b->qs[c & 31] = static_cast<int8_t>(roundf(v * id));
+        if ((c & 31) == 0) b->d = __float2half_rn(d);
+    };
+    constexpr bool kQ80 = sizeof(OutT) == sizeof(MsQ80);
     if (had_block < 32) {
+        if constexpr (kQ80) return;   // the launcher refuses it
         float* s_v = reinterpret_cast<float*>(s_w + stride_words + 1);
         for (int c = threadIdx.x; c < in_features; c += blockDim.x) s_v[c] = dec(c);
         __syncthreads();
         ms_fwht_smem(s_v, in_features, had_block);
-        for (int c = threadIdx.x; c < in_features; c += blockDim.x) put(c, s_v[c]);
+        if constexpr (!kQ80)
+            for (int c = threadIdx.x; c < in_features; c += blockDim.x) put(c, s_v[c]);
         return;
     }
     const int lane = threadIdx.x & 31;
@@ -313,12 +332,17 @@ __global__ void ms_dequant_rows_kernel(const uint8_t* __restrict__ payload, int 
             }
         }
         #pragma unroll
-        for (int i = 0; i < 16; ++i) if (i < v) put(base + 32 * i, r[i]);
+        for (int i = 0; i < 16; ++i) {
+            if (i < v) {
+                if constexpr (kQ80) put_q8(base + 32 * i, r[i]);
+                else put(base + 32 * i, r[i]);
+            }
+        }
     }
 }
 
 // Rows [row0, row0 + rows) of an MS payload's W (n_out x n_in, the input rotation undone) into out, row i at
-// out + i * out_stride (0: n_in).
+// out + i * out_stride elements of OutT (0: a row's own, n_in values or, for OutT = MsQ80, its n_in / 32 Q8_0 blocks).
 template <int K, typename OutT>
 inline cudaError_t launch_ms_dequant_rows(const uint8_t* payload, int row0, int rows, int out_features,
                                           int in_features, OutT* out, cudaStream_t stream, int out_stride = 0) {
@@ -326,6 +350,7 @@ inline cudaError_t launch_ms_dequant_rows(const uint8_t* payload, int row0, int 
         return cudaErrorInvalidValue;
     }
     const int had_block = ms_hadamard_block(in_features);
+    if (sizeof(OutT) == sizeof(MsQ80) && had_block < 32) return cudaErrorInvalidValue;   // Q8_0 needs whole warps
     // a warp per Hadamard block (at most 8); blocks below 32 values keep the decoded row in shared memory too
     const int warps = had_block >= 32 ? (in_features / had_block < 8 ? in_features / had_block : 8) : 8;
     const size_t smem = (ms_row_bytes(in_features, K) / 4 + 1) * 4 + (had_block < 32 ? static_cast<size_t>(in_features) * 4 : 0);
@@ -336,7 +361,9 @@ inline cudaError_t launch_ms_dequant_rows(const uint8_t* payload, int row0, int 
     }
     ms_dequant_rows_kernel<K, OutT><<<rows, warps * 32, smem, stream>>>(payload, row0, out_features, in_features,
                                                                      had_block, out,
-                                                                     out_stride > 0 ? out_stride : in_features);
+                                                                     out_stride > 0 ? out_stride
+                                                                     : sizeof(OutT) == sizeof(MsQ80) ? in_features / 32
+                                                                                                     : in_features);
     return cudaGetLastError();
 }
 

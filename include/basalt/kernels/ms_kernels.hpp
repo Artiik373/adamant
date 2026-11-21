@@ -23,6 +23,12 @@ void ms_dequant_dense_f16(int ggml_type, const void* weights, int64_t k, int64_t
 void ms_dequant_expert_f16(int ggml_type, const void* blob, int64_t n_embd, int64_t n_ff, size_t up_off,
                            size_t down_off, uint16_t* dq_gu, uint16_t* dq_d, void* stream);
 
+/// One MS expert blob (device) as the prompt path's Q8_0 matrices (ggml block_q8_0, quantize_row_q8_0's rounding of the
+/// weights with the input rotation undone): gu_dst = [gate rows | up rows] (2 n_ff rows of n_embd), d_dst = down rows
+/// (n_embd rows of n_ff).  n_embd and n_ff need Hadamard blocks of 32 or more.
+void ms_expert_to_q8_0(int ggml_type, const void* blob, int64_t n_embd, int64_t n_ff, size_t up_off, size_t down_off,
+                       void* gu_dst, void* d_dst, void* stream);
+
 /// Whether ms_expert_grouped covers an MS expert layer of this type and geometry.
 bool ms_expert_supported(int type, int64_t n_embd, int64_t n_ff) noexcept;
 

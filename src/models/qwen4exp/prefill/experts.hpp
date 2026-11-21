@@ -91,10 +91,11 @@ struct Prefill::Run::Chunk::Experts {
     // (moe_fused_iq.hpp) where they cover its two formats, else MMQ (or the FP16 path: IQ1_M).
     const basalt::kernels::cpu::ExpertLayout& lay = basalt::kernels::cpu::expert_layout();
     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
-    const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
-    const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
-    const int mmq_ut = lay.native ? lay.fmt[(size_t) l].up_type : 42;   // the up rows' type
-    const bool fused_nat = use_mmq && stream_all && lay.native && fused::native_supported(mmq_gt, mmq_dt, mmq_ut);
+    const int mmq_gt = lay.native ? mmq_type_of(lay.fmt[(size_t) l].gu_type) : 42;
+    const int mmq_dt = lay.native ? mmq_type_of(lay.fmt[(size_t) l].d_type) : 42;
+    const int mmq_ut = lay.native ? mmq_type_of(lay.fmt[(size_t) l].up_type) : 42;   // the up rows' type
+    const bool ms_l = lay.native && lay.fmt[(size_t) l].ms_k != 0;   // converted when gathered, never read as it is
+    const bool fused_nat = use_mmq && stream_all && lay.native && !ms_l && fused::native_supported(mmq_gt, mmq_dt, mmq_ut);
     const bool fused_l = (use_mmq && stream_all && !lay.native && fused::enabled()) || fused_nat;
     bool peer_now = false;                // multi-GPU: the peer computed rows of this layer (MMQ path only)
     // CPU share: this layer's CPU experts (rows [T * K - rows_cpu, T * K) of Dm) run on a thread that
@@ -216,7 +217,7 @@ struct Prefill::Run::Chunk::Experts::Group {
     // wait and a record per expert would put a GPU bubble each on the compute stream.  The same bytes into the same group slots.  A ring
     // entry the routing skipped inside an open group first gathers what the group holds so far
     // (`flush`), so no more than a group's entries are ever held back from the issuer.
-    const bool group_gather = stream_all && use_mmq && lay.native &&
+    const bool group_gather = stream_all && use_mmq && lay.native && !experts.ms_l &&
                               MMQ_GROUP <= mmq::kGatherGroupMax;
     mmq::GatherGroup gg;
     int gg_slots[MMQ_GROUP];

@@ -225,6 +225,53 @@ void bench_dequant_expert() {
                     bad ? "FAIL" : "bitwise equal");
         if (bad) ++g_fail;
         cudaFree(one);
+        // the Q8_0 conversion: every value within half a step (plus the fp16 copy's rounding) of the fp16 weights
+        const size_t bgu = (size_t) 2 * FF * (H / 32) * 34, bd = (size_t) H * (FF / 32) * 34;
+        void *qgu, *qd;
+        CK(cudaMalloc(&qgu, bgu));
+        CK(cudaMalloc(&qd, bd));
+        gpu::ms_expert_to_q8_0(type, db, H, FF, L.up_off, L.down_off, qgu, qd, s);
+        CK(cudaStreamSynchronize(s));
+        std::vector<uint8_t> hq(bgu), hd(bd);
+        CK(cudaMemcpy(hq.data(), qgu, bgu, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(hd.data(), qd, bd, cudaMemcpyDeviceToHost));
+        double worst = 0;   // in units of the block's step
+        auto cmp = [&](const std::vector<uint8_t>& q, int rows, int cols, auto ref_of) {
+            for (int r = 0; r < rows; ++r)
+                for (int bk = 0; bk < cols / 32; ++bk) {
+                    const uint8_t* blk = q.data() + ((size_t) r * (cols / 32) + bk) * 34;
+                    uint16_t d16;
+                    std::memcpy(&d16, blk, 2);
+                    const float dd = ms::fp16_to_fp32(d16);
+                    for (int i = 0; i < 32; ++i) {
+                        const float ref = ref_of(r, bk * 32 + i);
+                        const double err = std::fabs(dd * (float) (int8_t) blk[2 + i] - ref) -
+                                           2e-3 * std::fabs(ref);   // the fp16 copy's rounding
+                        if (dd > 0) worst = std::max(worst, err / dd);
+                    }
+                }
+        };
+        cmp(hq, 2 * FF, H, [&](int r, int c) {   // gate rows, then up rows; got holds them interleaved
+            const int src = r < FF ? 2 * r : 2 * (r - FF) + 1;
+            return ms::fp16_to_fp32(got[(size_t) src * H + c]);
+        });
+        cmp(hd, H, FF, [&](int r, int c) { return ms::fp16_to_fp32(gd[(size_t) r * FF + c]); });
+        const bool ok = worst <= 0.5 + 1e-3;
+        std::printf("  %s expert to Q8_0: worst error %.3f of a step (tol 0.5) %s\n", basalt::ggml_type_name(type), worst,
+                    ok ? "ok" : "FAIL");
+        if (!ok) ++g_fail;
+        cudaEvent_t q0, q1;
+        CK(cudaEventCreate(&q0));
+        CK(cudaEventCreate(&q1));
+        CK(cudaEventRecord(q0, s));
+        for (int i = 0; i < 100; ++i) gpu::ms_expert_to_q8_0(type, db, H, FF, L.up_off, L.down_off, qgu, qd, s);
+        CK(cudaEventRecord(q1, s));
+        CK(cudaEventSynchronize(q1));
+        float qms = 0;
+        CK(cudaEventElapsedTime(&qms, q0, q1));
+        std::printf("  bench %s expert to Q8_0: %.1f us an expert\n", basalt::ggml_type_name(type), qms * 10.0);
+        cudaFree(qgu);
+        cudaFree(qd);
     }
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0));
