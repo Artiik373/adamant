@@ -110,8 +110,9 @@ def load_layer(cfg, hf: Path, wmap: dict, l: int, dev) -> Qwen4ExpTextDecoderLay
     return layer.to(dev, torch.bfloat16).eval()
 
 
-def prelude(cfg, hf: Path, wmap: dict, ids: torch.Tensor, dev, batch: int):
-    """Layer-0 inputs and the per-batch layer kwargs (masks, positions, PLE ids) from the model's own forward."""
+def prelude(cfg, hf: Path, wmap: dict, ids: torch.Tensor, dev, batch: int, host: bool = False):
+    """Layer-0 inputs and the per-batch layer kwargs (masks, positions, PLE ids) from the model's own forward.
+    host: the inputs collected in host RAM (a calibration set too large for the GPU twice over)."""
     c1 = Qwen4ExpTextConfig(**{**cfg.to_dict(), "num_hidden_layers": 2, "layer_types": cfg.layer_types[:2]})  # 2 layers keep ple_layer_ids valid
     c1._attn_implementation = "sdpa"  # the masks the layers get are built for sdpa (see load_layer)
     with torch.device("meta"):
@@ -138,7 +139,7 @@ def prelude(cfg, hf: Path, wmap: dict, ids: torch.Tensor, dev, batch: int):
             except Stop:
                 pass
             h, kw = got.pop()
-            hs.append(h)
+            hs.append(h.cpu() if host else h)
             kws.append({n: v for n, v in kw.items() if n != "past_key_values"})
     del model
     return torch.cat(hs), kws
@@ -185,9 +186,10 @@ def run_layer(layer, h, kws, batch, grab_in=None, grab_out=None):
     if grab_out is not None:
         hooks.append(layer.mlp.register_forward_hook(lambda m, a, o: grab_out.append(o.reshape(-1, o.shape[-1]).float())))
     out = torch.empty_like(h)
+    dev = next(layer.parameters()).device   # h may live on the host (a large calibration set): a batch at a time
     with torch.no_grad():
         for b, kw in enumerate(kws):
-            out[b * batch : (b + 1) * batch] = layer(h[b * batch : (b + 1) * batch], **kw)
+            out[b * batch : (b + 1) * batch] = layer(h[b * batch : (b + 1) * batch].to(dev), **kw).to(out.device)
     for hk in hooks:
         hk.remove()
     return out

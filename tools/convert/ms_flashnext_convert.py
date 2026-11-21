@@ -95,17 +95,41 @@ def code_rows(w: torch.Tensor, h: torch.Tensor, k: int, lut, seed: int, chunk: i
     return b"".join(parts), signs.to(torch.int8).cpu().numpy()
 
 
-def expert_hessians(x: torch.Tensor, idx: torch.Tensor, e: int, w_gu: torch.Tensor):
-    xe = x[(idx == e).any(-1)].float()
-    if not xe.shape[0]:  # no calibration token reached this expert: identity Hessians
+def expert_hessians(x: torch.Tensor, idx: torch.Tensor, e: int, w_gu: torch.Tensor, wts=None, tau: float = 0.0,
+                    h_all=None, x_ref=None):
+    """Input Hessians of expert e's gate/up and down rows and its routed-token count.  Plain: sums over the tokens
+    routed to it (identity Hessians when none is).  wts (the router's top-k scores): each token weighted by its score
+    squared, as its error reaches the layer output times the score.  tau > 0: each Hessian, as a mean, shrunk toward
+    the layer's (gate/up: h_all, every token's x x^T mean; down: the expert's activations on the x_ref tokens) with
+    tau tokens' weight, so a rarely routed expert keeps the layer's input statistics instead of a few tokens' or none."""
+    hit = idx == e
+    rows = hit.any(-1)
+    xe = x[rows].float()
+    n = xe.shape[0]
+    if tau <= 0 and not n:
         return torch.eye(x.shape[1], device=x.device), torch.eye(w_gu.shape[0] // 2, device=x.device), 0
+    p = (wts.float()[rows] * hit[rows]).sum(-1) ** 2 if wts is not None else torch.ones(n, device=x.device)
     g, u = (xe @ w_gu.T).chunk(2, -1)
     a = torch.nn.functional.silu(g) * u
-    return xe.T @ xe, a.T @ a, xe.shape[0]
+    s_in, s_dn, m = (xe * p[:, None]).T @ xe, (a * p[:, None]).T @ a, p.sum()
+    if tau <= 0:
+        return s_in, s_dn, n
+    gr, ur = (x_ref.float() @ w_gu.T).chunk(2, -1)
+    ar = torch.nn.functional.silu(gr) * ur
+    hd_all = ar.T @ ar / ar.shape[0]
+    # tau weighs the prior as tau tokens of the mean routed token's weight
+    w_mean = m / n if n else torch.tensor(1.0, device=x.device)
+    t = tau * w_mean
+    return (s_in + t * h_all) / (m + t), (s_dn + t * hd_all) / (m + t), n
 
 
-def code_experts(moe, x, idx, k, lut, l, out_dir: Path) -> dict:
+def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0.0) -> dict:
     ex = moe.experts
+    h_all = x_ref = None
+    if tau > 0:   # the layer-wide statistics the shrinkage pulls toward: all tokens, and a fixed sample of them
+        h_all = sum(c.float().T @ c.float() for c in x.split(65536)) / x.shape[0]   # in chunks: no fp32 copy
+        g = torch.Generator(device="cpu").manual_seed(l)
+        x_ref = x[torch.randperm(x.shape[0], generator=g)[:2048].to(x.device)]
     n_exp, two_ff, n_embd = ex.gate_up_proj.shape
     n_ff = two_ff // 2
     files = {n: open(out_dir / f"blk.{l}.ffn_{n}_exps.ms", "wb") for n in ("gate", "up", "down")}
@@ -114,7 +138,7 @@ def code_experts(moe, x, idx, k, lut, l, out_dir: Path) -> dict:
     try:
         for e0 in range(0, n_exp, eb):
             es = list(range(e0, min(e0 + eb, n_exp)))
-            hs = [expert_hessians(x, idx, e, ex.gate_up_proj[e].float()) for e in es]
+            hs = [expert_hessians(x, idx, e, ex.gate_up_proj[e].float(), wts, tau, h_all, x_ref) for e in es]
             zero += sum(1 for h in hs if h[2] == 0)
             gu = code(ex.gate_up_proj[es].float(), torch.stack([h[0] for h in hs]), k, lut, [l * 4096 + 2 * e + 1 for e in es])
             dn = code(ex.down_proj[es].float(), torch.stack([h[1] for h in hs]), k, lut, [l * 4096 + 2 * e + 2 for e in es])
@@ -164,6 +188,10 @@ def main() -> None:
     p.add_argument("--stop-after", type=int, default=None, help="last layer to convert in this run")
     p.add_argument("--reuse-from", type=Path, help="an earlier output folder (same plan) to copy layers from")
     p.add_argument("--reuse-layers", type=int, default=0, help="copy layers below this from --reuse-from")
+    p.add_argument("--hess-tau", type=float, default=0.0,
+                   help="shrink each expert's Hessians toward the layer's with this many tokens' weight (0: off)")
+    p.add_argument("--hess-affinity", action="store_true",
+                   help="weight each routed token in its expert's Hessians by its router score squared")
     args = p.parse_args()
     if args.reuse_layers and not args.reuse_from:
         p.error("--reuse-layers needs --reuse-from")
@@ -182,11 +210,13 @@ def main() -> None:
     cal_ids, _ = split_calib(calib, args.calib_seqs, 0)
     bs = args.batch_size
 
-    h, kws = prelude(cfg, args.hf_dir, wmap, cal_ids, dev, bs)
+    # a large calibration set's stream (tokens x hyper-connection streams x hidden, bf16) stays in host RAM
+    host_h = cal_ids.numel() * cfg.hc_count * cfg.hidden_size * 2 > (4 << 30)
+    h, kws = prelude(cfg, args.hf_dir, wmap, cal_ids, dev, bs, host=host_h)
     state = out / "state.pt"
     start = 0
     if state.exists():
-        st = torch.load(state, map_location=dev, weights_only=True)
+        st = torch.load(state, map_location="cpu" if host_h else dev, weights_only=True)
         start, h = st["next_layer"], st["h"]
         print(f"resuming at layer {start}", flush=True)
     lut = ms.build_1mad_lut(dev)
@@ -223,9 +253,10 @@ def main() -> None:
 
         moe = layer.mlp
         with torch.no_grad():
-            _, _, idx = moe.gate(x)
-        rec = code_experts(moe, x, idx, plan[l], lut, l, out / "experts")
-        del layer, moe, x, idx
+            _, wts, idx = moe.gate(x)
+        rec = code_experts(moe, x, idx, plan[l], lut, l, out / "experts", wts if args.hess_affinity else None,
+                           args.hess_tau)
+        del layer, moe, x, idx, wts
         torch.cuda.empty_cache()
         torch.save({"next_layer": l + 1, "h": h}, state)
         print(f"layer {l:2d} {cfg.layer_types[l]:>17}: experts MS_C{plan[l]} (zero-token {rec['zero_token_experts']}) | "
@@ -246,7 +277,7 @@ def main() -> None:
         hh = torch.zeros(cfg.hidden_size, cfg.hidden_size, device=dev)
         with torch.no_grad():
             for i in range(0, h.shape[0], bs):
-                m = mixer(h[i : i + bs]).reshape(-1, cfg.hidden_size).float()
+                m = mixer(h[i : i + bs].to(dev)).reshape(-1, cfg.hidden_size).float()
                 hh += m.T @ m
         hh /= h.shape[0] * h.shape[1]
         with safe_open(args.hf_dir / wmap["lm_head.weight"], "pt") as s:
