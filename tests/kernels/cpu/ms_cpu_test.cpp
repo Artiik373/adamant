@@ -3,6 +3,7 @@
 // 640 -> 2560; K 3, 4, 6), 1 to 5 tokens.  Prints a microbench line per shape.
 #include "basalt/kernels/cpu/ms_expert.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/artifact/gguf_reader.hpp"
 
 #include <chrono>
@@ -10,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace basalt::kernels::cpu;
@@ -128,6 +130,66 @@ void check(std::mt19937& g, int k, int n_in, int n_out) {
     }
 }
 
+// One expert through native_fmt / native_gu_rows / native_down_rows (gate/up in two row parts, so the second part
+// reuses the rotated inputs) against silu(Wg x) * (Wu x) then Wd h in double.
+void check_expert(std::mt19937& g, int k) {
+    const int H = 2560, FF = 640, type = 120 + k;
+    NativeFmt f;
+    std::string err;
+    if (!native_fmt(type, type, H, FF, f, err)) {
+        std::printf("FAIL native_fmt(%d): %s\n", type, err.c_str());
+        ++g_fail;
+        return;
+    }
+    const auto pg = payload(g, k, H, FF), pu = payload(g, k, H, FF), pd = payload(g, k, FF, H);
+    std::vector<uint8_t> blob(pg);
+    blob.insert(blob.end(), pu.begin(), pu.end());
+    blob.insert(blob.end(), pd.begin(), pd.end());
+    expect(blob.size() == f.bytes && f.up_off == pg.size() && f.down_off == pg.size() + pu.size(), "blob layout", k, H,
+           1, (double) blob.size());
+    const auto wg = oracle_w(pg, k, H, FF), wu = oracle_w(pu, k, H, FF), wd = oracle_w(pd, k, FF, H);
+    std::normal_distribution<float> nd;
+    const int nt = 3;
+    std::vector<std::vector<float>> x((size_t) nt, std::vector<float>((size_t) H));
+    std::vector<std::vector<uint8_t>> a((size_t) nt, std::vector<uint8_t>(f.act_bytes)), hq((size_t) nt, std::vector<uint8_t>(f.h_bytes));
+    std::vector<std::vector<float>> ff((size_t) nt, std::vector<float>((size_t) FF)), y((size_t) nt, std::vector<float>((size_t) H));
+    std::vector<const void*> ap((size_t) nt), hp((size_t) nt);
+    std::vector<float*> fp((size_t) nt), yp((size_t) nt);
+    for (int t = 0; t < nt; ++t) {
+        for (auto& v : x[(size_t) t]) v = nd(g) * 4.f;
+        native_quant_act(f, x[(size_t) t].data(), a[(size_t) t].data());
+        ap[(size_t) t] = a[(size_t) t].data();
+        fp[(size_t) t] = ff[(size_t) t].data();
+        yp[(size_t) t] = y[(size_t) t].data();
+    }
+    native_gu_rows(f, blob.data(), ap.data(), nt, fp.data(), 0, 200);
+    native_gu_rows(f, blob.data(), ap.data(), nt, fp.data(), 200, FF);
+    for (int t = 0; t < nt; ++t) {
+        native_quant_h(f, ff[(size_t) t].data(), hq[(size_t) t].data());
+        hp[(size_t) t] = hq[(size_t) t].data();
+    }
+    native_down_rows(f, blob.data(), hp.data(), nt, yp.data(), 0, H);
+    double num = 0, den = 0;
+    for (int t = 0; t < nt; ++t) {
+        std::vector<double> h((size_t) FF);
+        for (int r = 0; r < FF; ++r) {
+            double gs = 0, us = 0;
+            for (int c = 0; c < H; ++c) {
+                gs += wg[(size_t) r * H + c] * x[(size_t) t][c];
+                us += wu[(size_t) r * H + c] * x[(size_t) t][c];
+            }
+            h[(size_t) r] = gs / (1 + std::exp(-gs)) * us;
+        }
+        for (int r = 0; r < H; ++r) {
+            double ys = 0;
+            for (int c = 0; c < FF; ++c) ys += wd[(size_t) r * FF + c] * h[(size_t) c];
+            num += (y[(size_t) t][r] - ys) * (y[(size_t) t][r] - ys);
+            den += ys * ys;
+        }
+    }
+    expect(std::sqrt(num / den) < 2e-2, "expert vs double", k, H, nt, std::sqrt(num / den));
+}
+
 void bench(std::mt19937& g, int k, int n_in, int n_out) {
     const auto p = payload(g, k, n_in, n_out);
     const int8_t* signs = (const int8_t*) p.data() + (size_t) n_out * basalt::ms_row_bytes((uint64_t) n_in, k);
@@ -162,6 +224,7 @@ int main() {
     for (int k : {3, 4, 6}) {
         check(g, k, 2560, 64);   // gate/up rows (a slice: the oracle is O(rows x n_in))
         check(g, k, 640, 256);   // down rows
+        check_expert(g, k);
     }
     for (int k : {3, 4}) {
         bench(g, k, 2560, 640);

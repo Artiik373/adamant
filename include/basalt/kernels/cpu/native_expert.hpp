@@ -36,6 +36,8 @@ struct NativeFmt {
     float swiglu_limit = 0.f;           ///< > 0: gate capped at it and up clamped to +-it before the product
     int exl3_w = 0;                     ///< EXL3 layer: 16-bit words per 16x16 tile (0: a GGUF layer); the blob is three
                                         ///< EXL3 projection records [gate | up | down] (exl3.hpp), activations are fp16
+    int ms_k = 0;                       ///< MS layer: K bits a weight (0: another format); the blob is three MS payloads
+                                        ///< [gate | up | down] (ms_expert.hpp), activations are fp16
 };
 
 /// Fills `f` for a layer (`swiglu_limit`: the model's SwiGLU limit, 0 for none; `up_type`: the up rows' type, -1 for
