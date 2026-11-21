@@ -127,7 +127,52 @@ def check_gguf_order() -> None:
     print("to_gguf_order: ssm_out columns and attn_qkv rows ok")
 
 
+def check_experts() -> None:
+    """Two layers of three experts (K 4 and 3): the blobs are [gate | up | down] per expert, the layout v8."""
+    hid, ff, n_exp = 64, 32, 3
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        w = ModelWriter(str(td / "base.basalt"))
+        q = bytes(N_OUT * N_IN // 32 * 34)
+        offs = w.add_parts("gguf", [q])
+        w.add_bytes("experts", b"old" * 10)
+        w.add_bytes("experts.layout", b"# experts v5\n")
+        meta = {"name": "t", "gguf_kv": {"qwen4exp.block_count": 2}, "tensors": {
+            "blk.0.attn_q.weight": {"type": "Q8_0", "type_id": 8, "shape": [N_IN, N_OUT], "offset": offs[0],
+                                    "bytes": len(q)}}}
+        w.add_bytes("meta", json.dumps(meta).encode())
+        w.close()
+        ms = td / "ms"
+        (ms / "experts").mkdir(parents=True)
+        ms_record(ms)
+        rng = np.random.default_rng(4)
+        want = []
+        for l, k in enumerate((4, 3)):
+            tens, per = {}, {}
+            for role, (n_in, n_out) in zip(ms_pack.ROLES, ((hid, ff), (hid, ff), (ff, hid))):
+                per[role] = [rng.integers(0, 256, ms_pack.payload_bytes(n_in, n_out, k), dtype=np.uint8).tobytes()
+                             for _ in range(n_exp)]
+                (ms / "experts" / f"blk.{l}.ffn_{role}_exps.ms").write_bytes(b"".join(per[role]))
+                tens[f"blk.{l}.ffn_{role}_exps.weight"] = {"file": f"blk.{l}.ffn_{role}_exps.ms", "shape": [n_in, n_out]}
+            (ms / "experts" / f"blk.{l}.experts.json").write_text(json.dumps(
+                {"layer": l, "k": k, "n_expert": n_exp, "tensors": tens}))
+            want += [per["gate"][e] + per["up"][e] + per["down"][e] for e in range(n_exp)]
+        out = td / "out.basalt"
+        assert ms_pack.main(["--base", str(td / "base.basalt"), "--ms-dir", str(ms), "--out", str(out), "--verify"]) == 0
+        m = ModelFile(str(out))
+        assert m.read("experts") == b"".join(want)
+        lines = m.read("experts.layout").decode().splitlines()
+        assert lines[0].startswith("# experts v8:") and "(n_expert 3," in lines[0], lines[0]
+        b0, b1 = len(want[0]), len(want[3])
+        assert lines[1:] == [f"0 124 124 0 {b0} 124", f"1 123 123 {3 * b0} {b1} 123"], lines
+        assert json.loads(m.read("meta"))["ms"]["experts"]["k"] == [4, 3]
+    print("ms_pack: experts interleaved, layout v8")
+
+
 class MsPackTest(unittest.TestCase):
+    def test_experts(self) -> None:
+        check_experts()
+
     def test_pack(self) -> None:
         check_pack()
 

@@ -14,6 +14,10 @@ payload of a GGUF [n_in, n_out] tensor is the engine's (include/basalt/artifact/
     int8 signs[n_in]                      +1 / -1, the input rotation y = W_rot * H(signs * x)
 
 The tensor type id is 120 + K (MS_C3 = 123, MS_C4 = 124, MS_C6 = 126).  The rows must already be in the GGUF order.
+
+With `<ms-dir>/experts/blk.<l>.experts.json` for every layer (ms_flashnext_convert.py), the `experts` section and
+`experts.layout` are rebuilt too.  An expert blob is three such payloads back to back, [gate | up | down], one K per
+layer; the layout is `# experts v8` with type 120 + K for gate, up and down.
 """
 from __future__ import annotations
 
@@ -31,6 +35,8 @@ from model_file import ModelFile, ModelWriter    # noqa: E402
 
 MS_TYPE_BASE = 120
 MS_BITS = (3, 4, 6)
+LAYOUT_VERSION = 8
+ROLES = ("gate", "up", "down")
 
 
 class PackError(Exception):
@@ -88,6 +94,66 @@ def read_records(ms_dir: Path, tensors: dict) -> dict:
     return out
 
 
+class Experts:
+    """The routed experts of `<ms-dir>/experts`, one record per layer, checked before anything is written."""
+
+    def __init__(self, exp_dir: Path, n_layers: int):
+        self.layers = []
+        for l in range(n_layers):
+            p = exp_dir / f"blk.{l}.experts.json"
+            if not p.exists():
+                raise PackError(f"{p}: missing (every layer needs its experts)")
+            rec = json.loads(p.read_text(encoding="utf-8"))
+            k, n = int(rec["k"]), int(rec["n_expert"])
+            if k not in MS_BITS:
+                raise PackError(f"{p.name}: K {k}")
+            files, sizes = [], []
+            for role in ROLES:
+                t = rec["tensors"][f"blk.{l}.ffn_{role}_exps.weight"]
+                n_in, n_out = (int(d) for d in t["shape"])
+                if n_in % 32:
+                    raise PackError(f"{p.name}: {role} n_in {n_in} is not a multiple of 32")
+                per = payload_bytes(n_in, n_out, k)
+                f = exp_dir / t["file"]
+                if f.stat().st_size != per * n:
+                    raise PackError(f"{f.name}: {f.stat().st_size} B, expected {n} x {per}")
+                files.append(f)
+                sizes.append(per)
+            if self.layers and n != self.layers[0][1]:
+                raise PackError(f"{p.name}: {n} experts, layer 0 has {self.layers[0][1]}")
+            self.layers.append((k, n, files, sizes))
+        self.n_expert = self.layers[0][1]
+
+    def blob_bytes(self, l: int) -> int:
+        return sum(self.layers[l][3])
+
+    def total_bytes(self) -> int:
+        return sum(self.blob_bytes(l) * self.n_expert for l in range(len(self.layers)))
+
+    def chunks(self, group: int = 16):
+        for k, n, files, sizes in self.layers:
+            fs = [open(f, "rb") for f in files]
+            try:
+                for s in range(0, n, group):
+                    m = min(group, n - s)
+                    parts = [f.read(per * m) for f, per in zip(fs, sizes)]
+                    yield b"".join(p[e * per:(e + 1) * per] for e in range(m) for p, per in zip(parts, sizes))
+            finally:
+                for f in fs:
+                    f.close()
+
+    def layout_text(self) -> bytes:
+        lines, off = [], 0
+        for l, (k, n, _, _) in enumerate(self.layers):
+            t, blob = MS_TYPE_BASE + k, self.blob_bytes(l)
+            lines.append(f"{l} {t} {t} {off} {blob} {t}\n")
+            off += blob * n
+        head = (f"# experts v{LAYOUT_VERSION}: layer gu_type d_type offset blob_bytes up_type (n_expert {self.n_expert}, "
+                f"total {off}); MS blobs: per projection gate, up, down: rows, int8 signs[n_in]; type = "
+                f"{MS_TYPE_BASE} + K\n")
+        return (head + "".join(lines)).encode("utf-8")
+
+
 def write_gguf(out: ModelWriter, base: ModelFile, meta: dict, records: dict) -> None:
     """The `gguf` section with each recorded tensor replaced by its payload, the others copied unchanged."""
     off0, _ = base.section("gguf")
@@ -129,6 +195,20 @@ def main(argv=None) -> int:
             raise PackError(f"{a.base} has no `{need}` section")
     meta = json.loads(base.read("meta"))
     records = read_records(Path(a.ms_dir), meta["tensors"])
+    experts = None
+    if (Path(a.ms_dir) / "experts").is_dir():
+        for need in ("experts", "experts.layout"):
+            if need not in base.sections:
+                raise PackError(f"{a.base} has no `{need}` section")
+        n_layers = next(int(v) for kk, v in meta["gguf_kv"].items() if kk.endswith(".block_count"))
+        experts = Experts(Path(a.ms_dir) / "experts", n_layers)
+        by_kx: dict = {}
+        for l, (k, *_rest) in enumerate(experts.layers):
+            by_kx.setdefault(k, []).append(l)
+        for k, ls in sorted(by_kx.items()):
+            print(f"experts MS_C{k}: {len(ls)} layers, blob {experts.blob_bytes(ls[0]):,} B", file=sys.stderr)
+        print(f"experts: {experts.total_bytes() / 2**30:.2f} GiB (base {base.section('experts')[1] / 2**30:.2f} GiB)",
+              file=sys.stderr)
     by_k: dict = {}
     for name, (rec, _) in records.items():
         by_k.setdefault(int(rec["k"]), []).append(name)
@@ -138,10 +218,17 @@ def main(argv=None) -> int:
         return 0
 
     meta["ms"] = {"dense": {f"MS_C{k}": len(v) for k, v in sorted(by_k.items())}, "type_base": MS_TYPE_BASE}
+    if experts is not None:
+        meta["ms"]["experts"] = {"k": [k for k, *_ in experts.layers], "layout_version": LAYOUT_VERSION}
     out = ModelWriter(a.out)
     try:
         for name in base.names():
-            if name == "meta":
+            if name == "meta" or (experts is not None and name == "experts.layout"):
+                continue
+            if experts is not None and name == "experts":
+                print("write experts ...", file=sys.stderr)
+                out.add_chunks("experts", experts.chunks())
+                out.add_bytes("experts.layout", experts.layout_text())
                 continue
             if name == "gguf":
                 write_gguf(out, base, meta, records)
