@@ -77,10 +77,45 @@ __device__ __forceinline__ void ms_fwht_smem(float* s, int n, int had_block) {
     }
 }
 
+// One Hadamard block of 32..512 values by one warp: s_x[base + 32 * i] = H(load(base + 32 * i)) for base = first +
+// lane, H without its 1/sqrt(had_block).  Lane l holds values l + 32*i (i < had_block/32); butterflies of distance
+// >= 32 inside a lane in registers, shorter ones across lanes by shuffles (the stages commute).
+template <typename Load>
+__device__ __forceinline__ void ms_rotate_block_warp(float* s_x, Load load, int first, int had_block) {
+    const int lane = threadIdx.x & 31;
+    const int v = had_block >> 5;
+    const int base = first + lane;
+    float r[16];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) if (i < v) r[i] = load(base + 32 * i);
+    #pragma unroll
+    for (int h = 1; h < 16; h <<= 1) {
+        if (h >= v) break;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            if (i < v && (i & h) == 0) {
+                const float a = r[i], b = r[i + h];
+                r[i] = a + b;
+                r[i + h] = a - b;
+            }
+        }
+    }
+    #pragma unroll
+    for (int m = 1; m < 32; m <<= 1) {
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            if (i < v) {
+                const float o = __shfl_xor_sync(0xFFFFFFFFu, r[i], m);
+                r[i] = (lane & m) ? o - r[i] : r[i] + o;
+            }
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) if (i < v) s_x[base + 32 * i] = r[i];
+}
+
 // s_x = H(load(i)) in shared memory, H the block Hadamard without its 1/sqrt(had_block); load(i) is the signed input.
-// Blocks of 32..512 values: one warp per Hadamard block, lane l holding values l + 32*i (i < had_block/32);
-// butterflies of distance >= 32 inside a lane in registers, shorter ones across lanes by shuffles (the stages
-// commute). Smaller blocks use a shared-memory loop.
+// Blocks of 32..512 values: a warp per Hadamard block (ms_rotate_block_warp).  Smaller blocks use a shared-memory loop.
 template <typename Load>
 __device__ __forceinline__ void ms_stage_rotated(float* s_x, Load load, int n, int had_block) {
     if (had_block < 32) {
@@ -89,38 +124,8 @@ __device__ __forceinline__ void ms_stage_rotated(float* s_x, Load load, int n, i
         ms_fwht_smem(s_x, n, had_block);
         return;
     }
-    const int lane = threadIdx.x & 31;
-    const int v = had_block >> 5;
-    for (int blk = threadIdx.x >> 5; blk * had_block < n; blk += blockDim.x >> 5) {
-        const int base = blk * had_block + lane;
-        float r[16];
-        #pragma unroll
-        for (int i = 0; i < 16; ++i) if (i < v) r[i] = load(base + 32 * i);
-        #pragma unroll
-        for (int h = 1; h < 16; h <<= 1) {
-            if (h >= v) break;
-            #pragma unroll
-            for (int i = 0; i < 16; ++i) {
-                if (i < v && (i & h) == 0) {
-                    const float a = r[i], b = r[i + h];
-                    r[i] = a + b;
-                    r[i + h] = a - b;
-                }
-            }
-        }
-        #pragma unroll
-        for (int m = 1; m < 32; m <<= 1) {
-            #pragma unroll
-            for (int i = 0; i < 16; ++i) {
-                if (i < v) {
-                    const float o = __shfl_xor_sync(0xFFFFFFFFu, r[i], m);
-                    r[i] = (lane & m) ? o - r[i] : r[i] + o;
-                }
-            }
-        }
-        #pragma unroll
-        for (int i = 0; i < 16; ++i) if (i < v) s_x[base + 32 * i] = r[i];
-    }
+    for (int blk = threadIdx.x >> 5; blk * had_block < n; blk += blockDim.x >> 5)
+        ms_rotate_block_warp(s_x, load, blk * had_block, had_block);
     __syncthreads();
 }
 

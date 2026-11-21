@@ -16,7 +16,7 @@ namespace mc = adamant::kernels::ms_cuda;
 
 constexpr int kWarps = 8;
 constexpr int kMaxCols = 8;
-constexpr int kRowWords = 512;               // a warp's staged row chunk, in 32-bit words
+constexpr int kRowWords = 192;               // a warp's staged row chunk, in 32-bit words
 constexpr int kWordsPerLane = kRowWords / 32;
 constexpr size_t kSmem = 48 * 1024 - kWarps * (kRowWords + 1) * 4;   // the staged columns: two blocks an SM
 
@@ -26,7 +26,7 @@ constexpr size_t kSmem = 48 * 1024 - kWarps * (kRowWords + 1) * 4;   // the stag
 // current one; a lane decodes 4 adjacent columns a step from one 32-bit window and takes every staged column from
 // the same decoded values.  A column's sum has one order whatever columns ride along.
 template <int K, int NC>
-__global__ void __launch_bounds__(kWarps * 32) ms_gemv_cols_kernel(const uint8_t* __restrict__ w,
+__global__ void __launch_bounds__(kWarps * 32, 4) ms_gemv_cols_kernel(const uint8_t* __restrict__ w,
                                                                    const mc::MsQ81* __restrict__ x,
                                                                    float* __restrict__ y, int n_in, int n_out,
                                                                    int col0) {
@@ -37,13 +37,10 @@ __global__ void __launch_bounds__(kWarps * 32) ms_gemv_cols_kernel(const uint8_t
     const int stride_words = (int) (mc::ms_row_bytes(n_in, K) >> 2);
     const int hb = mc::ms_hadamard_block(n_in);
     const int8_t* signs = reinterpret_cast<const int8_t*>(w + (size_t) n_out * stride_words * 4);
-    for (int j = 0; j < NC; ++j)
-        mc::ms_stage_q8_rotated(s_x + j * n_in, x + (size_t) (c0 + j) * (n_in / 32), signs, n_in, hb);
     const float rs = rsqrtf((float) hb);
     const int lane = threadIdx.x & 31, n4 = n_in / 4;
     const int warp_stride = gridDim.y * kWarps;
     int row = blockIdx.y * kWarps + (threadIdx.x >> 5);
-    if (row >= n_out) return;
 
     // a row in chunks of kChunkSteps steps of 128 columns: a chunk starts at word ch * kChunkWords with the row
     // start's in-word bit offsets and needs kChunkWords + 1 words
@@ -64,7 +61,24 @@ __global__ void __launch_bounds__(kWarps * 32) ms_gemv_cols_kernel(const uint8_t
         }
     };
     int ch = 0;
-    fetch(row, 0);
+    if (row < n_out) fetch(row, 0);   // in flight while the columns are staged
+    // the NC columns' Hadamard blocks spread over all warps, one barrier
+    if (hb >= 32) {
+        const int per = n_in / hb;
+        for (int b = threadIdx.x >> 5; b < NC * per; b += kWarps) {
+            const int j = b / per;
+            const mc::MsQ81* xq = x + (size_t) (c0 + j) * (n_in / 32);
+            mc::ms_rotate_block_warp(s_x + j * n_in, [&](int i) {
+                const mc::MsQ81& q = xq[i >> 5];
+                return __half2float(q.d) * (float) q.qs[i & 31] * (float) __ldg(signs + i);
+            }, (b - j * per) * hb, hb);
+        }
+        __syncthreads();
+    } else {
+        for (int j = 0; j < NC; ++j)
+            mc::ms_stage_q8_rotated(s_x + j * n_in, x + (size_t) (c0 + j) * (n_in / 32), signs, n_in, hb);
+    }
+    if (row >= n_out) return;
     const int lane_bit = 4 * lane * K + 18, bit_off = lane_bit & 31;
     const int lane_steps = (n4 - lane + 31) / 32;   // steps where this lane's 4 columns exist
     float acc[NC] = {};
@@ -140,6 +154,10 @@ void launch_nc(const uint8_t* w, const void* x, float* y, int n_in, int n_out, i
     // the chunks of a row block are neighbours in the grid, so they read its rows from L2 while they are there
     const int need = (n_out + kWarps - 1) / kWarps, want = sm_count() * 4 / chunks;
     const int gy = want < 1 ? 1 : want > need ? need : want;
+    // the most shared memory an SM can carve out: the blocks are limited by it, not by L1
+    static const bool carve = cudaFuncSetAttribute(ms_gemv_cols_kernel<K, NC>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                                   cudaSharedmemCarveoutMaxShared) == cudaSuccess;
+    (void) carve;
     ms_gemv_cols_kernel<K, NC><<<dim3(chunks, gy), kWarps * 32, (size_t) NC * n_in * 4, s>>>(
         w, static_cast<const mc::MsQ81*>(x), y, n_in, n_out, col0);
 }
