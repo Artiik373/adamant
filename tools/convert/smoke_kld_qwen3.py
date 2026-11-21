@@ -139,13 +139,36 @@ def main() -> None:
     parser.add_argument("--quant-lm-head", action="store_true", help="Also quantize lm_head to MS_C6")
     parser.add_argument("--gguf", type=Path, help="Measure this GGUF's decoder linears instead of quantizing")
     parser.add_argument(
-        "--calib-mode", choices=["fp", "guided", "kron-emp", "kron-true"], default="fp",
+        "--calib-mode", choices=["fp", "guided", "kron-emp", "kron-true", "swiglu"], default="fp",
         help="fp: Hessians from the BF16 model; "
         "guided: GuidedQuant, x x^T weighted by the squared loss gradient of each output-row group; "
         "kron-emp / kron-true: two-sided rounding on H = E[g g^T] (x) E[x x^T], g from data labels (empirical Fisher) "
-        "or from labels sampled from the model (true Fisher, the Hessian of the KL)",
+        "or from labels sampled from the model (true Fisher, the Hessian of the KL); "
+        "swiglu: as fp, but each group of gate / up rows weights a token's x x^T by its rows' local output "
+        "sensitivity through SwiGLU and down (up: silu(g) |W_down[:, r]|, gate: u silu'(g) |W_down[:, r]|), no gradients",
     )
     parser.add_argument("--guided-groups", type=int, default=4, help="output-row groups per layer for --calib-mode guided")
+    parser.add_argument("--calib-tokenizer", type=Path,
+                        help="the tokenizer --calib was built with, when it is not the model's: re-tokenized as text")
+    parser.add_argument("--spine-k", type=int, default=None, help="bits of the non-expert linears (default --k)")
+    parser.add_argument("--hess-tau", type=float, default=0.0,
+                        help="MoE: shrink each expert's Hessians toward the layer's with this many tokens' weight")
+    parser.add_argument("--hess-affinity", action="store_true",
+                        help="MoE: weight each routed token in its expert's Hessians by its router score squared")
+    parser.add_argument("--sign-trials", type=int, default=1,
+                        help="per matrix, keep the best of this many sign vectors (smallest rotated fourth moment)")
+    parser.add_argument("--window", type=int, default=32, help="Viterbi search window (columns)")
+    parser.add_argument("--commit", type=int, default=8, help="columns committed per window")
+    parser.add_argument("--ls-scales", action="store_true",
+                        help="after each matrix's search, refit every row's scale by least squares under its Hessian")
+    parser.add_argument("--tune-scales", type=int, default=0, metavar="STEPS",
+                        help="after coding, train each coded row's scale (codes fixed: the format's fp16 row scale) on "
+                        "KL(BF16 || quantized) over the calibration sequences for STEPS optimizer steps")
+    parser.add_argument("--tune-lr", type=float, default=5e-4, help="Adam learning rate of the row-scale factors")
+    parser.add_argument("--tune-norms", action="store_true", help="with --tune-scales: train the RMSNorm weights too")
+    parser.add_argument("--tune-cache", action="store_true",
+                        help="with --tune-scales: distill from the calibration logits cached before quantizing "
+                        "(no second model copy: MoE models)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -157,10 +180,27 @@ def main() -> None:
         trust_remote_code=True,
     )
     model.eval()
+    teacher = None
+    if args.tune_scales and not args.tune_cache:   # the BF16 model the tuning distills from
+        teacher = AutoModelForCausalLM.from_pretrained(args.model_dir, dtype=torch.bfloat16, device_map=device,
+                                                       trust_remote_code=True).eval()
+        teacher.requires_grad_(False)
 
     calib_all = torch.load(args.calib, map_location="cpu", weights_only=True)
     vocab_size = model.config.vocab_size
     calib_all = calib_all.clamp(0, vocab_size - 1)
+    if args.calib_tokenizer:   # decode with the pool's tokenizer, encode with the model's, repack into windows
+        from transformers import AutoTokenizer
+        src, dst = AutoTokenizer.from_pretrained(args.calib_tokenizer), AutoTokenizer.from_pretrained(args.model_dir)
+        n_len = calib_all.shape[1]
+        rows, buf = [], []
+        for r in calib_all.tolist():
+            buf += dst.encode(src.decode(r), add_special_tokens=False)
+            while len(buf) >= n_len:
+                rows.append(buf[:n_len])
+                del buf[:n_len]
+        calib_all = torch.tensor(rows, dtype=torch.long)
+        print(f"re-tokenized the pool: {calib_all.shape[0]} windows of {n_len}", flush=True)
     calib_ids, eval_ids = split_calib(calib_all, args.calib_seqs, args.eval_seqs)
 
     viterbi_cuda_fn = None
@@ -172,6 +212,9 @@ def main() -> None:
     t0 = time.time()
     print(f"Evaluating BF16 reference logits on {args.eval_seqs} held-out sequences...", flush=True)
     ref_logits = collect_logits(model, eval_ids, device, batch_size=args.batch_size)
+    if args.tune_scales and args.tune_cache:   # the teacher's calibration logits, before the model is quantized
+        teacher = [model(input_ids=calib_ids[i:i + 1].to(device=device, dtype=torch.long)).logits.to("cpu", torch.float16)
+                   for i in range(calib_ids.shape[0])]
 
     if args.gguf:
         print(f"Loading decoder linears from {args.gguf}: {load_gguf_linears(model, args.gguf)}", flush=True)
@@ -187,10 +230,12 @@ def main() -> None:
     mode_str = "fast-greedy" if args.fast_greedy else ("viterbi-cuda" if viterbi_cuda_fn else "viterbi-py")
 
     def quantize_linear(idx: int, name: str, mod: nn.Linear, w_target: torch.Tensor, h_f32: torch.Tensor) -> None:
-        k_use = 6 if name == "lm_head" else args.k
+        k_use = 6 if name == "lm_head" else (args.spine_k or args.k)
         w_f32 = mod.weight.detach().to(device=device, dtype=torch.float32)
         blk = largest_pow2_divisor(int(w_f32.shape[1]), cap=512)
         seed = (idx + 1) * 10007
+        if args.sign_trials > 1:
+            seed = ms.best_sign_seed(w_target.float(), blk, seed, args.sign_trials)
 
         # h_f32 [in, in], or [groups, in, in] with one Hessian per contiguous block of output rows
         hs = h_f32 if h_f32.dim() == 3 else h_f32.unsqueeze(0)
@@ -203,11 +248,15 @@ def main() -> None:
         if viterbi_cuda_fn is not None and not args.fast_greedy:
             from ms_viterbi_cuda import viterbi_code_batched_cuda
 
-            w_rot_q = viterbi_code_batched_cuda(w_rot, hu, k_use, lut)[2]
+            w_rot_q = viterbi_code_batched_cuda(w_rot, hu, k_use, lut, window=args.window, commit=args.commit)[2]
         elif args.fast_greedy:
             w_rot_q = torch.stack([greedy_trellis_code_matrix(w_rot[j], hu[j], k=k_use, lut=lut) for j in range(n_g)])
         else:
             w_rot_q = torch.stack([ms.viterbi_code_matrix(w_rot[j], hu[j], k=k_use, lut=lut)[2] for j in range(n_g)])
+        if args.ls_scales:   # each row's scale refit: min (w - a q) H (w - a q)^T, a = <w, q>_H / <q, q>_H
+            qh = torch.einsum("gro,gpo->grp", w_rot_q, torch.stack([r[1] for r in rot]))
+            a = (qh * w_rot).sum(-1) / (qh * w_rot_q).sum(-1).clamp(min=1e-20)
+            w_rot_q = w_rot_q * a.unsqueeze(-1)
         w_q = ms.fwht_blocks(w_rot_q.reshape(w_target.shape), block_size=blk) * signs.unsqueeze(0)
         mod.weight.data.copy_(w_q.to(dtype=mod.weight.dtype))
 
@@ -249,10 +298,16 @@ def main() -> None:
                 print(f"  [{j['idx'] + 1}/{len(target_linears)}] {j['name']} rel_err="
                       f"{((w_q - w0).norm() / w0.norm()).item():.4f} ({time.time() - t0:.1f}s)", flush=True)
 
-    if args.calib_mode != "fp":
+    def finish(label: str) -> None:
+        report(label, ref_logits, collect_logits(model, eval_ids, device, args.batch_size), t0)
+        if args.tune_scales:
+            tune_scales(model, teacher, target_linears, calib_ids, device, args)
+            report(f"{label} + tuned row scales{' and norms' if args.tune_norms else ''}", ref_logits,
+                   collect_logits(model, eval_ids, device, args.batch_size), t0)
+
+    if args.calib_mode not in ("fp", "swiglu"):
         quantize_guided(model, target_linears, quantize_linear, quantize_two_sided_many, calib_ids, device, args)
-        report(f"MS_C{args.k} ({mode_str}, {args.calib_mode})", ref_logits,
-               collect_logits(model, eval_ids, device, args.batch_size), t0)
+        finish(f"MS_C{args.k} ({mode_str}, {args.calib_mode})")
         return
 
     hessians: dict[str, torch.Tensor] = {}
@@ -271,8 +326,43 @@ def main() -> None:
                 counts[name] += x.shape[0]
         return hook
 
+    swiglu: dict[str, torch.Tensor] = {}   # gate / up name -> [groups, in, in]
+
+    def make_mlp_hook(prefix: str, mlp):
+        n_g = args.guided_groups
+        nd = mlp.down_proj.weight.detach().float().norm(dim=0)   # |W_down[:, r]| of each intermediate row
+
+        def hook(_mod, inp, _out):
+            x = inp[0].detach().reshape(-1, inp[0].shape[-1]).float()
+            g = x @ mlp.gate_proj.weight.detach().float().T
+            u = x @ mlp.up_proj.weight.detach().float().T
+            sg = torch.sigmoid(g)
+            for nm, c in ((f"{prefix}.up_proj", g * sg * nd), (f"{prefix}.gate_proj", u * sg * (1 + g * (1 - sg)) * nd)):
+                wt = (c * c).reshape(c.shape[0], n_g, -1).mean(-1)   # [tokens, groups]
+                h = torch.stack([(x * wt[:, j:j + 1]).T @ x for j in range(n_g)])
+                swiglu[nm] = swiglu[nm] + h if nm in swiglu else h
+        return hook
+
+    # MoE blocks (fused experts, as Qwen4Exp's): their inputs kept on the host, the experts coded after the pass
+    moe_blocks = [(n, m) for n, m in model.named_modules() if hasattr(m, "experts") and hasattr(m, "gate")
+                  and hasattr(getattr(m, "experts"), "gate_up_proj")]
+    moe_x: dict[str, list] = {n: [] for n, _ in moe_blocks}
+
+    def make_moe_hook(name: str):
+        def hook(_mod, inp, _out):
+            moe_x[name].append(inp[0].detach().reshape(-1, inp[0].shape[-1]).to("cpu"))
+        return hook
+
+    for name, mod in moe_blocks:
+        hooks.append(mod.register_forward_hook(make_moe_hook(name)))
     for name, mod in target_linears:
+        if args.calib_mode == "swiglu" and name.endswith((".gate_proj", ".up_proj")):
+            continue
         hooks.append(mod.register_forward_hook(make_hook(name)))
+    if args.calib_mode == "swiglu":
+        for name, mod in model.named_modules():
+            if name.endswith(".mlp") and hasattr(mod, "gate_proj"):
+                hooks.append(mod.register_forward_hook(make_mlp_hook(name, mod)))
 
     print(f"Collecting Hessians across {args.calib_seqs} sequences (batch={args.batch_size})...", flush=True)
     for i in range(0, args.calib_seqs, args.batch_size):
@@ -286,10 +376,126 @@ def main() -> None:
     print(f"Quantizing {len(target_linears)} linear layers to MS_C{args.k} ({mode_str})...", flush=True)
     for idx, (name, mod) in enumerate(target_linears):
         w_f32 = mod.weight.detach().to(device=device, dtype=torch.float32)
-        quantize_linear(idx, name, mod, w_f32, hessians.pop(name) / max(counts[name], 1))
+        h_l = swiglu.pop(name) if name in swiglu else hessians.pop(name) / max(counts[name], 1)
+        quantize_linear(idx, name, mod, w_f32, h_l)
+
+    if moe_blocks:
+        from ms_flashnext_convert import code, expert_hessians
+        for li, (name, blk) in enumerate(moe_blocks):
+            x = torch.cat(moe_x.pop(name)).to(device)
+            _, wts, idx = blk.gate(x)
+            ex = blk.experts
+            h_all = x_ref = None
+            if args.hess_tau > 0:
+                xf = x.float()
+                h_all = xf.T @ xf / xf.shape[0]
+                x_ref = x[torch.randperm(x.shape[0], generator=torch.Generator().manual_seed(li))[:2048].to(device)]
+            zero = 0
+            for e0 in range(0, ex.gate_up_proj.shape[0], 16):
+                es = list(range(e0, min(e0 + 16, ex.gate_up_proj.shape[0])))
+                hs = [expert_hessians(x, idx, e, ex.gate_up_proj[e].float(), wts if args.hess_affinity else None,
+                                      args.hess_tau, h_all, x_ref) for e in es]
+                zero += sum(1 for h in hs if h[2] == 0)
+                gu = code(ex.gate_up_proj[es].float(), torch.stack([h[0] for h in hs]), args.k, lut,
+                          [li * 4096 + 2 * e + 1 for e in es])
+                dn = code(ex.down_proj[es].float(), torch.stack([h[1] for h in hs]), args.k, lut,
+                          [li * 4096 + 2 * e + 2 for e in es])
+                for i, e in enumerate(es):
+                    ex.gate_up_proj.data[e].copy_(gu[i][2].to(ex.gate_up_proj.dtype))
+                    ex.down_proj.data[e].copy_(dn[i][2].to(ex.down_proj.dtype))
+            del x
+            print(f"  experts of {name}: MS_C{args.k}, zero-token {zero} ({time.time() - t0:.1f}s)", flush=True)
 
     print("Evaluating quantized MS logits...", flush=True)
-    report(f"MS_C{args.k} ({mode_str})", ref_logits, collect_logits(model, eval_ids, device, args.batch_size), t0)
+    finish(f"MS_C{args.k} ({mode_str})")
+
+
+def _scaled_experts_forward(self, hidden_states, top_k_index, top_k_weights):
+    """The fused experts' forward (OlmoeExperts / Qwen4ExpTextExperts) with each expert's row factors ms_a_gu, ms_a_d
+    on its gate/up and down output channels: the same as scaling the rows, without a copy of the weights."""
+    out = torch.zeros_like(hidden_states)
+    mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts + 1).permute(2, 1, 0)
+    for e in torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero()[:, 0].tolist():
+        if e == self.num_experts:
+            continue
+        pos, tok = torch.where(mask[e])
+        gu = nn.functional.linear(hidden_states[tok], self.gate_up_proj[e]) * self.ms_a_gu[e].to(hidden_states.dtype)
+        g, u = gu.chunk(2, dim=-1)
+        y = nn.functional.linear(self.act_fn(g) * u, self.down_proj[e]) * self.ms_a_d[e].to(hidden_states.dtype)
+        out.index_add_(0, tok, (y * top_k_weights[tok, pos, None]).to(out.dtype))
+    return out
+
+
+class _RowScale(nn.Module):
+    """W -> alpha[:, None] * W: a coded row times a factor, which the format stores in its fp16 row scale."""
+
+    def __init__(self, rows: int, device):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.ones(rows, device=device, dtype=torch.float32))
+
+    def forward(self, w):
+        return w * self.alpha.to(w.dtype)[:, None]
+
+
+@torch.enable_grad()
+def tune_scales(model, teacher, target_linears, calib_ids, device, args) -> None:
+    """Codes fixed, row scales (and with --tune-norms the RMSNorm weights) trained on KL(teacher || model) over the
+    calibration sequences, one sequence a step, cycling; the factors are then folded into the weights."""
+    import torch.nn.utils.parametrize as P
+
+    model.requires_grad_(False)
+    params = []
+    for _name, mod in target_linears:
+        P.register_parametrization(mod, "weight", _RowScale(mod.weight.shape[0], device))
+        params.append(mod.parametrizations.weight[0].alpha)
+    fused = [m for m in model.modules() if hasattr(m, "gate_up_proj") and hasattr(m, "down_proj")
+             and isinstance(getattr(m, "gate_up_proj"), nn.Parameter)]
+    for m in fused:   # each expert's rows: the format's row scales, applied to its output channels while training
+        m.ms_a_gu = nn.Parameter(torch.ones(m.gate_up_proj.shape[:2], device=device))
+        m.ms_a_d = nn.Parameter(torch.ones(m.down_proj.shape[:2], device=device))
+        params += [m.ms_a_gu, m.ms_a_d]
+        m.forward = _scaled_experts_forward.__get__(m)
+    norm_params = []
+    if args.tune_norms:
+        for name, mod in model.named_modules():
+            if "norm" in type(mod).__name__.lower() and getattr(mod, "weight", None) is not None:
+                mod.weight.requires_grad_(True)
+                norm_params.append(mod.weight)
+    groups = [{"params": params, "lr": args.tune_lr}]
+    if norm_params:
+        groups.append({"params": norm_params, "lr": args.tune_lr * 0.2})
+    opt = torch.optim.Adam(groups)
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.config.use_cache = False
+    model.train()
+    t0 = time.time()
+    run = 0.0
+    for step in range(args.tune_scales):
+        ids = calib_ids[step % calib_ids.shape[0]: step % calib_ids.shape[0] + 1].to(device=device, dtype=torch.long)
+        with torch.no_grad():
+            t_lg = teacher[step % len(teacher)].to(device) if isinstance(teacher, list) else teacher(input_ids=ids).logits
+            t_lp = torch.log_softmax(t_lg.float(), dim=-1)
+        s_lp = torch.log_softmax(model(input_ids=ids).logits.float(), dim=-1)
+        loss = (t_lp.exp() * (t_lp - s_lp)).sum(-1).mean()
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        run = loss.item() if step == 0 else 0.95 * run + 0.05 * loss.item()
+        if (step + 1) % 50 == 0 or step + 1 == args.tune_scales:
+            a = torch.cat([p.detach() for p in params])
+            print(f"  tune {step + 1}/{args.tune_scales}: KL {run:.5f}, factor range [{a.min().item():.4f}, "
+                  f"{a.max().item():.4f}] ({time.time() - t0:.0f}s)", flush=True)
+    model.eval()
+    model.gradient_checkpointing_disable()
+    for _name, mod in target_linears:
+        P.remove_parametrizations(mod, "weight", leave_parametrized=True)
+    with torch.no_grad():
+        for m in fused:   # the factors folded into the rows
+            m.gate_up_proj.mul_(m.ms_a_gu.to(m.gate_up_proj.dtype)[..., None])
+            m.down_proj.mul_(m.ms_a_d.to(m.down_proj.dtype)[..., None])
+            del m.ms_a_gu, m.ms_a_d, m.forward   # the class forward again
+    for w in norm_params:
+        w.requires_grad_(False)
 
 
 def quantize_guided(model, target_linears, quantize_linear, quantize_many, calib_ids, device, args, chunk_layers: int = 7) -> None:

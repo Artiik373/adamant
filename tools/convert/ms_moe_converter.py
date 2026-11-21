@@ -87,6 +87,19 @@ def rotate_weight_and_hessian(
     return w_rot, h_rot, signs
 
 
+def best_sign_seed(w: torch.Tensor, block_size: int, seed: int, trials: int) -> int:
+    """Of `trials` seeds (seed, seed + 1, ...), the one whose rotated weights have the smallest fourth moment
+    sum(w^4) / sum(w^2)^2: the fewest outliers for the trellis (OptRot's objective over the sign vectors only)."""
+    best, best_m = seed, None
+    for t in range(max(trials, 1)):
+        sd = seed + t
+        wr = fwht_blocks(w * random_hadamard_signs(w.shape[1], sd, w.device).unsqueeze(0), block_size)
+        m = (wr.pow(4).sum() / wr.pow(2).sum().pow(2)).item()
+        if best_m is None or m < best_m:
+            best, best_m = sd, m
+    return best
+
+
 def denoise_hessian_rmt(h: torch.Tensor, n_samples: int, base_damp: float = 0.01) -> torch.Tensor:
     """Marchenko-Pastur (MP+DG-Flat) RMT denoising for undersampled/cold experts (r/D < 0.5)."""
     d = h.shape[0]
