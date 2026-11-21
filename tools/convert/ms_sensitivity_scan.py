@@ -179,13 +179,13 @@ def quantize_experts(moe, x, idx, k, lut, experts, eb: int = 16):
     return gu_q, dn_q
 
 
-def run_layer(layer, h, kws, batch, grab_in=None, grab_out=None):
+def run_layer(layer, h, kws, batch, grab_in=None, grab_out=None, inplace=False):
     hooks = []
     if grab_in is not None:
         hooks.append(layer.mlp.register_forward_pre_hook(lambda m, a: grab_in.append(a[0].reshape(-1, a[0].shape[-1]))))
     if grab_out is not None:
         hooks.append(layer.mlp.register_forward_hook(lambda m, a, o: grab_out.append(o.reshape(-1, o.shape[-1]).float())))
-    out = torch.empty_like(h)
+    out = h if inplace else torch.empty_like(h)   # inplace: each batch is on the device before its slot is overwritten
     dev = next(layer.parameters()).device   # h may live on the host (a large calibration set): a batch at a time
     with torch.no_grad():
         for b, kw in enumerate(kws):

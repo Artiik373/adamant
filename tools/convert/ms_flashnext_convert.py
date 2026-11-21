@@ -68,12 +68,15 @@ def pack_rows(states: torch.Tensor, scales: torch.Tensor, k: int) -> bytes:
     return out.cpu().numpy().tobytes()
 
 
+VITERBI = (32, 8)   # search window, commit length; set from --window/--commit
+
+
 def code(ws: torch.Tensor, hs: torch.Tensor, k: int, lut, seeds) -> list:
     """Code E matrices [E, out, in] on Hessians [E, in, in]: (rows bytes, int8 signs, decoded W) per matrix."""
     blk = largest_pow2_divisor(int(ws.shape[2]), cap=512)
     rot = [ms.rotate_weight_and_hessian(w, h, block_size=blk, seed=s) for w, h, s in zip(ws, hs, seeds)]
     hu = torch.stack([ms.cholesky_inv_upper(r[1]) for r in rot])
-    scales, states, q = viterbi_code_batched_cuda(torch.stack([r[0] for r in rot]), hu, k, lut)
+    scales, states, q = viterbi_code_batched_cuda(torch.stack([r[0] for r in rot]), hu, k, lut, *VITERBI)
     out = []
     for i, r in enumerate(rot):
         signs = r[2]
@@ -90,7 +93,7 @@ def code_rows(w: torch.Tensor, h: torch.Tensor, k: int, lut, seed: int, chunk: i
     parts = []
     for r0 in range(0, w.shape[0], chunk):
         w_rot = ms.fwht_blocks(w[r0 : r0 + chunk].float() * signs.unsqueeze(0), blk)
-        scales, states, _ = viterbi_code_batched_cuda(w_rot.unsqueeze(0), hu, k, lut)
+        scales, states, _ = viterbi_code_batched_cuda(w_rot.unsqueeze(0), hu, k, lut, *VITERBI)
         parts.append(pack_rows(states[0], scales[0], k))
     return b"".join(parts), signs.to(torch.int8).cpu().numpy()
 
@@ -104,14 +107,20 @@ def expert_hessians(x: torch.Tensor, idx: torch.Tensor, e: int, w_gu: torch.Tens
     tau tokens' weight, so a rarely routed expert keeps the layer's input statistics instead of a few tokens' or none."""
     hit = idx == e
     rows = hit.any(-1)
-    xe = x[rows].float()
-    n = xe.shape[0]
+    sel = rows.nonzero().squeeze(1)
+    n = sel.numel()
     if tau <= 0 and not n:
         return torch.eye(x.shape[1], device=x.device), torch.eye(w_gu.shape[0] // 2, device=x.device), 0
-    p = (wts.float()[rows] * hit[rows]).sum(-1) ** 2 if wts is not None else torch.ones(n, device=x.device)
-    g, u = (xe @ w_gu.T).chunk(2, -1)
-    a = torch.nn.functional.silu(g) * u
-    s_in, s_dn, m = (xe * p[:, None]).T @ xe, (a * p[:, None]).T @ a, p.sum()
+    p = (wts.float()[sel] * hit[sel]).sum(-1) ** 2 if wts is not None else torch.ones(n, device=x.device)
+    s_in = torch.zeros(x.shape[1], x.shape[1], device=x.device)
+    s_dn = torch.zeros(w_gu.shape[0] // 2, w_gu.shape[0] // 2, device=x.device)
+    for c in range(0, n, 65536):   # in chunks: a busy expert's tokens in fp32 would not fit next to x
+        xe, pc = x[sel[c : c + 65536]].float(), p[c : c + 65536, None]
+        g, u = (xe @ w_gu.T).chunk(2, -1)
+        a = torch.nn.functional.silu(g) * u
+        s_in += (xe * pc).T @ xe
+        s_dn += (a * pc).T @ a
+    m = p.sum()
     if tau <= 0:
         return s_in, s_dn, n
     gr, ur = (x_ref.float() @ w_gu.T).chunk(2, -1)
@@ -133,7 +142,7 @@ def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0
     n_exp, two_ff, n_embd = ex.gate_up_proj.shape
     n_ff = two_ff // 2
     files = {n: open(out_dir / f"blk.{l}.ffn_{n}_exps.ms", "wb") for n in ("gate", "up", "down")}
-    eb = 16
+    eb = 8 * 32 // VITERBI[0]   # experts per batch: the back-pointer buffer grows with the window
     zero = 0
     try:
         for e0 in range(0, n_exp, eb):
@@ -188,6 +197,8 @@ def main() -> None:
     p.add_argument("--stop-after", type=int, default=None, help="last layer to convert in this run")
     p.add_argument("--reuse-from", type=Path, help="an earlier output folder (same plan) to copy layers from")
     p.add_argument("--reuse-layers", type=int, default=0, help="copy layers below this from --reuse-from")
+    p.add_argument("--window", type=int, default=32, help="Viterbi search window")
+    p.add_argument("--commit", type=int, default=8, help="Viterbi commit length")
     p.add_argument("--hess-tau", type=float, default=0.0,
                    help="shrink each expert's Hessians toward the layer's with this many tokens' weight (0: off)")
     p.add_argument("--hess-affinity", action="store_true",
@@ -198,6 +209,8 @@ def main() -> None:
 
     dev = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True  # Hessian sums: TF32 inputs, FP32 accumulation
+    global VITERBI
+    VITERBI = (args.window, args.commit)
     out = args.out_dir
     (out / "experts").mkdir(parents=True, exist_ok=True)
     tc = json.loads((args.hf_dir / "config.json").read_text())["text_config"]
@@ -227,20 +240,28 @@ def main() -> None:
         layer = load_layer(cfg, args.hf_dir, wmap, l, dev)
         if l < args.reuse_layers:
             # the layer's records come from an earlier run with the same plan; only advance the stream
-            h = run_layer(layer, h, kws, bs)
+            h = run_layer(layer, h, kws, bs, inplace=True)
             for src in list(args.reuse_from.glob(f"blk.{l}.*")) + list((args.reuse_from / "experts").glob(f"blk.{l}.*")):
                 shutil.copy2(src, out / src.relative_to(args.reuse_from))
             del layer
             torch.save({"next_layer": l + 1, "h": h}, state)
             print(f"layer {l:2d}: records reused from {args.reuse_from}, forward {time.time() - t0:.0f}s", flush=True)
             continue
-        hess, counts, xs = {}, {}, []
+        hess, counts = {}, {}
         hooks = spine_hooks(layer, hess, counts)
-        h = run_layer(layer, h, kws, bs, grab_in=xs)
+        # the MoE inputs go straight into one buffer: a list plus torch.cat would hold them twice
+        x = torch.empty(cal_ids.numel(), cfg.hidden_size, dtype=torch.bfloat16, device=dev)
+        fill = [0]
+
+        def grab(_m, a):
+            t = a[0].reshape(-1, a[0].shape[-1])
+            x[fill[0] : fill[0] + t.shape[0]] = t
+            fill[0] += t.shape[0]
+        hooks.append(layer.mlp.register_forward_pre_hook(grab))
+        h = run_layer(layer, h, kws, bs, inplace=True)
         for hk in hooks:
             hk.remove()
-        x = torch.cat(xs)
-        del xs
+        assert fill[0] == x.shape[0], (fill[0], x.shape)
         t_fwd = time.time() - t0
 
         mods = dict(layer.named_modules())
@@ -252,8 +273,10 @@ def main() -> None:
         t_spine = time.time() - t0 - t_fwd
 
         moe = layer.mlp
-        with torch.no_grad():
-            _, wts, idx = moe.gate(x)
+        with torch.no_grad():   # in chunks: only the top-k ids and scores stay, not every token's logits
+            parts = [moe.gate(c)[1:] for c in x.split(65536)]
+            wts, idx = torch.cat([p[0] for p in parts]), torch.cat([p[1] for p in parts])
+            del parts
         rec = code_experts(moe, x, idx, plan[l], lut, l, out / "experts", wts if args.hess_affinity else None,
                            args.hess_tau)
         del layer, moe, x, idx, wts
