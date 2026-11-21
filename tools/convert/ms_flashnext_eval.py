@@ -225,8 +225,11 @@ def main() -> None:
     p.add_argument("--base", type=Path, help="the BF16 base to score against")
     p.add_argument("--write-base", type=Path, help="run the BF16 original and write its base here")
     p.add_argument("--text", type=Path, help="the text for --write-base")
+    p.add_argument("--ids", type=Path, help="for --write-base: token windows [N, ctx] (a .pt) instead of --text")
     p.add_argument("--ctx", type=int, default=512)
     p.add_argument("--chunks", type=int, default=None)
+    p.add_argument("--ms-layers", type=int, default=1 << 30,
+                   help="take MS records for the layers below this only (the rest, and then the head, stay BF16)")
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--cases", type=Path, help="a corpus of token cases to score both models on, with --ms-dir")
     p.add_argument("--vocab", type=Path, help='{"valid_token_ids": [...]} for --cases')
@@ -242,9 +245,15 @@ def main() -> None:
         eval_cases(args, cfg, wmap, dev, ms.build_1mad_lut(dev))
         return
     writing = args.write_base is not None
-    if writing == (args.ms_dir is not None) or writing != (args.text is not None) or writing == (args.base is not None):
-        p.error("either --ms-dir with --base, or --write-base with --text")
-    if writing:
+    if writing == (args.ms_dir is not None) or writing != (args.text is not None or args.ids is not None) or             writing == (args.base is not None):
+        p.error("either --ms-dir with --base, or --write-base with --text or --ids")
+    if writing and args.ids is not None:   # token windows [N, ctx] as they are (e.g. templated chat)
+        t = torch.load(args.ids, map_location="cpu", weights_only=True).long()
+        n_chunk = min(args.chunks or t.shape[0], t.shape[0])
+        n_ctx = t.shape[1]
+        toks = t[:n_chunk]
+        print(f"{n_chunk} chunks of {n_ctx} from {args.ids}", flush=True)
+    elif writing:
         ids = tokenize(str(args.hf_dir), str(args.text))
         n_ctx = args.ctx
         n_chunk = min(args.chunks or 100, len(ids) // n_ctx)
@@ -260,7 +269,8 @@ def main() -> None:
     for l in range(cfg.num_hidden_layers):
         tl = time.time()
         layer = load_layer(cfg, args.hf_dir, wmap, l, dev)
-        if not writing:
+        if not writing and l < args.ms_layers and (args.ms_dir / "experts" / f"blk.{l}.experts.json").exists():
+            # else the layer stays BF16
             load_ms_layer(layer, l, args.ms_dir, lut, dev)
         td = time.time() - tl
         h = run_layer(layer, h, kws, bs)
@@ -269,7 +279,9 @@ def main() -> None:
         print(f"layer {l:2d}: decode {td:.0f}s forward {time.time() - tl - td:.0f}s", flush=True)
 
     mixer = load_mixer(cfg, args.hf_dir, wmap, dev)
-    head = bf16_head(args.hf_dir, wmap, dev) if writing else ms_head(args.ms_dir, lut, dev)
+    head = (ms_head(args.ms_dir, lut, dev)
+            if not writing and args.ms_layers >= cfg.num_hidden_layers and (args.ms_dir / "output.weight.json").exists()
+            else bf16_head(args.hf_dir, wmap, dev))
 
     lo, hi = n_ctx // 2, n_ctx - 1
     nll = kld = 0.0
