@@ -114,7 +114,7 @@ __device__ __forceinline__ void row_entries(const uint32_t (&wa)[STEPS], const u
 // columns a step from one 32-bit window of the row's big-endian stream; its bit offset is the same every step and its
 // words advance by 4 K, so all of a row's loads are issued before the first is used.
 template <int K, bool GU, int STEPS>
-__global__ void __launch_bounds__(kThreads) ms_rows_kernel(
+__global__ void __launch_bounds__(kThreads, 3) ms_rows_kernel(
     const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
     const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_dst, const float* __restrict__ xr,
     float* __restrict__ out0, float* __restrict__ out1, size_t off0, size_t off1, int n_out) {
