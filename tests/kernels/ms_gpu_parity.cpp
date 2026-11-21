@@ -124,6 +124,99 @@ void run(int n_in, int n_out, int ncols, uint32_t seed) {
                 basalt::ggml_type_name(type), n_out, n_in, ncols, err, mag, rel, tol, ok ? "ok" : "FAIL");
     if (!ok) ++g_fail;
 }
+// native_mmvq on 8 columns against each column alone: the verifier needs a column's value whatever rides along.
+// Then the time of one call at 1 and 8 columns (the weights decoded once a column chunk).
+template <int K>
+void run_cols(int n_in, int n_out, uint32_t seed) {
+    const int type = 120 + K, NC = 8;
+    std::mt19937 rng(seed);
+    const std::vector<uint8_t> payload = random_payload(K, n_in, n_out, rng);
+    std::vector<float> x((size_t) n_in * NC);
+    std::uniform_real_distribution<float> dx(-1.0f, 1.0f);
+    for (float& v : x) v = dx(rng);
+    cudaStream_t s;
+    CK(cudaStreamCreate(&s));
+    void *dw, *dq;
+    float *dx_, *dy, *d1;
+    CK(cudaMalloc(&dw, payload.size()));
+    CK(cudaMalloc(&dq, gpu::native_q8_1_bytes(n_in, NC)));
+    CK(cudaMalloc(&dx_, x.size() * 4));
+    CK(cudaMalloc(&dy, (size_t) n_out * NC * 4));
+    CK(cudaMalloc(&d1, (size_t) n_out * 4));
+    CK(cudaMemcpy(dw, payload.data(), payload.size(), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dx_, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+    gpu::native_quantize_q8_1(dx_, dq, n_in, NC, s);
+    gpu::native_mmvq(type, dw, dq, dy, n_in, n_out, NC, s);
+    std::vector<float> all((size_t) n_out * NC), one((size_t) n_out);
+    CK(cudaStreamSynchronize(s));
+    CK(cudaMemcpy(all.data(), dy, all.size() * 4, cudaMemcpyDeviceToHost));
+    int diff = 0;
+    for (int c = 0; c < NC; ++c) {
+        gpu::native_mmvq(type, dw, (const uint8_t*) dq + (size_t) c * (n_in / 32) * 36, d1, n_in, n_out, 1, s);
+        CK(cudaStreamSynchronize(s));
+        CK(cudaMemcpy(one.data(), d1, one.size() * 4, cudaMemcpyDeviceToHost));
+        diff += std::memcmp(one.data(), all.data() + (size_t) c * n_out, one.size() * 4) != 0;
+    }
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0));
+    CK(cudaEventCreate(&e1));
+    double us[2];
+    for (int k = 0; k < 2; ++k) {
+        const int nc = k ? NC : 1, it = 50;
+        gpu::native_mmvq(type, dw, dq, dy, n_in, n_out, nc, s);
+        CK(cudaEventRecord(e0, s));
+        for (int i = 0; i < it; ++i) gpu::native_mmvq(type, dw, dq, dy, n_in, n_out, nc, s);
+        CK(cudaEventRecord(e1, s));
+        CK(cudaEventSynchronize(e1));
+        float ms_ = 0;
+        CK(cudaEventElapsedTime(&ms_, e0, e1));
+        us[k] = ms_ * 1e3 / it;
+    }
+    const double mb = (double) payload.size() / 1e6;
+    std::printf("  %s %5dx%-5d columns alone vs 8: %s; bench c1 %.1f us (%.0f GB/s), c8 %.1f us (%.0f GB/s)\n",
+                basalt::ggml_type_name(type), n_out, n_in, diff ? "DIFF FAIL" : "bitwise equal", us[0],
+                mb / us[0] * 1e3, us[1], mb / us[1] * 1e3);
+    if (diff) ++g_fail;
+    for (void* p : {dw, dq, (void*) dx_, (void*) dy, (void*) d1}) cudaFree(p);
+    CK(cudaStreamDestroy(s));
+}
+
+// The prompt path's dequantizer of one expert blob (2560 x 640): microseconds an expert, fp16 bytes written a second.
+template <int K>
+void bench_dequant_expert() {
+    const int type = 120 + K, H = 2560, FF = 640;
+    const gpu::NativeExpertLayout L = gpu::native_expert_layout(type, type, H, FF, 0.f);
+    std::mt19937 rng(31);
+    std::vector<uint8_t> b = random_payload(K, H, FF, rng), u = random_payload(K, H, FF, rng),
+                         d = random_payload(K, FF, H, rng);
+    b.insert(b.end(), u.begin(), u.end());
+    b.insert(b.end(), d.begin(), d.end());
+    void* db;
+    uint16_t *gu, *dd;
+    CK(cudaMalloc(&db, b.size()));
+    CK(cudaMalloc(&gu, (size_t) 2 * FF * H * 2));
+    CK(cudaMalloc(&dd, (size_t) H * FF * 2));
+    CK(cudaMemcpy(db, b.data(), b.size(), cudaMemcpyHostToDevice));
+    cudaStream_t s;
+    CK(cudaStreamCreate(&s));
+    gpu::ms_dequant_expert_f16(type, db, H, FF, L.up_off, L.down_off, gu, dd, s);
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0));
+    CK(cudaEventCreate(&e1));
+    const int it = 100;
+    CK(cudaEventRecord(e0, s));
+    for (int i = 0; i < it; ++i) gpu::ms_dequant_expert_f16(type, db, H, FF, L.up_off, L.down_off, gu, dd, s);
+    CK(cudaEventRecord(e1, s));
+    CK(cudaEventSynchronize(e1));
+    float ms_ = 0;
+    CK(cudaEventElapsedTime(&ms_, e0, e1));
+    const double us = ms_ * 1e3 / it;
+    std::printf("  bench %s expert dequant f16: %.1f us an expert (%.0f GB/s of fp16 written)\n",
+                basalt::ggml_type_name(type), us, 3.0 * H * FF * 2 / (us * 1e3));
+    for (void* p : {db, (void*) gu, (void*) dd}) cudaFree(p);
+    CK(cudaStreamDestroy(s));
+}
+
 // native_expert_grouped on MS experts (2560 x 640): groups of 1, 3, 6 (two passes of the block's 4) and 2 entries on
 // random tokens and output rows, against gate/up -> SwiGLU -> down on the CPU from the same dequantized q8_1 inputs.
 template <int K>
@@ -380,6 +473,12 @@ int main() {
     run_dequant<6>(6144, 2560, 1000, 700, 9);   // a row slice of a wide input
     run_dequant<4>(640, 2560, 17, 300, 10);     // Hadamard block 128
     run_dequant<3>(2560, 640, 0, 640, 11);
+    run_cols<6>(2560, 10240, 20);   // GDN qkv
+    run_cols<6>(6144, 2560, 21);    // ssm_out
+    run_cols<6>(2560, 248320, 22);  // the head
+    run_cols<4>(640, 2560, 23);     // a shared expert's down
+    bench_dequant_expert<4>();
+    bench_dequant_expert<3>();
     run_grouped<4>(0.f, 12);
     run_grouped<3>(0.f, 13);
     run_grouped<6>(0.f, 14);

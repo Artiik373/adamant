@@ -93,14 +93,16 @@ __global__ void __launch_bounds__(kThreads) ms_rows_kernel(
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {
         const uint32_t* g32 = reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(grp_ptr[g]) + off) +
                               (size_t) r * stride_words;
-        uint32_t wa[STEPS], wb[STEPS];
+        const uint32_t hdr = __ldg(g32);
+        // lane i holds word i of each step's 4 K + 2 stream words; a lane's window is two of them
+        uint32_t lw[STEPS];
         #pragma unroll
         for (int st = 0; st < STEPS; ++st) {
-            const int wi = w_lane + 4 * K * st;
-            wa[st] = __ldg(g32 + wi);
-            wb[st] = wi + 1 < stride_words ? __ldg(g32 + wi + 1) : 0u;
+            const int wi = 4 * K * st + lane;
+            lw[st] = lane < 4 * K + 2 && wi < stride_words
+                         ? (wi == 0 ? (hdr >> 16) & mc::kStateMask : __byte_perm(__ldg(g32 + wi), 0, 0x0123))
+                         : 0u;
         }
-        const uint32_t hdr = __ldg(g32);
         const float scale = __half2float(__ushort_as_half((unsigned short) (hdr & 0xFFFFu))) * rs;
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
         for (int c0 = e0; c0 < e1; c0 += kNe) {
@@ -113,9 +115,9 @@ __global__ void __launch_bounds__(kThreads) ms_rows_kernel(
             float acc[kNe] = {};
             #pragma unroll
             for (int st = 0; st < STEPS; ++st) {
-                const int wi = w_lane + 4 * K * st;
-                const uint32_t a = wi == 0 ? (hdr >> 16) & mc::kStateMask : __byte_perm(wa[st], 0, 0x0123);
-                const uint32_t v = __funnelshift_l(__byte_perm(wb[st], 0, 0x0123), a, b_lane);
+                const uint32_t a = __shfl_sync(0xFFFFFFFFu, lw[st], w_lane);
+                const uint32_t b = __shfl_sync(0xFFFFFFFFu, lw[st], w_lane + 1);
+                const uint32_t v = __funnelshift_l(b, a, b_lane);
                 const float d0 = mc::decode_1mad_dp4a((v >> 18) & mc::kStateMask);
                 const float d1 = mc::decode_1mad_dp4a((v >> (18 - K)) & mc::kStateMask);
                 const float d2 = mc::decode_1mad_dp4a((v >> (18 - 2 * K)) & mc::kStateMask);

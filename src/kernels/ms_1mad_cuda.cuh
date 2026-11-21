@@ -27,11 +27,13 @@ __host__ __device__ inline int ms_hadamard_block(int n) {
     return b;
 }
 
+// The byte sum minus 510 lands in the mantissa of 1.5 * 2^23 (dp4a adds the float's bits), so one FADD converts it
+// exactly: the quarter-rate I2F is not needed.
 __device__ __forceinline__ float decode_1mad_dp4a(uint32_t state) {
     uint32_t x = state * kMadMul + kMadAdd;
     int32_t sum;
-    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(sum) : "r"(x), "r"(0x01010101u), "r"(-510));
-    return __int2float_rn(sum);
+    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(sum) : "r"(x), "r"(0x01010101u), "r"(0x4B400000 - 510));
+    return __int_as_float(sum) - 12582912.0f;
 }
 
 // Grid-stride warp-per-row GEMV. x_rot is staged once per block in shared memory; each warp
@@ -238,14 +240,15 @@ __global__ void ms_1mad_gemv_fast_kernel(const MsGemvGroup group, int out_featur
 }
 
 // One row of W = W_rot * H * diag(signs) per block: decode the row's states, block Hadamard, signs and scale.
-// Shared memory: the row as a big-endian bit stream (stride_words + 1 words), then in_features floats.
+// The row is staged in shared memory as a big-endian bit stream (stride_words + 1 words).  Blocks of 32..512 values:
+// one warp per Hadamard block, lane l holding columns l + 32*i, butterflies in registers and by shuffles (the
+// stages commute); smaller blocks run in shared memory after the stream.
 template <int K, typename OutT>
 __global__ void ms_dequant_rows_kernel(const uint8_t* __restrict__ payload, int row0, int out_features, int in_features,
                                        int had_block, OutT* __restrict__ out, int out_stride) {
     extern __shared__ uint32_t s_dq[];
     const int stride_words = static_cast<int>(ms_row_bytes(in_features, K) >> 2);
     uint32_t* s_w = s_dq;
-    float* s_v = reinterpret_cast<float*>(s_dq + stride_words + 1);
     const int row = row0 + blockIdx.x;
     const uint32_t* g = reinterpret_cast<const uint32_t*>(payload) + static_cast<size_t>(row) * stride_words;
     const uint32_t hdr = __ldg(g);
@@ -253,21 +256,59 @@ __global__ void ms_dequant_rows_kernel(const uint8_t* __restrict__ payload, int 
         s_w[w] = w == 0 ? (hdr >> 16) & kStateMask : w < stride_words ? __byte_perm(__ldg(g + w), 0, 0x0123) : 0u;
     }
     __syncthreads();
-    for (int c = threadIdx.x; c < in_features; c += blockDim.x) {
-        const int bit = c * K + 18;
-        s_v[c] = decode_1mad_dp4a(__funnelshift_l(s_w[(bit >> 5) + 1], s_w[bit >> 5], bit & 31) >> 18);
-    }
-    __syncthreads();
-    ms_fwht_smem(s_v, in_features, had_block);
     const float scale = __half2float(__ushort_as_half(static_cast<unsigned short>(hdr & 0xFFFFu))) *
                         rsqrtf(static_cast<float>(had_block));
     const int8_t* signs = reinterpret_cast<const int8_t*>(
         payload + static_cast<size_t>(out_features) * ms_row_bytes(in_features, K));
     OutT* o = out + static_cast<size_t>(blockIdx.x) * out_stride;
-    for (int c = threadIdx.x; c < in_features; c += blockDim.x) {
-        const float v = s_v[c] * scale * static_cast<float>(__ldg(signs + c));
+    auto dec = [&](int c) {
+        const int bit = c * K + 18;
+        return decode_1mad_dp4a(__funnelshift_l(s_w[(bit >> 5) + 1], s_w[bit >> 5], bit & 31) >> 18);
+    };
+    auto put = [&](int c, float v) {
+        v *= scale * static_cast<float>(__ldg(signs + c));
         if constexpr (sizeof(OutT) == 4) o[c] = v;
         else o[c] = __float2half_rn(v);
+    };
+    if (had_block < 32) {
+        float* s_v = reinterpret_cast<float*>(s_w + stride_words + 1);
+        for (int c = threadIdx.x; c < in_features; c += blockDim.x) s_v[c] = dec(c);
+        __syncthreads();
+        ms_fwht_smem(s_v, in_features, had_block);
+        for (int c = threadIdx.x; c < in_features; c += blockDim.x) put(c, s_v[c]);
+        return;
+    }
+    const int lane = threadIdx.x & 31;
+    const int v = had_block >> 5;
+    for (int blk = threadIdx.x >> 5; blk * had_block < in_features; blk += blockDim.x >> 5) {
+        const int base = blk * had_block + lane;
+        float r[16];
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) if (i < v) r[i] = dec(base + 32 * i);
+        #pragma unroll
+        for (int h = 1; h < 16; h <<= 1) {
+            if (h >= v) break;
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                if (i < v && (i & h) == 0) {
+                    const float x0 = r[i], x1 = r[i + h];
+                    r[i] = x0 + x1;
+                    r[i + h] = x0 - x1;
+                }
+            }
+        }
+        #pragma unroll
+        for (int m = 1; m < 32; m <<= 1) {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                if (i < v) {
+                    const float x1 = __shfl_xor_sync(0xFFFFFFFFu, r[i], m);
+                    r[i] = (lane & m) ? x1 - r[i] : r[i] + x1;
+                }
+            }
+        }
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) if (i < v) put(base + 32 * i, r[i]);
     }
 }
 
@@ -279,15 +320,18 @@ inline cudaError_t launch_ms_dequant_rows(const uint8_t* payload, int row0, int 
     if (in_features < 4 || in_features % 4 || row0 < 0 || rows <= 0 || row0 + rows > out_features) {
         return cudaErrorInvalidValue;
     }
-    const size_t smem = (ms_row_bytes(in_features, K) / 4 + 1) * 4 + static_cast<size_t>(in_features) * 4;
+    const int had_block = ms_hadamard_block(in_features);
+    // a warp per Hadamard block (at most 8); blocks below 32 values keep the decoded row in shared memory too
+    const int warps = had_block >= 32 ? (in_features / had_block < 8 ? in_features / had_block : 8) : 8;
+    const size_t smem = (ms_row_bytes(in_features, K) / 4 + 1) * 4 + (had_block < 32 ? static_cast<size_t>(in_features) * 4 : 0);
     if (smem > 48u * 1024u) {
         const cudaError_t err = cudaFuncSetAttribute(ms_dequant_rows_kernel<K, OutT>,
                                                      cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
         if (err != cudaSuccess) return err;
     }
-    ms_dequant_rows_kernel<K, OutT><<<rows, 256, smem, stream>>>(payload, row0, out_features, in_features,
-                                                              ms_hadamard_block(in_features), out,
-                                                              out_stride > 0 ? out_stride : in_features);
+    ms_dequant_rows_kernel<K, OutT><<<rows, warps * 32, smem, stream>>>(payload, row0, out_features, in_features,
+                                                                     had_block, out,
+                                                                     out_stride > 0 ? out_stride : in_features);
     return cudaGetLastError();
 }
 
