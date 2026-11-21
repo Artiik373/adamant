@@ -288,7 +288,8 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
                          basalt::ggml_type_name((uint32_t) f.d_type), (long long) l, (long long) e,
                          basalt::kernels::dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type)
                              ? "device-planned tail + grouped kernels" : "grouped kernels",
-                         basalt::prefill::mmq::fits(f.gu_type, 2 * f.n_ff) && basalt::prefill::mmq::fits(f.up_type, 2 * f.n_ff) &&
+                         f.ms_k ? "MMQ on Q8_0 copies"
+                         : basalt::prefill::mmq::fits(f.gu_type, 2 * f.n_ff) && basalt::prefill::mmq::fits(f.up_type, 2 * f.n_ff) &&
                                  basalt::prefill::mmq::fits(f.d_type, f.n_embd)
                              ? "MMQ" : "dequant GEMM");
             l = e + 1;
