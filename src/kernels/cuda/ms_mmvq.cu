@@ -143,9 +143,8 @@ __global__ void __launch_bounds__(kWarps * 32, 4) ms_gemv_cols_kernel(const uint
 // Q8_0 rows of W = W_rot H diag(signs) for a group of MS expert blobs, a warp a row over all of them: expert e's
 // rows are its P payloads (at off[0..P)) of N_EACH rows each, written to dst + e * dst_stride bytes, row r of the
 // expert at r * (N_IN / 32) blocks.  The row is staged in shared memory as a big-endian bit stream with the warp's
-// next row in flight; each Hadamard block is decoded, transformed and quantized by the warp (a Q8_0 block of 32
-// values is one i across the 32 lanes; quantize_row_q8_0's scale, round to nearest).  One launch for a whole group, so the GPU has
-// enough rows to hide each row's latency.
+// next row in flight; each Hadamard block is decoded, transformed and quantized by the warp (quantize_row_q8_0's
+// scale, round to nearest).  One launch for a whole group, so the GPU has enough rows to hide each row's latency.
 struct MsBlobs {
     const uint8_t* blob[kMsGroupMax];
 };
@@ -159,6 +158,7 @@ __global__ void __launch_bounds__(kWarps * 32) ms_q80_rows_kernel(const MsBlobs 
     constexpr int kRowsExp = P * N_EACH;
     static_assert(N_IN % 32 == 0 && kHb >= 32, "whole warps");
     __shared__ uint32_t s_rows[kWarps][kStride + 1];
+    __shared__ float s_tp[kWarps][kHb + kHb / 16];   // a warp's transposed Hadamard block
     const int lane = threadIdx.x & 31;
     uint32_t* s_row = s_rows[threadIdx.x >> 5];
     const int n_rows = n_exp * kRowsExp, stride_all = gridDim.x * kWarps;
@@ -194,23 +194,68 @@ __global__ void __launch_bounds__(kWarps * 32) ms_q80_rows_kernel(const MsBlobs 
                        (size_t) (row % kRowsExp) * (N_IN / 32);
         if (row + stride_all < n_rows) fetch(row + stride_all);
         const float scale = __half2float(__ushort_as_half((unsigned short) (hdr & 0xFFFFu))) * rs;
+        // a Hadamard block: lane l decodes columns l + 32 i (V of them), the stages of distance >= 32 run in registers;
+        // one padded transpose through shared memory gives lane l the V consecutive columns l V + j, so the stages of
+        // distance < V run in registers too and only those from V to 16 cross lanes; a Q8_0 block is 32 / V lanes
+        constexpr int V = kHb / 32;
+        float* tp = s_tp[threadIdx.x >> 5];
+        auto at = [](int c) { return c + (c >> 4); };   // a word of padding every 16: conflict-free both ways
         for (int first = 0; first < N_IN; first += kHb) {
-            mc::ms_hadamard_warp(
-                [&](int c) {
-                    const int bit = c * K + 18;
-                    return mc::decode_1mad_dp4a(__funnelshift_l(s_row[(bit >> 5) + 1], s_row[bit >> 5], bit & 31) >> 18);
-                },
-                [&](int c, float v) {
-                    v *= scale * (float) __ldg(signs + c);
-                    float amax = fabsf(v);
-                    #pragma unroll
-                    for (int m = 16; m > 0; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, m));
-                    const float d = amax * (1.0f / 127.0f), id = amax > 0.0f ? __fdividef(127.0f, amax) : 0.0f;
-                    mc::MsQ80* q = o + c / 32;
-                    q->qs[lane] = (int8_t) __float2int_rn(v * id);   // nearest (ties to even), within half a step
-                    if (lane == 0) q->d = __float2half_rn(d);
-                },
-                first, kHb);
+            float r[V];
+            #pragma unroll
+            for (int i = 0; i < V; ++i) {
+                const int bit = (first + lane + 32 * i) * K + 18;
+                r[i] = mc::decode_1mad_dp4a(__funnelshift_l(s_row[(bit >> 5) + 1], s_row[bit >> 5], bit & 31) >> 18);
+            }
+            #pragma unroll
+            for (int h = 1; h < V; h <<= 1)
+                #pragma unroll
+                for (int i = 0; i < V; ++i)
+                    if ((i & h) == 0) {
+                        const float x0 = r[i], x1 = r[i + h];
+                        r[i] = x0 + x1;
+                        r[i + h] = x0 - x1;
+                    }
+            #pragma unroll
+            for (int i = 0; i < V; ++i) tp[at(lane + 32 * i)] = r[i];
+            __syncwarp();
+            #pragma unroll
+            for (int j = 0; j < V; ++j) r[j] = tp[at(lane * V + j)];
+            __syncwarp();
+            #pragma unroll
+            for (int h = 1; h < V; h <<= 1)
+                #pragma unroll
+                for (int j = 0; j < V; ++j)
+                    if ((j & h) == 0) {
+                        const float x0 = r[j], x1 = r[j + h];
+                        r[j] = x0 + x1;
+                        r[j + h] = x0 - x1;
+                    }
+            #pragma unroll
+            for (int m = 1; m * V < 32; m <<= 1)
+                #pragma unroll
+                for (int j = 0; j < V; ++j) {
+                    const float x1 = __shfl_xor_sync(0xFFFFFFFFu, r[j], m);
+                    r[j] = (lane & m) ? x1 - r[j] : r[j] + x1;
+                }
+            // scale and signs, the block's absolute maximum, quantize_row_q8_0's scale, round to nearest
+            const int c0 = first + lane * V;
+            float amax = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < V; ++j) {
+                r[j] *= scale * (float) __ldg(signs + c0 + j);
+                amax = fmaxf(amax, fabsf(r[j]));
+            }
+            #pragma unroll
+            for (int m = 1; m * V < 32; m <<= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, m));
+            const float d = amax * (1.0f / 127.0f), id = amax > 0.0f ? __fdividef(127.0f, amax) : 0.0f;
+            mc::MsQ80* q = o + c0 / 32;
+            #pragma unroll
+            for (int j = 0; j < V; j += 2) {   // the block's bytes are 2-aligned
+                const int lo = __float2int_rn(r[j] * id), hi = __float2int_rn(r[j + 1] * id);
+                *reinterpret_cast<uint16_t*>(q->qs + (c0 & 31) + j) = (uint16_t) ((lo & 0xFF) | ((hi & 0xFF) << 8));
+            }
+            if ((c0 & 31) == 0) q->d = __float2half_rn(d);
         }
     }
 }
