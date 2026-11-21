@@ -1548,7 +1548,8 @@ endif()
 
 add_library(kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
             src/kernels/cpu/cpu_quota.cpp src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp
-            src/kernels/cpu/q2_avx2_vnni.cpp src/kernels/cpu/exl3.cpp src/kernels/cpu/exl3_vnni.cpp)
+            src/kernels/cpu/q2_avx2_vnni.cpp src/kernels/cpu/exl3.cpp src/kernels/cpu/exl3_vnni.cpp
+            src/kernels/cpu/ms_expert.cpp src/kernels/cpu/ms_expert_vnni.cpp)
 target_include_directories(kernels_cpu PUBLIC include)
 # only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
@@ -1561,6 +1562,9 @@ set_source_files_properties(src/kernels/cpu/q2_avx2_vnni.cpp PROPERTIES COMPILE_
 # EXL3 projections: AVX2 + F16C rows behind cpu_avx2_ok(); the plain C rows run anywhere
 set_source_files_properties(src/kernels/cpu/exl3.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
 set_source_files_properties(src/kernels/cpu/exl3_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnni_flags}")
+# MS projections: AVX2 + F16C rows behind cpu_avx2_ok(), the AVX-VNNI build behind cpu_avxvnni_ok()
+set_source_files_properties(src/kernels/cpu/ms_expert.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+set_source_files_properties(src/kernels/cpu/ms_expert_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnni_flags}")
 find_package(Threads REQUIRED)
 target_link_libraries(kernels_cpu PUBLIC Threads::Threads platform)
 
@@ -1806,6 +1810,10 @@ if(BUILD_TESTING)
   target_link_libraries(exl3_cpu_test PRIVATE kernels_cpu)
   basalt_cpu_test(NAME exl3_cpu_test COMMAND exl3_cpu_test)
   set_tests_properties(exl3_cpu_test PROPERTIES LABELS "cpu;avx2")
+  add_executable(ms_cpu_test tests/kernels/cpu/ms_cpu_test.cpp)
+  target_link_libraries(ms_cpu_test PRIVATE kernels_cpu)
+  basalt_cpu_test(NAME ms_cpu_test COMMAND ms_cpu_test)
+  set_tests_properties(ms_cpu_test PROPERTIES LABELS "cpu;avx2")
   # the warp-level tile mapping of the EXL3 GPU kernels, lane by lane on the host
   add_executable(exl3_lane_test tests/kernels/cpu/exl3_lane_test.cpp)
   target_include_directories(exl3_lane_test PRIVATE include)
