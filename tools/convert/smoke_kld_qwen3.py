@@ -482,7 +482,7 @@ def tune_scales(model, teacher, target_linears, calib_ids, device, args) -> None
         opt.step()
         run = loss.item() if step == 0 else 0.95 * run + 0.05 * loss.item()
         if (step + 1) % 50 == 0 or step + 1 == args.tune_scales:
-            a = torch.cat([p.detach() for p in params])
+            a = torch.cat([p.detach().reshape(-1) for p in params])
             print(f"  tune {step + 1}/{args.tune_scales}: KL {run:.5f}, factor range [{a.min().item():.4f}, "
                   f"{a.max().item():.4f}] ({time.time() - t0:.0f}s)", flush=True)
     model.eval()
