@@ -100,10 +100,16 @@ MS_C3 on 12, the dense spine and the head MS_C6; the n-gram table and the hyper-
 
 | Pack | experts | wiki2 KLD | wiki2 top-1 | gsm8k KLD | gsm8k top-1 |
 | --- | --- | --- | --- | --- | --- |
-| MS (60 GB plan) | 53.2 GiB | 0.0741 | 91.13% | 0.0356 | 96.55% |
+| MS v3 (60 GB plan, chat calibration) | 53.2 GiB | 0.0614 | 92.04% | 0.0323 | 96.81% |
+| MS (60 GB plan, web calibration) | 53.2 GiB | 0.0741 | 91.13% | 0.0356 | 96.55% |
 | UD-IQ4_XS | 56.2 GiB | 0.0835 | 90.69% | 0.0402 | 96.39% |
 | EXL3 3.18 bpw | | 0.0983 | 89.72% | 0.0481 | 96.16% |
 | WV-v5 3.5 bpw | | 0.2400 | 84.15% | 0.1144 | 93.33% |
+
+MS v3 (`Qwen3.8-FN-MS-60-v3.basalt`) changes only the converter's inputs and search: 2560 x 512 calibration tokens
+(on-policy Flash-Next chat with thinking 60%, agent and chat traces 20%, web 20%; `build_calib_pool.py --dspine`) instead
+of 256 web sequences, each expert's Hessian shrunk toward the layer's (`--hess-tau 256`), and Viterbi window 64 / commit
+8 (`--window 64`). Conversion: 7.5 h. Same format, plan and size as MS.
 
 The CPU tier's fp32 activations and the prompt path's Q8_0 experts against the fp16 / fp16-GEMM build before them, paired on
 wikitext: dKLD +0.0006 [-0.0009, +0.0021].
