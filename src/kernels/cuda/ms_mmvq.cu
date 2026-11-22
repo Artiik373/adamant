@@ -3,6 +3,7 @@
 #include "basalt/artifact/gguf_reader.hpp"
 #include "../ms_1mad_cuda.cuh"
 
+#include <algorithm>
 #include <climits>
 #include <cstdint>
 #include <stdexcept>
@@ -140,6 +141,137 @@ __global__ void __launch_bounds__(kWarps * 32, 4) ms_gemv_cols_kernel(const uint
     }
 }
 
+// ---- The tensor-core GEMV: y[c][r] = W[r] . x_c for up to 8 columns, 16 rows a warp per m16n8k16 product. ----
+// A (16 x 16): the rows' 1MAD codes, integers within +-510 and so exact in fp16 (the row scale holds the rest).  B
+// (16 x 8): the block's columns, rotated, H(signs * x_c), staged once as fp16, each divided by sqrt(had_block) and by its
+// largest |x| (127 times its largest Q8_1 scale), so every value is within +-sqrt(had_block) (the rounding to fp16 is the
+// one change against the fp32 GEMV: docs/precision/qwen38-flash-next.md).  The product's k positions 2t, 2t+1, 2t+8, 2t+9 of lane t are the columns 4t .. 4t+3 of the
+// step, the same for A and B: a lane decodes 4 adjacent columns of rows g and g + 8 from one 32-bit window each, and
+// reads a column's 4 values as one 8-byte load.  A column's sums take one order whatever columns ride along.
+constexpr int kTcWarps = 8;
+constexpr int kTcCh = 128;                    // input columns a staged row chunk
+constexpr size_t kTcSmemMax = 64 * 1024;      // the staged columns' shared memory at most
+
+__device__ __forceinline__ uint32_t tc_h2(float lo, float hi) {
+    const __half2 h = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+
+template <int K>
+__global__ void __launch_bounds__(kTcWarps * 32, 2) ms_gemv_tc_kernel(const uint8_t* __restrict__ w,
+                                                                    const mc::MsQ81* __restrict__ x,
+                                                                    float* __restrict__ y, int n_in, int n_out,
+                                                                    int col0, int nc, int ks) {
+    static_assert(3 * K + 14 <= 32, "4 states must fit one 32-bit window");
+    // a chunk's windows start at bits 18 + c K (c = k0 .. k0 + 124 in steps of 4) and read two words each
+    constexpr int kChWords = (31 + (kTcCh - 4) * K) / 32 + 2;
+    __shared__ uint32_t s_w[kTcWarps][16][kChWords];
+    __shared__ float s_cmax[8];
+    extern __shared__ uint2 s_x[];                // column j's values from s_x + j * n_in / 4, 4 fp16 an element
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
+    const int cb = col0 + blockIdx.x * nc;
+    const int stride_words = (int) (mc::ms_row_bytes(n_in, K) >> 2);
+    const int hb = mc::ms_hadamard_block(n_in);
+    const float rs = rsqrtf((float) hb);
+    const int8_t* signs = reinterpret_cast<const int8_t*>(w + (size_t) n_out * stride_words * 4);
+    for (int j = warp; j < nc; j += kTcWarps) {
+        const mc::MsQ81* xq = x + (size_t) (cb + j) * (n_in / 32);
+        float m = 0.0f;
+        for (int b = lane; b < n_in / 32; b += 32) m = fmaxf(m, fabsf(__half2float(xq[b].d)));
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, o));
+        if (lane == 0) s_cmax[j] = m > 0.0f ? 127.0f * m : 1.0f;
+    }
+    __syncthreads();
+    __half* s_xh = reinterpret_cast<__half*>(s_x);
+    const int per = n_in / hb;   // n_in % 32 == 0: the Hadamard blocks are 32 or more, a warp each
+    for (int b = warp; b < nc * per; b += kTcWarps) {
+        const int j = b / per;
+        const mc::MsQ81* xq = x + (size_t) (cb + j) * (n_in / 32);
+        mc::ms_rotate_block_warp(s_xh + (size_t) j * n_in, [&](int i) {
+            const mc::MsQ81& q = xq[i >> 5];
+            return __half2float(q.d) * (float) q.qs[i & 31] * (float) __ldg(signs + i);
+        }, (b - j * per) * hb, hb, rs / s_cmax[j]);
+    }
+    __syncthreads();
+
+    const uint32_t* g32 = reinterpret_cast<const uint32_t*>(w);
+    uint32_t(*sw)[kChWords] = s_w[warp];
+    const bool col_on = g < nc;
+    const int n_tiles = n_out / 16, n_chunks = (n_in + kTcCh - 1) / kTcCh;
+    // ks warps share a tile (each every ks-th chunk; partial sums added in shared memory), kTcWarps / ks tiles a block
+    const int tpb = kTcWarps / ks, tg = warp / ks, kq = warp % ks;
+    __shared__ float4 s_red[kTcWarps][32];
+    // lane l holds word l of the 16 rows' chunk: the next chunk is in flight while the warp decodes the staged one
+    uint32_t buf[16];
+    auto fetch = [&](int tile, int ch) {
+        const uint32_t* rows = g32 + (size_t) tile * 16 * stride_words;
+        const int gw = ((18 + ch * kTcCh * K) >> 5) + lane;
+        #pragma unroll
+        for (int rr = 0; rr < 16; ++rr)
+            buf[rr] = lane < kChWords && gw < stride_words ? __ldg(rows + (size_t) rr * stride_words + gw) : 0u;
+    };
+    const int bstride = gridDim.y * tpb;
+    if (blockIdx.y * tpb + tg < n_tiles && kq < n_chunks) fetch(blockIdx.y * tpb + tg, kq);
+    for (int base = blockIdx.y * tpb; base < n_tiles; base += bstride) {   // block-uniform: the barriers below
+        const int tile = base + tg;
+        const bool on = tile < n_tiles;
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int ch = kq; on && ch < n_chunks; ch += ks) {
+            const int k0 = ch * kTcCh, wlo = (18 + k0 * K) >> 5, gw = wlo + lane;
+            __syncwarp();
+            if (lane < kChWords) {
+                #pragma unroll
+                for (int rr = 0; rr < 16; ++rr)   // big-endian, word 0 the start state
+                    sw[rr][lane] = gw == 0 ? (buf[rr] >> 16) & mc::kStateMask : __byte_perm(buf[rr], 0, 0x0123);
+            }
+            __syncwarp();
+            if (ch + ks < n_chunks) fetch(tile, ch + ks);
+            else if (tile + bstride < n_tiles && kq < n_chunks) fetch(tile + bstride, kq);
+            const int kend = min(kTcCh, n_in - k0);
+            for (int kk = 0; kk < kend; kk += 16) {
+                const int c = k0 + kk + 4 * t;
+                const int p = 18 + c * K - 32 * wlo, wi = p >> 5, off = p & 31;
+                const uint32_t v0 = __funnelshift_l(sw[g][wi + 1], sw[g][wi], off);
+                const uint32_t v1 = __funnelshift_l(sw[g + 8][wi + 1], sw[g + 8][wi], off);
+                const uint32_t a0 = tc_h2(mc::decode_1mad_dp4a(v0 >> 18), mc::decode_1mad_dp4a((v0 >> (18 - K)) & mc::kStateMask));
+                const uint32_t a2 = tc_h2(mc::decode_1mad_dp4a((v0 >> (18 - 2 * K)) & mc::kStateMask),
+                                          mc::decode_1mad_dp4a((v0 >> (18 - 3 * K)) & mc::kStateMask));
+                const uint32_t a1 = tc_h2(mc::decode_1mad_dp4a(v1 >> 18), mc::decode_1mad_dp4a((v1 >> (18 - K)) & mc::kStateMask));
+                const uint32_t a3 = tc_h2(mc::decode_1mad_dp4a((v1 >> (18 - 2 * K)) & mc::kStateMask),
+                                          mc::decode_1mad_dp4a((v1 >> (18 - 3 * K)) & mc::kStateMask));
+                uint2 b = make_uint2(0u, 0u);
+                if (col_on) b = s_x[((size_t) g * n_in + c) >> 2];
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b.x), "r"(b.y));
+            }
+        }
+        if (ks > 1) {   // the tile's partial sums, in split order
+            s_red[warp][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+            __syncthreads();
+            if (kq == 0)
+                for (int q = 1; q < ks; ++q) {
+                    const float4 r = s_red[warp + q][lane];
+                    acc[0] += r.x; acc[1] += r.y; acc[2] += r.z; acc[3] += r.w;
+                }
+            __syncthreads();
+        }
+        if (!on || kq != 0) continue;
+        // acc[0], acc[1]: row g, columns 2t, 2t + 1; acc[2], acc[3]: row g + 8
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int row = tile * 16 + g + 8 * h;
+            const float d = __half2float(__ushort_as_half((unsigned short) (__ldg(g32 + (size_t) row * stride_words) & 0xFFFFu)));
+            #pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                const int j = 2 * t + q;
+                if (j < nc) y[(size_t) (cb + j) * n_out + row] = acc[2 * h + q] * d * s_cmax[j];
+            }
+        }
+    }
+}
+
 // Q8_0 rows of W = W_rot H diag(signs) for a group of MS expert blobs, a warp a row over all of them: expert e's
 // rows are its P payloads (at off[0..P)) of N_EACH rows each, written to dst + e * dst_stride bytes, row r of the
 // expert at r * (N_IN / 32) blocks.  The row is staged in shared memory as a big-endian bit stream with the warp's
@@ -270,6 +402,29 @@ int sm_count() {
     return n;
 }
 
+template <int K>
+cudaError_t launch_tc(const uint8_t* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+    static const bool big = cudaFuncSetAttribute(ms_gemv_tc_kernel<K>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                 (int) kTcSmemMax) == cudaSuccess;
+    if (!big) return cudaErrorInvalidValue;
+    const int fit = (int) (kTcSmemMax / ((size_t) n_in * 2));
+    if (fit < 1) return cudaErrorInvalidValue;
+    const int cpb = std::min(std::min(fit, ncols), 8), full = ncols / cpb, rest = ncols - full * cpb;
+    // the k split: enough warps for the GPU when the rows are few (at most a chunk a warp)
+    const int tiles = n_out / 16, n_chunks = (n_in + kTcCh - 1) / kTcCh;
+    int ks = 1;
+    while (ks < kTcWarps && ks * 2 <= n_chunks && (int64_t) tiles * ks < (int64_t) sm_count() * 16) ks *= 2;
+    const int tpb = kTcWarps / ks, need = (tiles + tpb - 1) / tpb;
+    auto go = [&](int nc, int col0, int chunks) {
+        const int want = sm_count() * 2 / chunks, gy = want < 1 ? 1 : want > need ? need : want;
+        ms_gemv_tc_kernel<K><<<dim3(chunks, gy), kTcWarps * 32, (size_t) nc * n_in * 2, s>>>(
+            w, static_cast<const mc::MsQ81*>(x), y, n_in, n_out, col0, nc, ks);
+    };
+    go(cpb, 0, full);
+    if (rest > 0) go(rest, full * cpb, 1);
+    return cudaGetLastError();
+}
+
 template <int K, int NC>
 void launch_nc(const uint8_t* w, const void* x, float* y, int n_in, int n_out, int col0, int chunks, cudaStream_t s) {
     // the chunks of a row block are neighbours in the grid, so they read its rows from L2 while they are there
@@ -319,11 +474,12 @@ void ms_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y, i
         throw std::invalid_argument("ms_mmvq: unsupported type, shape, column count or pointer");
     const auto* w = static_cast<const uint8_t*>(weights);
     const auto s = static_cast<cudaStream_t>(stream);
+    const bool tc = n_out % 16 == 0;   // whole 16-row tiles: the tensor-core GEMV, every column count alike
     cudaError_t err = cudaSuccess;
     switch (basalt::ms_bits((uint32_t) ggml_type)) {
-    case 3: err = launch_cols<3>(w, x_q8_1, y, n_in, n_out, ncols, s); break;
-    case 4: err = launch_cols<4>(w, x_q8_1, y, n_in, n_out, ncols, s); break;
-    default: err = launch_cols<6>(w, x_q8_1, y, n_in, n_out, ncols, s); break;
+    case 3: err = tc ? launch_tc<3>(w, x_q8_1, y, n_in, n_out, ncols, s) : launch_cols<3>(w, x_q8_1, y, n_in, n_out, ncols, s); break;
+    case 4: err = tc ? launch_tc<4>(w, x_q8_1, y, n_in, n_out, ncols, s) : launch_cols<4>(w, x_q8_1, y, n_in, n_out, ncols, s); break;
+    default: err = tc ? launch_tc<6>(w, x_q8_1, y, n_in, n_out, ncols, s) : launch_cols<6>(w, x_q8_1, y, n_in, n_out, ncols, s); break;
     }
     if (err != cudaSuccess) throw std::runtime_error(std::string("ms_mmvq: ") + cudaGetErrorString(err));
 }

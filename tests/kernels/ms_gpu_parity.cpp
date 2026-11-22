@@ -118,7 +118,7 @@ void run(int n_in, int n_out, int ncols, uint32_t seed) {
             mag = std::max(mag, (double) std::fabs(yr[r]));
         }
     }
-    const double rel = err / (mag + 1e-30), tol = 1e-5;
+    const double rel = err / (mag + 1e-30), tol = 1e-3;   // the GEMV stages its rotated columns as fp16
     const bool ok = rel <= tol;
     std::printf("  %s %5dx%-5d c%d  max err %.2e of max |y| %.2e  (rel %.1e, tol %.0e) %s\n",
                 basalt::ggml_type_name(type), n_out, n_in, ncols, err, mag, rel, tol, ok ? "ok" : "FAIL");
@@ -571,6 +571,10 @@ int main() {
     run_cols<6>(6144, 2560, 21);    // ssm_out
     run_cols<6>(2560, 248320, 22);  // the head
     run_cols<4>(640, 2560, 23);     // a shared expert's down
+    run_cols<6>(2560, 640, 24);     // a shared expert's gate / up
+    run_cols<6>(640, 2560, 25);     // a shared expert's down at the pack's K
+    run_cols<6>(2560, 512, 26);     // attention k / v
+    run_cols<6>(2560, 12288, 27);   // attention q
     bench_dequant_expert<4>();
     bench_dequant_expert<3>();
     run_grouped<4>(0.f, 12);

@@ -79,9 +79,9 @@ __device__ __forceinline__ void ms_fwht_smem(float* s, int n, int had_block) {
 
 // One Hadamard block of 32..512 values by one warp: s_x[base + 32 * i] = H(load(base + 32 * i)) for base = first +
 // lane, H without its 1/sqrt(had_block).  Lane l holds values l + 32*i (i < had_block/32); butterflies of distance
-// >= 32 inside a lane in registers, shorter ones across lanes by shuffles (the stages commute).
-template <typename Load>
-__device__ __forceinline__ void ms_rotate_block_warp(float* s_x, Load load, int first, int had_block) {
+// >= 32 inside a lane in registers, shorter ones across lanes by shuffles (the stages commute).  Stored as T, times mul.
+template <typename Load, typename T = float>
+__device__ __forceinline__ void ms_rotate_block_warp(T* s_x, Load load, int first, int had_block, float mul = 1.0f) {
     const int lane = threadIdx.x & 31;
     const int v = had_block >> 5;
     const int base = first + lane;
@@ -111,7 +111,7 @@ __device__ __forceinline__ void ms_rotate_block_warp(float* s_x, Load load, int 
         }
     }
     #pragma unroll
-    for (int i = 0; i < 16; ++i) if (i < v) s_x[base + 32 * i] = r[i];
+    for (int i = 0; i < 16; ++i) if (i < v) s_x[base + 32 * i] = static_cast<T>(r[i] * mul);
 }
 
 // s_x = H(load(i)) in shared memory, H the block Hadamard without its 1/sqrt(had_block); load(i) is the signed input.

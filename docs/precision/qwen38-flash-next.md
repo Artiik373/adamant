@@ -112,6 +112,12 @@ MS v3 (`Qwen3.8-FN-MS-60-v3.basalt`) changes only the converter's inputs and sea
 of 256 web sequences, each expert's Hessian shrunk toward the layer's (`--hess-tau 256`), and Viterbi window 64 / commit
 8 (`--window 64`). Conversion: 7.5 h. Same format, plan and size as MS.
 
+The dense MS GEMV of the decode windows runs on the tensor cores (`ms_mmvq.cu`): the 1MAD codes are exact in fp16, the
+rotated input columns are staged as fp16 (each divided by its largest magnitude), the sums are fp32. Against the fp32
+GEMV before it, paired on wikitext (100 chunks): dKLD +0.0005 [-0.0006, +0.0016], same top-1 -0.26 points [-0.51, -0.02];
+decode +7 to +10% on short prompts (one RTX 3090 at 290 W). An exact variant (fp16 hi + lo pairs, two products) gave
+about half of that gain.
+
 The CPU tier's fp32 activations and the prompt path's Q8_0 experts against the fp16 / fp16-GEMM build before them, paired on
 wikitext: dKLD +0.0006 [-0.0009, +0.0021].
 
