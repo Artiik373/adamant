@@ -218,6 +218,52 @@ def eval_cases(args, cfg, wmap, dev, lut, prefix: int = 55) -> None:
     print(f"time {time.time() - t0:.0f}s", flush=True)
 
 
+def write_qbench(args, cfg, wmap, dev) -> None:
+    """The BF16 original's _qbench_ base (basalt/program/ppl_gate.hpp) of a qbench prompt file: per row its input and
+    response tokens, scored from the input's last position (it predicts the first response token) to the second last."""
+    rows = json.loads(args.qbench.read_text(encoding="utf-8"))["rows"]
+    seqs = [(r["input_ids"] + r["response_ids"], len(r["input_ids"]) - 1) for r in rows]
+    t0 = time.time()
+    states = []
+    for ids, _ in seqs:
+        h, kws = prelude(cfg, args.hf_dir, wmap, torch.tensor(ids, dtype=torch.long).unsqueeze(0), dev, 1)
+        states.append([h, kws])
+    for l in range(cfg.num_hidden_layers):
+        tl = time.time()
+        layer = load_layer(cfg, args.hf_dir, wmap, l, dev)
+        for st in states:
+            st[0] = run_layer(layer, st[0], st[1], 1)
+        del layer
+        torch.cuda.empty_cache()
+        print(f"layer {l:2d}: {time.time() - tl:.0f}s", flush=True)
+    mixer = load_mixer(cfg, args.hf_dir, wmap, dev)
+    head = bf16_head(args.hf_dir, wmap, dev)
+    nll, n_rows = 0.0, 0
+    with open(args.write_base, "wb") as out, torch.no_grad():
+        out.write(b"_qbench_")
+        out.write(struct.pack("<ii", head.shape[0], len(seqs)))
+        for ids, first in seqs:
+            out.write(struct.pack("<II", len(ids), first))
+        for ids, _ in seqs:
+            out.write(np.asarray(ids, dtype=np.int32).tobytes())
+        for (ids, first), st in zip(seqs, states):
+            tgt = torch.tensor(ids, dtype=torch.long, device=dev)
+            for r0 in range(first, len(ids) - 1, 512):
+                r1 = min(r0 + 512, len(ids) - 1)
+                logits = (mixer(st[0][:, r0:r1]) @ head.T).float()[0]
+                lp = torch.log_softmax(logits, dim=-1)
+                nll -= lp.gather(1, tgt[r0 + 1 : r1 + 1, None]).sum().item()
+                n_rows += r1 - r0
+                for r in range(logits.shape[0]):
+                    scale, low, q = quantize_row(logits[r])
+                    out.write(struct.pack("<ff", scale, low))
+                    out.write(q.tobytes())
+                    if head.shape[0] % 2:
+                        out.write(bytes(2))
+    print(f"wrote {args.write_base}: {len(seqs)} rows, {n_rows} scored, BF16 PPL {np.exp(nll / n_rows):.4f}, "
+          f"{time.time() - t0:.0f}s", flush=True)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Qwen3.8-Flash-Next MS records against a BF16 KLD base")
     p.add_argument("--hf-dir", type=Path, required=True)
@@ -226,6 +272,8 @@ def main() -> None:
     p.add_argument("--write-base", type=Path, help="run the BF16 original and write its base here")
     p.add_argument("--text", type=Path, help="the text for --write-base")
     p.add_argument("--ids", type=Path, help="for --write-base: token windows [N, ctx] (a .pt) instead of --text")
+    p.add_argument("--qbench", type=Path, help="for --write-base: a qbench prompt file (rows of input_ids and "
+                   "response_ids); writes a _qbench_ base scored on the responses")
     p.add_argument("--ctx", type=int, default=512)
     p.add_argument("--chunks", type=int, default=None)
     p.add_argument("--ms-layers", type=int, default=1 << 30,
@@ -239,6 +287,11 @@ def main() -> None:
     tc = json.loads((args.hf_dir / "config.json").read_text())["text_config"]
     cfg = Qwen4ExpTextConfig(**tc)
     wmap = json.loads((args.hf_dir / "model.safetensors.index.json").read_text())["weight_map"]
+    if args.qbench:
+        if not args.write_base or args.ms_dir or args.base or args.text or args.ids:
+            p.error("--qbench needs --write-base, and no --ms-dir, --base, --text or --ids")
+        write_qbench(args, cfg, wmap, dev)
+        return
     if args.cases:
         if not (args.ms_dir and args.vocab) or args.base or args.write_base:
             p.error("--cases needs --ms-dir and --vocab, and no --base or --write-base")
