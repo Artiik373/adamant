@@ -107,6 +107,17 @@ from `eval_chat.pt`).
 | EXL3 3.68 bpw (experts 3.5 / 4 bits, dense 7, head 6) | 50.8 GiB | 0.0682 | 91.50% | 0.0352 | 96.50% | 0.1000 | 94.09% |
 | WV-v5 3.5 bpw | | 0.2400 | 84.15% | 0.1144 | 93.33% | | |
 
+qbench (22 conversations of exllamav3's `qbench_prompts.json`, 45,588 response tokens with thinking and tool calls;
+[quality](quality.md#the-bf16-reference)), same gate settings. The EXL3 3.68 bpw pack reads 0.0090 here against 0.0087
+published for it, so the gate matches the exllamav3 harness. Paired over conversations, EXL3 3.68 minus MS v3: dKLD
++0.0009 [+0.0005, +0.0018] (MS v3 lower in 19 of 22); IQ4_XS minus MS v3: +0.0052 [+0.0037, +0.0072] (21 of 22).
+
+| Pack | KLD mean | median | p99 | top-1 | PPL (BF16 1.3850) |
+| --- | --- | --- | --- | --- | --- |
+| MS v3 | 0.00811 | 0.00042 | 0.0884 | 97.20% | 1.3922 |
+| EXL3 3.68 bpw | 0.00903 | 0.00048 | 0.0932 | 97.17% | 1.3957 |
+| UD-IQ4_XS | 0.01332 | 0.00077 | 0.1432 | 96.44% | 1.4036 |
+
 MS v3 (`Qwen3.8-FN-MS-60-v3.basalt`) changes only the converter's inputs and search: 2560 x 512 calibration tokens
 (on-policy Flash-Next chat with thinking 60%, agent and chat traces 20%, web 20%; `build_calib_pool.py --dspine`) instead
 of 256 web sequences, each expert's Hessian shrunk toward the layer's (`--hess-tau 256`), and Viterbi window 64 / commit
