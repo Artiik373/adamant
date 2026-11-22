@@ -96,15 +96,16 @@ further from the BF16 model. On one RTX 5090 decode is the same (355 against 357
 The MS pack (`Qwen3.8-FN-MS-60.basalt`, [format](../ms-trellis-qwen4exp.md)) codes the routed experts MS_C4 on 36 layers and
 MS_C3 on 12, the dense spine and the head MS_C6; the n-gram table and the hyper-connections are the IQ4_XS pack's. Gate:
 100 chunks, T 3, int8 KV, one RTX 3090 at 290 W, against a local BF16 base (the BF16 checkpoint layer by layer,
-`ms_flashnext_eval.py --write-base`; wikitext-2 base PPL 3.2756, gsm8k 1.4628).
+`ms_flashnext_eval.py --write-base`; wikitext-2 base PPL 3.2756, gsm8k 1.4628, chat 2.9924 over 64 windows of 512 tokens
+from `eval_chat.pt`).
 
-| Pack | experts | wiki2 KLD | wiki2 top-1 | gsm8k KLD | gsm8k top-1 |
-| --- | --- | --- | --- | --- | --- |
-| MS v3 (60 GB plan, chat calibration) | 53.2 GiB | 0.0614 | 92.04% | 0.0323 | 96.81% |
-| MS (60 GB plan, web calibration) | 53.2 GiB | 0.0741 | 91.13% | 0.0356 | 96.55% |
-| UD-IQ4_XS | 56.2 GiB | 0.0835 | 90.69% | 0.0402 | 96.39% |
-| EXL3 3.18 bpw | | 0.0983 | 89.72% | 0.0481 | 96.16% |
-| WV-v5 3.5 bpw | | 0.2400 | 84.15% | 0.1144 | 93.33% |
+| Pack | experts | wiki2 KLD | wiki2 top-1 | gsm8k KLD | gsm8k top-1 | chat KLD | chat top-1 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| MS v3 (60 GB plan, chat calibration) | 53.2 GiB | 0.0614 | 92.04% | 0.0323 | 96.81% | 0.0723 | 95.38% |
+| MS (60 GB plan, web calibration) | 53.2 GiB | 0.0741 | 91.13% | 0.0356 | 96.55% | | |
+| UD-IQ4_XS | 56.2 GiB | 0.0835 | 90.69% | 0.0402 | 96.39% | 0.1087 | 93.14% |
+| EXL3 3.68 bpw (experts 3.5 / 4 bits, dense 7, head 6) | 50.8 GiB | 0.0682 | 91.50% | 0.0352 | 96.50% | 0.1000 | 94.09% |
+| WV-v5 3.5 bpw | | 0.2400 | 84.15% | 0.1144 | 93.33% | | |
 
 MS v3 (`Qwen3.8-FN-MS-60-v3.basalt`) changes only the converter's inputs and search: 2560 x 512 calibration tokens
 (on-policy Flash-Next chat with thinking 60%, agent and chat traces 20%, web 20%; `build_calib_pool.py --dspine`) instead
