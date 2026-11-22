@@ -203,8 +203,10 @@ void ms_expert_grouped(const NativeExpertLayout& L, float limit, const unsigned 
     const unsigned gy = (unsigned) ((grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups);
     cudaStream_t s = (cudaStream_t) stream;
     switch (basalt::ms_bits((uint32_t) L.gu_type)) {
+    case 2: grouped_k<2>(L, limit, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, gy, x_q8_1, gate, up, h, xr, out, s); break;
     case 3: grouped_k<3>(L, limit, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, gy, x_q8_1, gate, up, h, xr, out, s); break;
     case 4: grouped_k<4>(L, limit, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, gy, x_q8_1, gate, up, h, xr, out, s); break;
+    case 5: grouped_k<5>(L, limit, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, gy, x_q8_1, gate, up, h, xr, out, s); break;
     default: grouped_k<6>(L, limit, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, gy, x_q8_1, gate, up, h, xr, out, s); break;
     }
 }

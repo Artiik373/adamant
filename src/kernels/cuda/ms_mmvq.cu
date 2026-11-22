@@ -477,8 +477,10 @@ void ms_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y, i
     const bool tc = n_out % 16 == 0;   // whole 16-row tiles: the tensor-core GEMV, every column count alike
     cudaError_t err = cudaSuccess;
     switch (basalt::ms_bits((uint32_t) ggml_type)) {
+    case 2: err = tc ? launch_tc<2>(w, x_q8_1, y, n_in, n_out, ncols, s) : launch_cols<2>(w, x_q8_1, y, n_in, n_out, ncols, s); break;
     case 3: err = tc ? launch_tc<3>(w, x_q8_1, y, n_in, n_out, ncols, s) : launch_cols<3>(w, x_q8_1, y, n_in, n_out, ncols, s); break;
     case 4: err = tc ? launch_tc<4>(w, x_q8_1, y, n_in, n_out, ncols, s) : launch_cols<4>(w, x_q8_1, y, n_in, n_out, ncols, s); break;
+    case 5: err = tc ? launch_tc<5>(w, x_q8_1, y, n_in, n_out, ncols, s) : launch_cols<5>(w, x_q8_1, y, n_in, n_out, ncols, s); break;
     default: err = tc ? launch_tc<6>(w, x_q8_1, y, n_in, n_out, ncols, s) : launch_cols<6>(w, x_q8_1, y, n_in, n_out, ncols, s); break;
     }
     if (err != cudaSuccess) throw std::runtime_error(std::string("ms_mmvq: ") + cudaGetErrorString(err));
@@ -496,8 +498,10 @@ void ms_dequant_dense_f16(int ggml_type, const void* weights, int64_t k, int64_t
     const int r0 = (int) row0, nr = (int) rows, no = (int) n, ni = (int) k;
     cudaError_t err = cudaSuccess;
     switch (basalt::ms_bits((uint32_t) ggml_type)) {
+    case 2: err = mc::launch_ms_dequant_rows<2>(w, r0, nr, no, ni, o, s); break;
     case 3: err = mc::launch_ms_dequant_rows<3>(w, r0, nr, no, ni, o, s); break;
     case 4: err = mc::launch_ms_dequant_rows<4>(w, r0, nr, no, ni, o, s); break;
+    case 5: err = mc::launch_ms_dequant_rows<5>(w, r0, nr, no, ni, o, s); break;
     default: err = mc::launch_ms_dequant_rows<6>(w, r0, nr, no, ni, o, s); break;
     }
     if (err != cudaSuccess) throw std::runtime_error(std::string("ms_dequant_dense_f16: ") + cudaGetErrorString(err));
@@ -522,8 +526,10 @@ void ms_dequant_expert_f16(int ggml_type, const void* blob, int64_t n_embd, int6
         if (err == cudaSuccess) err = mc::launch_ms_dequant_rows<K>(b + down_off, 0, ne, ne, nf, d, s);
     };
     switch (basalt::ms_bits((uint32_t) ggml_type)) {
+    case 2: run(std::integral_constant<int, 2>{}); break;
     case 3: run(std::integral_constant<int, 3>{}); break;
     case 4: run(std::integral_constant<int, 4>{}); break;
+    case 5: run(std::integral_constant<int, 5>{}); break;
     default: run(std::integral_constant<int, 6>{}); break;
     }
     if (err != cudaSuccess) throw std::runtime_error(std::string("ms_dequant_expert_f16: ") + cudaGetErrorString(err));
@@ -554,8 +560,10 @@ void ms_experts_to_q8_0(int ggml_type, const uint8_t* const* blobs, int n, int64
         ms_q80_rows_kernel<K, 640, 2560, 1><<<grid(n * 2560), kWarps * 32, 0, s>>>(g, n, down_off, down_off, d, d_stride);
     };
     switch (basalt::ms_bits((uint32_t) ggml_type)) {
+    case 2: run(std::integral_constant<int, 2>{}); break;
     case 3: run(std::integral_constant<int, 3>{}); break;
     case 4: run(std::integral_constant<int, 4>{}); break;
+    case 5: run(std::integral_constant<int, 5>{}); break;
     default: run(std::integral_constant<int, 6>{}); break;
     }
     const cudaError_t err = cudaGetLastError();

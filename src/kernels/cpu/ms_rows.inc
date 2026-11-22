@@ -106,8 +106,10 @@ void rows_k(const uint8_t* rows, int n_in, const MsAct* const* a, int nt, float*
 
 void BASALT_MS_ROWS(int k, const uint8_t* rows, int n_in, const MsAct* const* a, int nt, float* const* out, int r0,
                     int r1) {
-    if (k == 3) rows_k<3>(rows, n_in, a, nt, out, r0, r1);
+    if (k == 2) rows_k<2>(rows, n_in, a, nt, out, r0, r1);
+    else if (k == 3) rows_k<3>(rows, n_in, a, nt, out, r0, r1);
     else if (k == 4) rows_k<4>(rows, n_in, a, nt, out, r0, r1);
+    else if (k == 5) rows_k<5>(rows, n_in, a, nt, out, r0, r1);
     else rows_k<6>(rows, n_in, a, nt, out, r0, r1);
 }
 

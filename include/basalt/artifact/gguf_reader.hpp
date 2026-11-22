@@ -47,7 +47,7 @@ inline bool exl3_tensor_type(uint32_t t) { return t > 96 && t <= 112; }
 // payload of a [n_in, n_out] tensor is n_out rows of ms_row_bytes(n_in, K) (fp16 scale, uint16 14-bit start state,
 // MSB-first K-bit symbols, zero padding to 4 bytes), then int8 signs[n_in] (+1/-1) of the input rotation
 // y = W_rot * H(signs * x). H is the orthonormal block Hadamard of size ms_hadamard_block(n_in).
-inline bool ms_tensor_type(uint32_t t) { return t == 123 || t == 124 || t == 126; }
+inline bool ms_tensor_type(uint32_t t) { return t >= 122 && t <= 126; }
 inline int ms_bits(uint32_t t) { return (int) t - 120; }
 inline uint64_t ms_row_bytes(uint64_t n_in, int k) { return (4 + ((n_in - 1) * (uint64_t) k + 7) / 8 + 3) & ~uint64_t{3}; }
 // Largest power-of-two divisor of n_in, at most 512 (the converter uses the same rule).
@@ -124,10 +124,14 @@ inline const char* ggml_type_name(uint32_t t) {
         return "F8_E4M3";
     case 45:
         return "NVFP4_PLANES";
+    case 122:
+        return "MS_C2";
     case 123:
         return "MS_C3";
     case 124:
         return "MS_C4";
+    case 125:
+        return "MS_C5";
     case 126:
         return "MS_C6";
     default:

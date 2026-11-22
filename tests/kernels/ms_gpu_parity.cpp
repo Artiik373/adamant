@@ -563,10 +563,19 @@ int main() {
     run<4>(2560, 640, 3, 5);     // shared-expert gate / up
     run<4>(640, 2560, 1, 6);     // shared-expert down: Hadamard block 128
     run<3>(2560, 640, 4, 7);
+    run<2>(2560, 640, 3, 30);
+    run<2>(640, 2560, 1, 31);
+    run<5>(2560, 640, 3, 32);
+    run<5>(640, 2560, 1, 33);
+    run<5>(2560, 10240, 8, 34);
     run_dequant<6>(2560, 4096, 0, 4096, 8);
     run_dequant<6>(6144, 2560, 1000, 700, 9);   // a row slice of a wide input
     run_dequant<4>(640, 2560, 17, 300, 10);     // Hadamard block 128
     run_dequant<3>(2560, 640, 0, 640, 11);
+    run_dequant<2>(2560, 640, 0, 640, 35);
+    run_dequant<2>(640, 2560, 17, 300, 36);
+    run_dequant<5>(2560, 640, 0, 640, 37);
+    run_dequant<5>(640, 2560, 17, 300, 38);
     run_cols<6>(2560, 10240, 20);   // GDN qkv
     run_cols<6>(6144, 2560, 21);    // ssm_out
     run_cols<6>(2560, 248320, 22);  // the head
@@ -575,14 +584,27 @@ int main() {
     run_cols<6>(640, 2560, 25);     // a shared expert's down at the pack's K
     run_cols<6>(2560, 512, 26);     // attention k / v
     run_cols<6>(2560, 12288, 27);   // attention q
+    run_cols<2>(2560, 640, 40);
+    run_cols<2>(640, 2560, 41);
+    run_cols<2>(2560, 10240, 42);
+    run_cols<5>(2560, 640, 43);
+    run_cols<5>(640, 2560, 44);
+    run_cols<5>(2560, 10240, 45);
     bench_dequant_expert<4>();
     bench_dequant_expert<3>();
+    bench_dequant_expert<2>();
+    bench_dequant_expert<5>();
     run_grouped<4>(0.f, 12);
     run_grouped<3>(0.f, 13);
     run_grouped<6>(0.f, 14);
+    run_grouped<2>(0.f, 46);
+    run_grouped<5>(0.f, 47);
+    run_grouped<5>(7.f, 48);
     run_grouped<4>(7.f, 15);
     bench_grouped<4>(10, 1);
     bench_grouped<3>(10, 1);
+    bench_grouped<2>(10, 1);
+    bench_grouped<5>(10, 1);
     bench_grouped<4>(20, 2);
     std::printf(g_fail ? "ms_gpu_parity: %d FAILED\n" : "ms_gpu_parity: all ok\n", g_fail);
     return g_fail ? 1 : 0;

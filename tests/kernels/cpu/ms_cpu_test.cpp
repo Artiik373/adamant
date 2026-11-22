@@ -1,6 +1,6 @@
 // tests/kernels/cpu/ms_cpu_test.cpp - the MS CPU rows against the plain C rows (same integers) and against W x in
 // double (the int8 rotated input's error), on random payloads in the experts' geometry (gate/up 2560 -> 640, down
-// 640 -> 2560; K 3, 4, 6), 1 to 5 tokens.  Prints a microbench line per shape.
+// 640 -> 2560; K 2 to 6), 1 to 5 tokens.  Prints a microbench line per shape.
 #include "basalt/kernels/cpu/ms_expert.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
@@ -246,14 +246,14 @@ int main() {
         return 0;
     }
     std::mt19937 g(7);
-    for (int k : {3, 4, 6}) {
+    for (int k : {2, 3, 4, 5, 6}) {
         check(g, k, 2560, 64);   // gate/up rows (a slice: the oracle is O(rows x n_in))
         check(g, k, 640, 256);   // down rows
         check_expert(g, k);
     }
     check_prepare(g, 2560);
     check_prepare(g, 640);
-    for (int k : {3, 4}) {
+    for (int k : {2, 3, 4, 5}) {
         bench(g, k, 2560, 640);
         bench(g, k, 640, 2560);
     }

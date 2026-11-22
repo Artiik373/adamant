@@ -25,7 +25,7 @@ uint8  qs[...]  ceil((in_features - 1) * K / 8) bytes, MSB-first K-bit symbols
                 zero padding to a 4-byte row stride (ms_row_bytes)
 ```
 
-A GGUF tensor `[n_in, n_out]` of type `120 + K` (`MS_C3` = 123, `MS_C4` = 124, `MS_C6` = 126) stores `n_out` such rows,
+A GGUF tensor `[n_in, n_out]` of type `120 + K` (`MS_C2` = 122 to `MS_C6` = 126) stores `n_out` such rows,
 then `int8 signs[n_in]` (+1 / -1). The engine computes `y = W_rot * H(signs * x)`, with `H` the orthonormal block
 Hadamard of size `largest_pow2_divisor(n_in)`, at most 512. `n_in` must be a multiple of 32.
 
