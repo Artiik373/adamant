@@ -33,7 +33,7 @@ class ViterbiCudaParity(unittest.TestCase):
         return w, ms.cholesky_inv_upper(x.T @ x)
 
     def test_matches_reference(self):
-        for k in (2, 3, 4, 6):
+        for k in (2, 3, 4, 5, 6):
             w, hu = self.case(32, 128, k)
             _, s_ref, q_ref = ms.viterbi_code_matrix(w, hu, k=k, lut=self.lut)
             _, s, q = self.mv.viterbi_code_matrix_cuda(w, hu, k=k, lut=self.lut)
@@ -58,7 +58,7 @@ class PackRows(unittest.TestCase):
         from ms_flashnext_convert import pack_rows
 
         g = torch.Generator().manual_seed(3)
-        for k in (3, 4, 6):
+        for k in (2, 3, 4, 5, 6):
             states = torch.randint(0, ms.NUM_STATES, (5, 64), generator=g, dtype=torch.int32)
             scales = torch.rand(5, generator=g).to(torch.float16)
             self.assertEqual(pack_rows(states, scales, k), ms.pack_per_row_ms(scales, states, k), f"k={k}")
@@ -93,13 +93,28 @@ class ConverterPayload(unittest.TestCase):
         dev = torch.device("cuda")
         lut = ms.build_1mad_lut(dev)
         g = torch.Generator(device=dev).manual_seed(5)
-        for k, (n_out, n_in) in ((3, (16, 640)), (4, (24, 512)), (6, (8, 1024))):
+        for k, (n_out, n_in) in ((2, (16, 640)), (3, (16, 640)), (4, (24, 512)), (5, (16, 512)), (6, (8, 1024))):
             w = torch.randn(2, n_out, n_in, device=dev, generator=g)
             x = torch.randn(4 * n_in, n_in, device=dev, generator=g)
             h = (x.T @ x).expand(2, n_in, n_in).contiguous()
             for rows, signs, deq in code(w, h, k, lut, [7, 8]):
                 got = decode_payload(rows, signs, n_out, n_in, k, lut)
                 self.assertLess((got - deq.cpu()).abs().max().item(), 1e-3 * deq.abs().max().item(), f"k={k}")
+
+    def test_mse_falls_with_k(self):
+        from ms_flashnext_convert import code
+
+        dev = torch.device("cuda")
+        lut = ms.build_1mad_lut(dev)
+        n_out, n_in = 64, 512
+        w = torch.randn(1, n_out, n_in, device=dev, generator=torch.Generator(device=dev).manual_seed(9))
+        h = torch.eye(n_in, device=dev).unsqueeze(0)
+        mse = {}
+        for k in (2, 3, 4, 5, 6):
+            rows, signs, _ = code(w, h, k, lut, [3])[0]
+            mse[k] = ((decode_payload(rows, signs, n_out, n_in, k, lut) - w[0].cpu()) ** 2).mean().item()
+        print("MSE by K:", {k: f"{v:.5f}" for k, v in mse.items()})
+        self.assertTrue(all(mse[k] > mse[k + 1] for k in (2, 3, 4, 5)), mse)
 
 
 if __name__ == "__main__":

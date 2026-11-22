@@ -42,22 +42,22 @@ def base_pack(path: Path) -> dict:
     return {"norm": norm}
 
 
-def ms_record(out_dir: Path, name: str = "blk.0.attn_q.weight", shape=(N_IN, N_OUT), signs=None) -> bytes:
+def ms_record(out_dir: Path, name: str = "blk.0.attn_q.weight", shape=(N_IN, N_OUT), signs=None, k=K) -> bytes:
     n_in, n_out = shape
-    rows = np.random.default_rng(2).integers(0, 256, n_out * ms_pack.ms_row_bytes(n_in, K), dtype=np.uint8).tobytes()
+    rows = np.random.default_rng(2).integers(0, 256, n_out * ms_pack.ms_row_bytes(n_in, k), dtype=np.uint8).tobytes()
     if signs is None:
         signs = np.where(np.arange(n_in) % 3, 1, -1)
-    ms_pack.write_record(out_dir, name, K, n_in, n_out, rows, signs)
+    ms_pack.write_record(out_dir, name, k, n_in, n_out, rows, signs)
     return rows + np.asarray(signs, dtype=np.int8).tobytes()
 
 
-def check_pack() -> None:
+def check_pack(k: int = K) -> None:
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         base = base_pack(td / "base.basalt")
         (td / "ms").mkdir()
-        payload = ms_record(td / "ms")
-        assert len(payload) == ms_pack.payload_bytes(N_IN, N_OUT, K)
+        payload = ms_record(td / "ms", k=k)
+        assert len(payload) == ms_pack.payload_bytes(N_IN, N_OUT, k)
         out = td / "out.basalt"
         assert ms_pack.main(["--base", str(td / "base.basalt"), "--ms-dir", str(td / "ms"), "--out", str(out),
                              "--verify"]) == 0
@@ -65,7 +65,7 @@ def check_pack() -> None:
         assert m.read("tokenizer") == b"tok" * 100
         meta = json.loads(m.read("meta"))
         t = meta["tensors"]["blk.0.attn_q.weight"]
-        assert (t["type"], t["type_id"], t["bytes"]) == ("MS_C6", 126, len(payload)), t
+        assert (t["type"], t["type_id"], t["bytes"]) == (f"MS_C{k}", 120 + k, len(payload)), t
         assert t["offset"] % 4096 == 0
         g0, _ = m.section("gguf")
         with open(out, "rb") as f:
@@ -74,7 +74,7 @@ def check_pack() -> None:
             n = meta["tensors"]["blk.0.attn_norm.weight"]
             f.seek(g0 + n["offset"])
             assert f.read(n["bytes"]) == base["norm"]
-        assert meta["ms"]["dense"] == {"MS_C6": 1}
+        assert meta["ms"]["dense"] == {f"MS_C{k}": 1}
     print("ms_pack: replace + copy + verify ok")
 
 
@@ -127,8 +127,8 @@ def check_gguf_order() -> None:
     print("to_gguf_order: ssm_out columns and attn_qkv rows ok")
 
 
-def check_experts() -> None:
-    """Two layers of three experts (K 4 and 3): the blobs are [gate | up | down] per expert, the layout v8."""
+def check_experts(ks=(4, 3)) -> None:
+    """Two layers of three experts (one K each): the blobs are [gate | up | down] per expert, the layout v8."""
     hid, ff, n_exp = 64, 32, 3
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
@@ -147,7 +147,7 @@ def check_experts() -> None:
         ms_record(ms)
         rng = np.random.default_rng(4)
         want = []
-        for l, k in enumerate((4, 3)):
+        for l, k in enumerate(ks):
             tens, per = {}, {}
             for role, (n_in, n_out) in zip(ms_pack.ROLES, ((hid, ff), (hid, ff), (ff, hid))):
                 per[role] = [rng.integers(0, 256, ms_pack.payload_bytes(n_in, n_out, k), dtype=np.uint8).tobytes()
@@ -164,17 +164,20 @@ def check_experts() -> None:
         lines = m.read("experts.layout").decode().splitlines()
         assert lines[0].startswith("# experts v8:") and "(n_expert 3," in lines[0], lines[0]
         b0, b1 = len(want[0]), len(want[3])
-        assert lines[1:] == [f"0 124 124 0 {b0} 124", f"1 123 123 {3 * b0} {b1} 123"], lines
-        assert json.loads(m.read("meta"))["ms"]["experts"]["k"] == [4, 3]
+        t0, t1 = (120 + k for k in ks)
+        assert lines[1:] == [f"0 {t0} {t0} 0 {b0} {t0}", f"1 {t1} {t1} {3 * b0} {b1} {t1}"], lines
+        assert json.loads(m.read("meta"))["ms"]["experts"]["k"] == list(ks)
     print("ms_pack: experts interleaved, layout v8")
 
 
 class MsPackTest(unittest.TestCase):
     def test_experts(self) -> None:
         check_experts()
+        check_experts((5, 2))
 
     def test_pack(self) -> None:
-        check_pack()
+        for k in ms_pack.MS_BITS:
+            check_pack(k)
 
     def test_refused(self) -> None:
         check_refused()

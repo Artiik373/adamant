@@ -13,7 +13,7 @@ payload of a GGUF [n_in, n_out] tensor is the engine's (include/basalt/artifact/
     n_out rows of ms_row_bytes(n_in, K)   fp16 scale, uint16 14-bit start state, MSB-first K-bit symbols, zero pad
     int8 signs[n_in]                      +1 / -1, the input rotation y = W_rot * H(signs * x)
 
-The tensor type id is 120 + K (MS_C3 = 123, MS_C4 = 124, MS_C6 = 126).  The rows must already be in the GGUF order.
+The tensor type id is 120 + K (MS_C2 = 122 .. MS_C6 = 126).  The rows must already be in the GGUF order.
 
 With `<ms-dir>/experts/blk.<l>.experts.json` for every layer (ms_flashnext_convert.py), the `experts` section and
 `experts.layout` are rebuilt too.  An expert blob is three such payloads back to back, [gate | up | down], one K per
@@ -34,7 +34,7 @@ sys.path.insert(0, str(HERE.parent))
 from model_file import ModelFile, ModelWriter    # noqa: E402
 
 MS_TYPE_BASE = 120
-MS_BITS = (3, 4, 6)
+MS_BITS = (2, 3, 4, 5, 6)
 LAYOUT_VERSION = 8
 ROLES = ("gate", "up", "down")
 

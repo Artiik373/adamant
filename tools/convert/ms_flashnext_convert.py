@@ -33,7 +33,7 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextGatedRe
 import ms_moe_converter as ms
 from eval_ms_kld import split_calib
 from ms_convert_dense_spine import largest_pow2_divisor, to_gguf_order
-from ms_pack import ms_row_bytes, write_record
+from ms_pack import MS_BITS, ms_row_bytes, write_record
 from ms_sensitivity_scan import PRE, load_layer, prelude, run_layer
 from ms_viterbi_cuda import viterbi_code_batched_cuda
 
@@ -192,8 +192,8 @@ def main() -> None:
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--calib-seqs", type=int, default=256)
     p.add_argument("--batch-size", type=int, default=4)
-    p.add_argument("--spine-k", type=int, default=6)
-    p.add_argument("--head-k", type=int, default=6)
+    p.add_argument("--spine-k", type=int, default=6, choices=MS_BITS)
+    p.add_argument("--head-k", type=int, default=6, choices=MS_BITS)
     p.add_argument("--stop-after", type=int, default=None, help="last layer to convert in this run")
     p.add_argument("--reuse-from", type=Path, help="an earlier output folder (same plan) to copy layers from")
     p.add_argument("--reuse-layers", type=int, default=0, help="copy layers below this from --reuse-from")
@@ -217,7 +217,7 @@ def main() -> None:
     cfg = Qwen4ExpTextConfig(**tc)
     nl = cfg.num_hidden_layers
     plan = json.loads(args.plan.read_text())["experts_k"]
-    assert len(plan) == nl and all(k in (3, 4, 6) for k in plan), plan
+    assert len(plan) == nl and all(k in MS_BITS for k in plan), plan
     wmap = json.loads((args.hf_dir / "model.safetensors.index.json").read_text())["weight_map"]
     calib = torch.load(args.calib, map_location="cpu", weights_only=True)
     cal_ids, _ = split_calib(calib, args.calib_seqs, 0)

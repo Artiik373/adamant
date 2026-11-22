@@ -1,4 +1,4 @@
-"""Per-layer MS_C3 / MS_C4 sensitivity scan for Qwen3.8-Flash-Next routed experts.
+"""Per-layer MS width sensitivity scan (default MS_C3 / MS_C4) for Qwen3.8-Flash-Next routed experts.
 
 Streams one BF16 decoder layer at a time through calibration tokens (the reference chain stays BF16), builds
 per-expert Hessians from the real routing, quantizes all experts of the layer at each k, and measures the
@@ -30,6 +30,7 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import (
 )
 
 import ms_moe_converter as ms
+from ms_pack import MS_BITS
 from eval_ms_kld import split_calib
 from ms_viterbi_cuda import viterbi_code_batched_cuda
 
@@ -201,19 +202,23 @@ def rel(a, b):
 
 def report(out_dir: Path) -> None:
     rows = [json.loads(s) for s in (out_dir / "scan.jsonl").read_text().splitlines() if s.strip()]
-    # C3 -> C4 costs the same bits on every layer, so rank by the drop in squared layer-output error
+    ws = [c for c in rows[0] if c[0] == "C" and c[1:].isdigit()]
+    ws.sort(key=lambda c: int(c[1:]))
+    # one width step costs the same bits on every layer, so rank by the drop in squared layer-output error
+    lo, hi = ws[0], ws[1] if len(ws) > 1 else ws[0]
     for r in rows:
-        r["gain"] = r["C3"]["out_rel"] ** 2 - r["C4"]["out_rel"] ** 2
-    print(f"{'layer':>5} {'type':>17} {'C3 out':>8} {'C4 out':>8} {'C3 moe':>8} {'C4 moe':>8} {'zero-tok':>8}")
+        r["gain"] = r[lo]["out_rel"] ** 2 - r[hi]["out_rel"] ** 2
+    print(f"{'layer':>5} {'type':>17} " + " ".join(f"{c + ' out':>8}" for c in ws) + " "
+          + " ".join(f"{c + ' moe':>8}" for c in ws) + f" {'zero-tok':>8}")
     for r in rows:
-        print(f"{r['layer']:5d} {r['type']:>17} {r['C3']['out_rel']:8.5f} {r['C4']['out_rel']:8.5f} "
-              f"{r['C3']['moe_rel']:8.4f} {r['C4']['moe_rel']:8.4f} {r['zero_token_experts']:8d}")
+        print(f"{r['layer']:5d} {r['type']:>17} " + " ".join(f"{r[c]['out_rel']:8.5f}" for c in ws) + " "
+              + " ".join(f"{r[c]['moe_rel']:8.4f}" for c in ws) + f" {r['zero_token_experts']:8d}")
     order = sorted(rows, key=lambda r: -r["gain"])
-    print("layers by C3->C4 gain:", [r["layer"] for r in order])
+    print(f"layers by {lo}->{hi} gain:", [r["layer"] for r in order])
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Per-layer MS_C3/MS_C4 sensitivity scan (Qwen3.8-Flash-Next experts)")
+    p = argparse.ArgumentParser(description="Per-layer MS width sensitivity scan (Qwen3.8-Flash-Next experts)")
     p.add_argument("--hf-dir", type=Path, required=True)
     p.add_argument("--calib", type=Path, required=True)
     p.add_argument("--out-dir", type=Path, required=True)
@@ -221,8 +226,11 @@ def main() -> None:
     p.add_argument("--eval-seqs", type=int, default=8)
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--experts", type=int, default=64, help="experts quantized per layer, spread over token counts")
+    p.add_argument("--widths", type=lambda s: [int(k) for k in s.split(",")], default=[3, 4],
+                   help="comma-separated trellis widths K to scan, e.g. 2,3,4,5,6")
     p.add_argument("--stop-after", type=int, default=None, help="last layer to scan in this run")
     args = p.parse_args()
+    assert args.widths and all(k in MS_BITS for k in args.widths), args.widths
 
     dev = torch.device("cuda")
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -276,7 +284,7 @@ def main() -> None:
         sample = order[:: max(1, len(order) // args.experts)][: args.experts]
         t_fwd = time.time() - t0 - t_load
         gu_ref, dn_ref = moe.experts.gate_up_proj.data, moe.experts.down_proj.data
-        for k in (3, 4):
+        for k in args.widths:
             tq = time.time()
             gu_q, dn_q = quantize_experts(moe, x, idx, k, lut, sample)
             moe.experts.gate_up_proj.data, moe.experts.down_proj.data = gu_q, dn_q
@@ -297,9 +305,10 @@ def main() -> None:
         with open(args.out_dir / "scan.jsonl", "a") as f:
             f.write(json.dumps(rec) + "\n")
         torch.save({"next_layer": l + 1, "h_cal": h_cal, "h_ev": h_ev}, state)
-        print(f"layer {l:2d} {rec['type']:>17}: C3 out {rec['C3']['out_rel']:.5f} moe {rec['C3']['moe_rel']:.4f} | "
-              f"C4 out {rec['C4']['out_rel']:.5f} moe {rec['C4']['moe_rel']:.4f} | zero-token experts "
-              f"{rec['zero_token_experts']} | load {t_load:.0f}s fwd {t_fwd:.0f}s quant {rec['C3']['seconds'] + rec['C4']['seconds']:.0f}s total {time.time() - t0:.0f}s", flush=True)
+        widths = " | ".join(f"C{k} out {rec[f'C{k}']['out_rel']:.5f} moe {rec[f'C{k}']['moe_rel']:.4f}" for k in args.widths)
+        quant = sum(rec[f"C{k}"]["seconds"] for k in args.widths)
+        print(f"layer {l:2d} {rec['type']:>17}: {widths} | zero-token experts "
+              f"{rec['zero_token_experts']} | load {t_load:.0f}s fwd {t_fwd:.0f}s quant {quant:.0f}s total {time.time() - t0:.0f}s", flush=True)
 
     report(args.out_dir)
 
