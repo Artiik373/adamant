@@ -26,7 +26,8 @@ __device__ __forceinline__ const int8_t* signs_of(const uint8_t* payload, int n_
     return reinterpret_cast<const int8_t*>(payload + (size_t) n_out * mc::ms_row_bytes(N_IN, K));
 }
 
-// xr[e][z] = H(signs_z * x[ent_tok[e]]) for z = gate, up: a block per (entry slot, group), a warp per Hadamard block.
+// xr[e][z] = H(signs_z * x[ent_tok[e]]) for z = gate, up (blockIdx.z): a block per (entry slot, group, z), a warp per
+// Hadamard block.
 template <int K>
 __global__ void __launch_bounds__(kThreads) ms_rotate_in_kernel(
     const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
@@ -34,15 +35,12 @@ __global__ void __launch_bounds__(kThreads) ms_rotate_in_kernel(
     float* __restrict__ xr, size_t up_off, int n_ff) {
     constexpr int N = 2560;
     const int ng = *n_groups;
+    const int z = blockIdx.z;
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {
-        const uint8_t* w = reinterpret_cast<const uint8_t*>(grp_ptr[g]);
-        for (int e = grp_start[g] + blockIdx.x; e < grp_start[g + 1]; e += gridDim.x) {
-            const mc::MsQ81* xq = x + (size_t) ent_tok[e] * (N / 32);
-            for (int z = 0; z < 2; ++z) {
-                const int8_t* sg = signs_of<K, N>(w + (z ? up_off : 0), n_ff);
-                mc::ms_stage_q8_rotated(xr + ((size_t) e * 2 + z) * N, xq, sg, N, mc::ms_hadamard_block(N));
-            }
-        }
+        const int8_t* sg = signs_of<K, N>(reinterpret_cast<const uint8_t*>(grp_ptr[g]) + (z ? up_off : 0), n_ff);
+        for (int e = grp_start[g] + blockIdx.x; e < grp_start[g + 1]; e += gridDim.x)
+            mc::ms_stage_q8_rotated(xr + ((size_t) e * 2 + z) * N, x + (size_t) ent_tok[e] * (N / 32), sg, N,
+                                    mc::ms_hadamard_block(N));
     }
 }
 
@@ -114,7 +112,7 @@ __device__ __forceinline__ void row_entries(const uint32_t (&wa)[STEPS], const u
 // columns a step from one 32-bit window of the row's big-endian stream; its bit offset is the same every step and its
 // words advance by 4 K, so all of a row's loads are issued before the first is used.
 template <int K, bool GU, int STEPS>
-__global__ void __launch_bounds__(kThreads, 3) ms_rows_kernel(
+__global__ void __launch_bounds__(kThreads, STEPS <= 5 ? 4 : 3) ms_rows_kernel(   // short rows: more warps in flight
     const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
     const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_dst, const float* __restrict__ xr,
     float* __restrict__ out0, float* __restrict__ out1, size_t off0, size_t off1, int n_out) {
@@ -167,7 +165,7 @@ void grouped_k(const NativeExpertLayout& L, float limit, const unsigned long lon
     constexpr int NE = 2560, NF = 640;
     // entry slots a group: a decode window has one entry an expert, a verify window a few
     const dim3 grot(2, gy);
-    ms_rotate_in_kernel<K><<<grot, 160, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok,
+    ms_rotate_in_kernel<K><<<dim3(2, gy, 2), 160, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok,
                                                static_cast<const mc::MsQ81*>(x_q8_1), xr, L.up_off, NF);
     check("ms_expert_grouped/rotate");
     ms_rows_kernel<K, true, NE / 128><<<dim3(NF / kWarps, gy, 2), kThreads, 0, s>>>(
