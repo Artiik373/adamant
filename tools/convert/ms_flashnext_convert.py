@@ -338,6 +338,108 @@ def two_stream_layer(layer, l, nl, h, hq, kws, bs, x, code_spine, code_moe, load
     return rec
 
 
+MTP_PROJ = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+            "mlp.shared_expert.gate_proj", "mlp.shared_expert.up_proj", "mlp.shared_expert.down_proj")   # MS-coded
+MTP_Q8 = ("fc_embedding", "fc_hidden", "self_attn.indexer.index_qk_proj")   # Q8_0 (the drafter's loader reads them so)
+
+
+def mtp_index_entry(name: str, t: torch.Tensor, coded: dict) -> tuple:
+    """(kind, rows, cols, bytes) of one drafter tensor in the engine's mtp/dense forms: MS records for MTP_PROJ (rows,
+    int8 signs), Q8_0 for MTP_Q8, f32 1 + w for the norm vectors, bf16 for the other matrices."""
+    import gguf.quants as gq
+    from gguf import GGMLQuantizationType as T
+    base = name[: -len(".weight")] if name.endswith(".weight") else name
+    if base in coded:
+        rows, signs, n_out, n_in = coded[base]
+        return "ms", n_out, n_in, rows + signs.tobytes()
+    if t.dim() == 1:
+        return "f32", 1, t.shape[0], (1.0 + t.float()).cpu().numpy().astype("<f4").tobytes()
+    if base in MTP_Q8:
+        return "q8_0", t.shape[0], t.shape[1], gq.quantize(t.float().cpu().numpy(), T.Q8_0).tobytes()
+    return "bf16", t.shape[0], t.shape[1], t.to(torch.bfloat16).contiguous().view(torch.int16).cpu().numpy().tobytes()
+
+
+@torch.no_grad()
+def code_mtp(cfg, hf: Path, wmap: dict, h, cal_ids, kws, bs, dev, lut, k_proj: int, k_exp: int, tau: float, out: Path):
+    """The MTP drafter from the checkpoint's mtp.* weights, coded on Hessians from the original model's last residual
+    stream h: <out>/mtp/mtp.dense + mtp.dense.index (the pack's mtp/dense forms, first line `#experts ms T T BLOB`)
+    and the experts as one layer's records (code_experts). The drafter (decode/mtp/forward.cpp): R at t and the
+    embedding of token t+1 -> fc_hidden(norm(R)) per stream + fc_embedding(norm(e)) -> one full-attention layer."""
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextDecoderLayer
+    d = out / "mtp"
+    d.mkdir(parents=True, exist_ok=True)
+    get = lambda k: safe_open(hf / wmap[k], "pt").get_tensor(k)
+    c1 = Qwen4ExpTextConfig(**{**cfg.to_dict(), "num_hidden_layers": 1, "layer_types": ["full_attention"],
+                               "ple_layer_ids": []})
+    c1._attn_implementation = "sdpa"
+    with torch.device("meta"):
+        layer = Qwen4ExpTextDecoderLayer(c1, 0)
+    lp = "mtp.layers.0."
+    layer.load_state_dict({k[len(lp):]: get(k) for k in wmap if k.startswith(lp)}, strict=True, assign=True)
+    layer = layer.to(dev, torch.bfloat16).eval()
+    top = {k[4:]: get(k).to(dev) for k in wmap if k.startswith("mtp.") and ".layers." not in k}
+    emb = get(f"{PRE}embed_tokens.weight").to(dev)
+    hc, n = cfg.hc_count, cfg.hidden_size
+
+    def norm(x, w, group=None):
+        x = x.float()
+        if group:
+            x = x.unflatten(-1, (-1, group))
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + cfg.rms_norm_eps)
+        return (x.flatten(-2) if group else x) * (1.0 + w.float())
+
+    mods = dict(layer.named_modules())
+    hs = {}
+    x = torch.empty(cal_ids.numel(), n, dtype=torch.bfloat16, device=dev)
+    fill = [0]
+
+    def hk(name):
+        def f(_m, a):
+            t = a[0].reshape(-1, a[0].shape[-1]).float()
+            hs[name] = hs.get(name, 0) + t.T @ t
+        return f
+
+    def grab(_m, a):
+        t = a[0].reshape(-1, n)
+        x[fill[0] : fill[0] + t.shape[0]] = t
+        fill[0] += t.shape[0]
+    hooks = [mods[m].register_forward_pre_hook(hk(m)) for m in MTP_PROJ] + [layer.mlp.register_forward_pre_hook(grab)]
+    for b, kw in enumerate(kws):
+        t = cal_ids[b * bs : (b + 1) * bs].to(dev, torch.long)
+        nxt = torch.cat([t[:, 1:], t[:, -1:]], 1)
+        h2 = norm(h[b * bs : (b + 1) * bs].to(dev), top["pre_fc_norm_hidden.weight"], n).unflatten(-1, (hc, n))
+        h2 = h2 @ top["fc_hidden.weight"].float().T
+        e2 = norm(emb[nxt], top["pre_fc_norm_embedding.weight"]) @ top["fc_embedding.weight"].float().T
+        layer((h2 + e2.unsqueeze(-2)).flatten(-2).to(torch.bfloat16), **kw)
+    for hk_ in hooks:
+        hk_.remove()
+    assert fill[0] == x.shape[0], (fill[0], x.shape)
+    coded = {}
+    for i, m in enumerate(MTP_PROJ):
+        w = mods[m].weight.float()
+        rows, signs, _ = code(w[None], (hs.pop(m) / x.shape[0])[None], k_proj, lut, [9000 + i])[0]
+        coded[m] = (rows, signs, w.shape[0], w.shape[1])
+    _, wts, idx = layer.mlp.gate(x)
+    rec = code_experts(layer.mlp, x, idx, k_exp, lut, 0, d, None, tau)
+    ex = rec["tensors"]
+    blob = sum(int(ms_row_bytes(int(t["shape"][0]), k_exp)) * int(t["shape"][1]) + int(t["shape"][0]) for t in ex.values())
+    t_exp = 120 + k_exp
+    lines, parts, off = [f"#experts ms {t_exp} {t_exp} {blob}"], [], 0
+    names = [k[4:] for k in wmap if k.startswith("mtp.") and ".experts." not in k]
+    for name in names:
+        short = name.replace("layers.0.", "")
+        kind, r, c, raw = mtp_index_entry(short, get("mtp." + name), coded)
+        pad = (-off) % 256
+        parts.append(b"\0" * pad)
+        off += pad
+        lines.append(f"{short} {kind} {r} {c} {off} {len(raw)}")
+        parts.append(raw)
+        off += len(raw)
+    (d / "mtp.dense").write_bytes(b"".join(parts))
+    (d / "mtp.dense.index").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return {"k_proj": k_proj, "k_exp": k_exp, "zero_token_experts": rec["zero_token_experts"], "dense_bytes": off}
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Qwen3.8-Flash-Next -> MS records, layer-streamed")
     p.add_argument("--hf-dir", type=Path, required=True)
@@ -359,6 +461,10 @@ def main() -> None:
                    help="keep the converted model's stream beside the original's (the MS method's section 6.3): read "
                         "projections mapped toward the original inputs, output projections refit toward the original "
                         "stream, every matrix coded on the converted model's inputs")
+    p.add_argument("--mtp-k", type=int, default=5, choices=MS_BITS, help="the MTP drafter's projections")
+    p.add_argument("--mtp-k-exp", type=int, default=2, choices=MS_BITS, help="the MTP drafter's routed experts")
+    p.add_argument("--mtp-only", action="store_true",
+                   help="only the MTP drafter: the original layers run uncoded, then the drafter is coded")
     p.add_argument("--hess-affinity", action="store_true",
                    help="weight each routed token in its expert's Hessians by its router score squared")
     args = p.parse_args()
@@ -366,6 +472,8 @@ def main() -> None:
         p.error("--reuse-layers needs --reuse-from")
     if args.two_stream and args.reuse_layers:
         p.error("--reuse-layers advances one stream only: not with --two-stream")
+    if args.mtp_only and (args.two_stream or args.reuse_layers or args.stop_after is not None):
+        p.error("--mtp-only runs every original layer: not with --two-stream, --reuse-layers or --stop-after")
 
     dev = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True  # Hessian sums: TF32 inputs, FP32 accumulation
@@ -389,6 +497,17 @@ def main() -> None:
     hq = h.clone() if args.two_stream else None   # the converted model's stream
     state = out / "state.pt"
     start = 0
+    if args.mtp_only:
+        for l in range(nl):
+            h = run_layer(load_layer(cfg, args.hf_dir, wmap, l, dev), h, kws, bs, inplace=True)
+            torch.cuda.empty_cache()
+        print(f"original stream through {nl} layers", flush=True)
+        t0 = time.time()
+        r = code_mtp(cfg, args.hf_dir, wmap, h, cal_ids, kws, bs, dev, ms.build_1mad_lut(dev), args.mtp_k,
+                     args.mtp_k_exp, args.hess_tau, out)
+        print(f"mtp: projections MS_C{r['k_proj']}, experts MS_C{r['k_exp']} (zero-token {r['zero_token_experts']}), "
+              f"dense {r['dense_bytes'] / 2**20:.1f} MiB: {time.time() - t0:.0f}s", flush=True)
+        return
     if state.exists():
         st = torch.load(state, map_location="cpu" if host_h else dev, weights_only=True)
         start, h, hq = st["next_layer"], st["h"], st.get("hq")
@@ -433,7 +552,7 @@ def main() -> None:
             torch.cuda.empty_cache()
             torch.save({"next_layer": l + 1, "h": h, "hq": hq}, state)
             print(f"layer {l:2d} {cfg.layer_types[l]:>17}: experts MS_C{plan[l]} (zero-token {rec['zero_token_experts']}) | "
-                  " ".join(f"{k} {v:.0f}s" for k, v in rec["times"].items()) + f" total {time.time() - t0:.0f}s", flush=True)
+                  + " ".join(f"{k} {v:.0f}s" for k, v in rec["times"].items()) + f" total {time.time() - t0:.0f}s", flush=True)
             continue
         hess, counts = {}, {}
         hooks = spine_hooks(layer, hess, counts)
@@ -496,6 +615,11 @@ def main() -> None:
         rows, signs = code_rows(w, hh, args.head_k, lut, seed=12)
         write_record(out, "output.weight", args.head_k, w.shape[1], w.shape[0], rows, signs)
         print(f"head MS_C{args.head_k}: {time.time() - t0:.0f}s", flush=True)
+    if last >= nl - 1 and not (out / "mtp" / "mtp.dense.index").exists():
+        t0 = time.time()
+        r = code_mtp(cfg, args.hf_dir, wmap, h, cal_ids, kws, bs, dev, lut, args.mtp_k, args.mtp_k_exp, args.hess_tau, out)
+        print(f"mtp: projections MS_C{r['k_proj']}, experts MS_C{r['k_exp']} (zero-token {r['zero_token_experts']}), "
+              f"dense {r['dense_bytes'] / 2**20:.1f} MiB: {time.time() - t0:.0f}s", flush=True)
 
 
 if __name__ == "__main__":

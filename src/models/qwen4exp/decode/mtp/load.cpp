@@ -117,11 +117,11 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     const char* required[] = {"fc_embedding.weight", "fc_hidden.weight", "self_attn.q_proj.weight", "self_attn.k_proj.weight",
                               "self_attn.v_proj.weight", "self_attn.o_proj.weight", "mlp.shared_expert.gate_proj.weight",
                               "mlp.shared_expert.up_proj.weight", "mlp.shared_expert.down_proj.weight"};
-    for (const char* n : required) if (!q8(n)) { err = std::string("mtp: ") + n + " is missing (a q8_0 or exl3 projection)"; return false; }
-    if (ex_.exl3) {   // the experts' kernels are checked before anything else is allocated
+    for (const char* n : required) if (!q8(n)) { err = std::string("mtp: ") + n + " is missing (a q8_0, exl3 or ms projection)"; return false; }
+    if (ex_.native) {   // the experts' kernels are checked before anything else is allocated
         if (!basalt::kernels::native_expert_supported(ex_.gu_type, ex_.d_type, g.n_embd, g.n_ff) ||
             basalt::kernels::native_expert_layout(ex_.gu_type, ex_.d_type, g.n_embd, g.n_ff).bytes != ex_.blob) {
-            err = "mtp: the EXL3 experts' types " + std::to_string(ex_.gu_type) + "/" + std::to_string(ex_.d_type) +
+            err = "mtp: the experts' types " + std::to_string(ex_.gu_type) + "/" + std::to_string(ex_.d_type) +
                   " or blob size do not fit the model";
             return false;
         }
@@ -250,7 +250,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 36); hit_xs_ = b.take<float>(T * (N / 32));
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
             basalt::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
-            ex_.exl3 ? basalt::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff) : 0));
+            ex_.native ? basalt::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff) : 0));
         sh_scratch_ = (float*) b.take<uint8_t>(basalt::kernels::shared_expert_scratch_bytes(g.n_ff));
         out_ids_ = b.take<int32_t>(T + 4);
         probs_ = b.take<float>(T + 4);

@@ -33,17 +33,19 @@ bool MtpDrafter::parse_index(const FileRange& index, std::vector<Tensor>& out, E
     std::string line;
     while (std::getline(idx, line)) {
         if (line.empty()) continue;
-        if (line[0] == '#') {   // `#experts exl3 GU_TYPE D_TYPE BLOB_BYTES`
+        if (line[0] == '#') {   // `#experts exl3|ms GU_TYPE D_TYPE BLOB_BYTES`
             std::istringstream hs(line);
             std::string tag, fmt;
             hs >> tag >> fmt;
             if (tag == "#experts") {
-                if (fmt != "exl3" || !(hs >> ex.gu_type >> ex.d_type >> ex.blob) || !basalt::kernels::cpu::exl3_type(ex.gu_type) ||
-                    !basalt::kernels::cpu::exl3_type(ex.d_type) || ex.blob == 0) {
+                const bool read = (fmt == "exl3" || fmt == "ms") && (hs >> ex.gu_type >> ex.d_type >> ex.blob) && ex.blob != 0;
+                const bool typed = fmt == "exl3" ? basalt::kernels::cpu::exl3_type(ex.gu_type) && basalt::kernels::cpu::exl3_type(ex.d_type)
+                                                 : ms_tensor_type((uint32_t) ex.gu_type) && ex.d_type == ex.gu_type;
+                if (!read || !typed) {
                     err = "mtp: malformed experts line: " + line;
                     return false;
                 }
-                ex.exl3 = true;
+                ex.native = true;
             }
             continue;
         }
@@ -61,6 +63,10 @@ bool MtpDrafter::parse_index(const FileRange& index, std::vector<Tensor>& out, E
             }
             t.type = basalt::kernels::cpu::kExl3TypeBase + (int) (body / per) / 8;
             if (!basalt::kernels::cpu::exl3_type(t.type)) { err = "mtp: bad EXL3 rate: " + line; return false; }
+        } else if (t.kind == "ms") {   // rows of ms_row_bytes(cols, K), then int8 signs[cols]: K is implied
+            for (int k = 2; k <= 6 && t.type < 0; ++k)
+                if ((uint64_t) t.rows * ms_row_bytes((uint64_t) t.cols, k) + (uint64_t) t.cols == t.bytes) t.type = 120 + k;
+            if (t.type < 0) { err = "mtp: bad MS tensor in the dense index: " + line; return false; }
         }
         out.push_back(t);
     }
@@ -90,7 +96,7 @@ bool MtpDrafter::plan_bytes(const MtpFiles& files, const ModelGeometry& g, uint6
         std::vector<Tensor> tensors;
         if (!parse_index(files.index, tensors, ex, err)) return false;
     }
-    out = dense + (uint64_t) g.n_expert * (ex.exl3 ? ex.blob : (uint64_t) basalt::kernels::cpu::BLOB);
+    out = dense + (uint64_t) g.n_expert * (ex.native ? ex.blob : (uint64_t) basalt::kernels::cpu::BLOB);
     return true;
 }
 

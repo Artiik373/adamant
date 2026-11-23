@@ -18,6 +18,10 @@ The tensor type id is 120 + K (MS_C2 = 122 .. MS_C6 = 126).  The rows must alrea
 With `<ms-dir>/experts/blk.<l>.experts.json` for every layer (ms_flashnext_convert.py), the `experts` section and
 `experts.layout` are rebuilt too.  An expert blob is three such payloads back to back, [gate | up | down], one K per
 layer; the layout is `# experts v8` with type 120 + K for gate, up and down.
+
+With `<ms-dir>/mtp/` (ms_flashnext_convert.py's drafter: mtp.dense, mtp.dense.index and one layer of expert records)
+the `mtp/dense`, `mtp/dense.index` and `mtp/experts` sections are replaced: the index names the same tensors as the
+base pack's, projections of kind `ms`, and its first line `#experts ms T T BLOB` says the experts are such blobs.
 """
 from __future__ import annotations
 
@@ -154,6 +158,39 @@ class Experts:
         return (head + "".join(lines)).encode("utf-8")
 
 
+MTP_SECTIONS = ("mtp/dense", "mtp/dense.index", "mtp/experts")
+
+
+def read_mtp(mtp_dir: Path, base: ModelFile):
+    """(index text, dense path, Experts) of the converter's drafter, checked against the base pack's drafter."""
+    for need in MTP_SECTIONS:
+        if need not in base.sections:
+            raise PackError(f"the base pack has no `{need}` section")
+    index = (mtp_dir / "mtp.dense.index").read_text(encoding="utf-8")
+    dense = mtp_dir / "mtp.dense"
+    lines = index.splitlines()
+    ex = Experts(mtp_dir, 1)
+    k = ex.layers[0][0]
+    want = f"#experts ms {MS_TYPE_BASE + k} {MS_TYPE_BASE + k} {ex.blob_bytes(0)}"
+    if not lines or lines[0] != want:
+        raise PackError(f"{mtp_dir}: the index starts with {lines[0] if lines else '(nothing)'!r}, expected {want!r}")
+    names, end = set(), 0
+    for line in lines[1:]:
+        name, kind, rows, cols, off, size = line.split()
+        rows, cols, off, size = int(rows), int(cols), int(off), int(size)
+        if kind == "ms" and not any(rows * ms_row_bytes(cols, kk) + cols == size for kk in MS_BITS):
+            raise PackError(f"{name}: {size} B is no MS payload of [{rows}, {cols}]")
+        names.add(name)
+        end = max(end, off + size)
+    if end > dense.stat().st_size:
+        raise PackError(f"{dense}: {dense.stat().st_size} B, the index reaches {end}")
+    base_names = {ln.split()[0] for ln in base.read("mtp/dense.index").decode("utf-8").splitlines()
+                  if ln.strip() and not ln.startswith("#")}
+    if names != base_names:
+        raise PackError(f"the drafter's tensors differ from the base pack's: {sorted(names ^ base_names)}")
+    return index, dense, ex
+
+
 def write_gguf(out: ModelWriter, base: ModelFile, meta: dict, records: dict) -> None:
     """The `gguf` section with each recorded tensor replaced by its payload, the others copied unchanged."""
     off0, _ = base.section("gguf")
@@ -209,6 +246,12 @@ def main(argv=None) -> int:
             print(f"experts MS_C{k}: {len(ls)} layers, blob {experts.blob_bytes(ls[0]):,} B", file=sys.stderr)
         print(f"experts: {experts.total_bytes() / 2**30:.2f} GiB (base {base.section('experts')[1] / 2**30:.2f} GiB)",
               file=sys.stderr)
+    mtp = None
+    if (Path(a.ms_dir) / "mtp").is_dir():
+        mtp = read_mtp(Path(a.ms_dir) / "mtp", base)
+        print(f"mtp: experts MS_C{mtp[2].layers[0][0]} ({mtp[2].total_bytes() / 2**30:.2f} GiB, base "
+              f"{base.section('mtp/experts')[1] / 2**30:.2f} GiB), dense {mtp[1].stat().st_size / 2**20:.1f} MiB",
+              file=sys.stderr)
     by_k: dict = {}
     for name, (rec, _) in records.items():
         by_k.setdefault(int(rec["k"]), []).append(name)
@@ -220,6 +263,10 @@ def main(argv=None) -> int:
     meta["ms"] = {"dense": {f"MS_C{k}": len(v) for k, v in sorted(by_k.items())}, "type_base": MS_TYPE_BASE}
     if experts is not None:
         meta["ms"]["experts"] = {"k": [k for k, *_ in experts.layers], "layout_version": LAYOUT_VERSION}
+    if mtp is not None:   # the drafter is the checkpoint's own, coded: no tuned dense, no Q2_0 experts
+        meta["mtp"] = {k: v for k, v in meta.get("mtp", {}).items() if k not in ("dense", "source_sha256")}
+        meta["mtp"]["expert_format"] = "ms"
+        meta["ms"]["mtp"] = {"experts_k": mtp[2].layers[0][0]}
     out = ModelWriter(a.out)
     try:
         for name in base.names():
@@ -232,6 +279,15 @@ def main(argv=None) -> int:
                 continue
             if name == "gguf":
                 write_gguf(out, base, meta, records)
+                continue
+            if mtp is not None and name in MTP_SECTIONS:
+                if name == "mtp/dense":
+                    out.add_file(name, str(mtp[1]), 0, mtp[1].stat().st_size)
+                elif name == "mtp/dense.index":
+                    out.add_bytes(name, mtp[0].encode("utf-8"))
+                else:
+                    out.add_chunks(name, mtp[2].chunks())
+                print(f"mtp: {name} from {a.ms_dir}", file=sys.stderr)
                 continue
             off, size = base.section(name)
             print(f"copy {name} ({size / 2**30:.2f} GiB)", file=sys.stderr)

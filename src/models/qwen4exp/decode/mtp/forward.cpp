@@ -257,7 +257,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         }
         moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) expert_blob(), grp_ptr_,
                            grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
-        if (ex_.exl3) {   // EXL3 records: q8_1 activations, the native grouped kernels on the same groups
+        if (ex_.native) {   // EXL3 or MS records: q8_1 activations, the native grouped kernels on the same groups
             native_quantize_q8_1(mixed_, hit_xq_, (int) N, T, cs);
             native_expert_grouped(ex_layout_, grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K,
                                   (int64_t) T * K, hit_xq_, hit_scratch_, parts_, cs);

@@ -267,15 +267,16 @@ private:
         std::string name, kind;
         int64_t rows = 0, cols = 0;
         uint64_t off = 0, bytes = 0;
-        int type = -1;               ///< native_mmvq type of a q8_0 / exl3 projection
+        int type = -1;               ///< native_mmvq type of a q8_0 / exl3 / ms projection
         const void* dev = nullptr;   ///< set: the tensor lives here instead of in dense_ (an 8-bit copy)
     };
     std::vector<Tensor> tensors_;
     /// The experts' format: Q2_0 blobs (`#experts` line absent) or EXL3 records [gate | up | down], gate/up at gu_type, down at d_type.
-    struct ExpertFormat { bool exl3 = false; int gu_type = 0, d_type = 0; uint64_t blob = 0; };
+    /// native: EXL3 or MS blobs on the native expert kernels; else Q2_0 blobs
+    struct ExpertFormat { bool native = false; int gu_type = 0, d_type = 0; uint64_t blob = 0; };
     static bool parse_index(const FileRange& index, std::vector<Tensor>& out, ExpertFormat& ex, std::string& err);
     ExpertFormat ex_;
-    uint64_t expert_blob() const { return ex_.exl3 ? ex_.blob : (uint64_t) basalt::kernels::cpu::BLOB; }
+    uint64_t expert_blob() const { return ex_.native ? ex_.blob : (uint64_t) basalt::kernels::cpu::BLOB; }
     basalt::kernels::NativeExpertLayout ex_layout_;
     static bool is_hc8_matrix(const Tensor& t);
     uint8_t* dense_ = nullptr;
