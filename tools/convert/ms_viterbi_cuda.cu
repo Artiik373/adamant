@@ -3,6 +3,8 @@
 #include <c10/cuda/CUDAException.h>
 #include <cstdint>
 #include <cmath>
+#include <cstring>
+#include <type_traits>
 
 namespace {
 
@@ -23,9 +25,24 @@ __device__ __forceinline__ float decode_1mad(int s) {
     return static_cast<float>(v);
 }
 
-// One block per row runs the whole window DP. Thread tid owns states tid + m * T, which hold every
-// predecessor of its own remainders j = s mod 2^(14-k), so costs live in registers and only the per-j
-// minimum crosses threads (double-buffered: one barrier per step). All states with the same j share one
+// n consecutive elements written as one aligned vector store where n fits one
+template <int N, typename E>
+__device__ __forceinline__ void store_run(E* dst, const E (&x)[N]) {
+    constexpr int bytes = N * static_cast<int>(sizeof(E));
+    if constexpr (bytes == 2 || bytes == 4 || bytes == 8 || bytes == 16) {
+        using V = std::conditional_t<bytes == 2, uint16_t, std::conditional_t<bytes == 4, uint32_t,
+                  std::conditional_t<bytes == 8, uint2, uint4>>>;
+        V u;
+        memcpy(&u, x, bytes);
+        *reinterpret_cast<V*>(dst) = u;
+    } else {
+        #pragma unroll
+        for (int i = 0; i < N; ++i) dst[i] = x[i];
+    }
+}
+
+// One block per row runs the whole window DP. Thread tid owns the states of its remainders j = s mod 2^(14-k), with
+// every predecessor of each, so costs live in registers and only the per-j minimum crosses threads (double-buffered: one barrier per step). All states with the same j share one
 // predecessor, so the back-pointer is stored once per j as the predecessor's top-k bits.
 template <int PT, int K>
 __global__ void __launch_bounds__(NUM_STATES / PT) viterbi_window_kernel(
@@ -57,9 +74,13 @@ __global__ void __launch_bounds__(NUM_STATES / PT) viterbi_window_kernel(
     const float* piv_row = inv_piv2 + static_cast<size_t>(r / rows_per_group) * w_len;
     uint8_t* bp_row = backptr + static_cast<size_t>(r) * w_len * n_rem;
 
+    // state m = a * n_sub + sub is s = (a << shift_r) | j with j = j0 + sub: a thread owns n_sub consecutive
+    // remainders, so their minima go out as one vector store and, when n_sub <= 2^k, one loaded minimum serves
+    // the n_sub states of each predecessor top a
+    const int j0 = tid * n_sub;
     float v[PT], c[PT];
     #pragma unroll
-    for (int m = 0; m < PT; ++m) v[m] = decode_1mad(tid + m * T);
+    for (int m = 0; m < PT; ++m) v[m] = decode_1mad(((m / n_sub) << shift_r) | (j0 + m % n_sub));
 
     {
         const float a = piv_row[0] * d2;
@@ -68,7 +89,7 @@ __global__ void __launch_bounds__(NUM_STATES / PT) viterbi_window_kernel(
         const int base = prev_s ? ((prev_s[r] << k) & STATE_MASK) : 0;
         #pragma unroll
         for (int m = 0; m < PT; ++m) {
-            int s = tid + m * T;
+            int s = ((m / n_sub) << shift_r) | (j0 + m % n_sub);
             float branch = v[m] * (a * v[m] + b);
             c[m] = (prev_s == nullptr || (s & mask) == base) ? branch : INFINITY;
         }
@@ -77,7 +98,8 @@ __global__ void __launch_bounds__(NUM_STATES / PT) viterbi_window_kernel(
     for (int t = 1; t < w_len; ++t) {
         float* mc = min_c + (t & 1) * n_rem;
         uint8_t* bp_t = bp_row + static_cast<size_t>(t) * n_rem;
-        // m = pred_top * n_sub + sub, remainder j = tid + sub * T
+        float best[n_sub];
+        uint8_t best_a[n_sub];
         #pragma unroll
         for (int sub = 0; sub < n_sub; ++sub) {
             // pairwise tree over the 2^k predecessors; the right side wins only when strictly smaller, so ties
@@ -94,27 +116,34 @@ __global__ void __launch_bounds__(NUM_STATES / PT) viterbi_window_kernel(
                     if (tv[a + w] < tv[a]) { tv[a] = tv[a + w]; ta[a] = ta[a + w]; }
                 }
             }
-            float best = tv[0];
-            int best_a = ta[0];
-            int j = tid + sub * T;
-            mc[j] = best;
-            bp_t[j] = static_cast<uint8_t>(best_a);
+            best[sub] = tv[0];
+            best_a[sub] = static_cast<uint8_t>(ta[0]);
         }
+        store_run<n_sub>(mc + j0, best);
+        store_run<n_sub>(bp_t + j0, best_a);
         __syncthreads();
         const float a = piv_row[t] * d2;
         const float b = -piv_row[t] * 2.0f * w_row[t] * d;
         #pragma unroll
-        for (int m = 0; m < PT; ++m) {
-            int s = tid + m * T;
-            c[m] = mc[s >> k] + v[m] * (a * v[m] + b);
+        for (int ap = 0; ap < (1 << K); ++ap) {
+            constexpr int per_load = n_sub <= (1 << K) ? n_sub : (1 << K);
+            #pragma unroll
+            for (int sub0 = 0; sub0 < n_sub; sub0 += per_load) {
+                const float prev = mc[(ap << (shift_r - k)) | ((j0 + sub0) >> k)];
+                #pragma unroll
+                for (int sub = sub0; sub < sub0 + per_load; ++sub) {
+                    const int m = ap * n_sub + sub;
+                    c[m] = prev + v[m] * (a * v[m] + b);
+                }
+            }
         }
     }
 
     float best_c = INFINITY;
     int best_s = 0;
     #pragma unroll
-    for (int m = 0; m < PT; ++m) {
-        if (c[m] < best_c) { best_c = c[m]; best_s = tid + m * T; }
+    for (int m = 0; m < PT; ++m) {   // m runs in increasing s, so the first strict minimum is the lowest index
+        if (c[m] < best_c) { best_c = c[m]; best_s = ((m / n_sub) << shift_r) | (j0 + m % n_sub); }
     }
     red_c[tid] = best_c;
     red_s[tid] = best_s;
@@ -181,9 +210,9 @@ torch::Tensor viterbi_window_cuda(
     };
     switch (k) {
         case 1: launch(viterbi_window_kernel<16, 1>, NUM_STATES / 16); break;
-        case 2: launch(viterbi_window_kernel<16, 2>, NUM_STATES / 16); break;
-        case 3: launch(viterbi_window_kernel<16, 3>, NUM_STATES / 16); break;
-        case 4: launch(viterbi_window_kernel<16, 4>, NUM_STATES / 16); break;
+        case 2: launch(viterbi_window_kernel<32, 2>, NUM_STATES / 32); break;
+        case 3: launch(viterbi_window_kernel<32, 3>, NUM_STATES / 32); break;
+        case 4: launch(viterbi_window_kernel<32, 4>, NUM_STATES / 32); break;
         case 5: launch(viterbi_window_kernel<64, 5>, NUM_STATES / 64); break;
         default: launch(viterbi_window_kernel<64, 6>, NUM_STATES / 64); break;
     }
