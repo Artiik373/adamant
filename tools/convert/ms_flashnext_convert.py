@@ -71,12 +71,27 @@ def pack_rows(states: torch.Tensor, scales: torch.Tensor, k: int) -> bytes:
 VITERBI = (48, 12)   # search window, commit length; set from --window/--commit
 
 
+def refit_scales(w: torch.Tensor, states: torch.Tensor, scales: torch.Tensor, h: torch.Tensor, lut):
+    """Each row's fp16 scale refitted for its fixed codes c: s = (c H w^T) / (c H c^T), the least H-weighted error;
+    a row keeps its old scale where the rounded refit is not better. w, states [E, out, in], h [E, in, in]."""
+    c = lut[states.long()]
+    ch = torch.bmm(c, h)
+    s_new = ((ch * w).sum(-1) / (ch * c).sum(-1).clamp(min=1e-30)).to(torch.float16)
+    def err(s):
+        e = w - c * s.float().unsqueeze(-1)
+        return (torch.bmm(e, h) * e).sum(-1)
+    s_new = torch.where(torch.isfinite(s_new) & (err(s_new) < err(scales)), s_new, scales)
+    return s_new, c * s_new.float().unsqueeze(-1)
+
+
 def code(ws: torch.Tensor, hs: torch.Tensor, k: int, lut, seeds) -> list:
     """Code E matrices [E, out, in] on Hessians [E, in, in]: (rows bytes, int8 signs, decoded W) per matrix."""
     blk = largest_pow2_divisor(int(ws.shape[2]), cap=512)
     rot = [ms.rotate_weight_and_hessian(w, h, block_size=blk, seed=s) for w, h, s in zip(ws, hs, seeds)]
     hu = torch.stack([ms.cholesky_inv_upper(r[1]) for r in rot])
-    scales, states, q = viterbi_code_batched_cuda(torch.stack([r[0] for r in rot]), hu, k, lut, *VITERBI)
+    w_rot = torch.stack([r[0] for r in rot])
+    scales, states, _ = viterbi_code_batched_cuda(w_rot, hu, k, lut, *VITERBI)
+    scales, q = refit_scales(w_rot, states, scales, torch.stack([r[1] for r in rot]), lut)
     out = []
     for i, r in enumerate(rot):
         signs = r[2]
@@ -94,6 +109,7 @@ def code_rows(w: torch.Tensor, h: torch.Tensor, k: int, lut, seed: int, chunk: i
     for r0 in range(0, w.shape[0], chunk):
         w_rot = ms.fwht_blocks(w[r0 : r0 + chunk].float() * signs.unsqueeze(0), blk)
         scales, states, _ = viterbi_code_batched_cuda(w_rot.unsqueeze(0), hu, k, lut, *VITERBI)
+        scales, _ = refit_scales(w_rot.unsqueeze(0), states, scales, h_rot.unsqueeze(0), lut)
         parts.append(pack_rows(states[0], scales[0], k))
     return b"".join(parts), signs.to(torch.int8).cpu().numpy()
 

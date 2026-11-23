@@ -105,6 +105,23 @@ class ConverterPayload(unittest.TestCase):
                 got = decode_payload(rows, signs, n_out, n_in, k, lut)
                 self.assertLess((got - deq.cpu()).abs().max().item(), 1e-3 * deq.abs().max().item(), f"k={k}")
 
+    def test_scale_refit_never_worse(self):
+        from ms_flashnext_convert import refit_scales
+        import ms_viterbi_cuda as mv
+
+        dev = torch.device("cuda")
+        lut = ms.build_1mad_lut(dev)
+        g = torch.Generator(device=dev).manual_seed(4)
+        w = torch.randn(2, 32, 256, device=dev, generator=g)
+        x = torch.randn(1024, 256, device=dev, generator=g)
+        h = (x.T @ x / 1024).expand(2, 256, 256).contiguous()
+        hu = torch.stack([ms.cholesky_inv_upper(m) for m in h])
+        sc, st, q = mv.viterbi_code_batched_cuda(w, hu, 3, lut)
+        s2, q2 = refit_scales(w, st, sc, h, lut)
+        err = lambda q_: (torch.bmm(w - q_, h) * (w - q_)).sum(-1)
+        self.assertTrue(bool((err(q2) <= err(q) * (1 + 1e-6)).all()))
+        self.assertLess(err(q2).sum().item(), err(q).sum().item())
+
     def test_mse_falls_with_k(self):
         from ms_flashnext_convert import code
 
