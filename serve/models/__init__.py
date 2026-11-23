@@ -50,6 +50,10 @@ class Dialect:
         server where it is."""
         raise NotImplementedError
 
+    def out_piece(self, tok, t: int, piece: str) -> str:
+        """Token t's text (piece) as the dialect's parser reads it."""
+        return piece
+
     def literal_tags(self, controls) -> dict[str, str]:
         """Texts that stay plain text inside a message, with the private-use mark standing for each while the
         prompt is rendered."""

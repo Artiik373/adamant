@@ -27,6 +27,27 @@ IMAGE_PAD = "<|unused_200054|>"
 OWN_TOKENS = ("<|endoftext|>", "<|message_user|>", HEADER, "<|message_system|>", "<|message_tool|>", TEXT, IMAGE,
               END_TURN, THINK, END, TOOL_ERROR, "<|content_xml|>", "<|begin_of_text|>", TOOL_JSON, TOOL_TEXT, IMAGE_PAD)
 MARK0 = 0xF2400                         # the marks of the dialect's own tokens while a message is rendered
+PARSE0 = 0xF2500                        # the marks of the model's own tokens as the block parser reads them
+_PMARK = {tok: chr(PARSE0 + k) for k, tok in enumerate(OWN_TOKENS)}
+_PTEXT = {m: tok for tok, m in _PMARK.items()}
+_PMARKS = re.compile("|".join(re.escape(t) for t in sorted(OWN_TOKENS, key=len, reverse=True)))
+_PUNMARK = re.compile("[" + "".join(_PTEXT) + "]")
+
+
+class Marked(str):
+    """Model output whose control tokens are already marks (the server knows them by id): text in it is text."""
+
+
+def _mark(text: str) -> str:
+    """Text whose markers are the model's tokens (the server's own openings, tests) as the parser reads it."""
+    return text if isinstance(text, Marked) else _PMARKS.sub(lambda m: _PMARK[m.group(0)], text)
+
+
+def _unmark(text: str) -> str:
+    return _PUNMARK.sub(lambda m: _PTEXT[m.group(0)], text)
+
+
+_H, _THINK, _TEXT, _TERR, _TTXT, _J, _E = (_PMARK[t] for t in (HEADER, THINK, TEXT, TOOL_ERROR, TOOL_TEXT, TOOL_JSON, END))
 MAX_EFFORT = 0.99
 _NAME = re.compile(r'\s*\{\s*"name"\s*:\s*("(?:[^"\\]|\\.)*")')   # a call object's own name, first key
 
@@ -46,12 +67,13 @@ class _Blocks:
         self.json = frontend.JsonPrefix()   # the arguments read: up to where they can be closed
         self.fed = 0                    # characters of the arguments fed to it
         self.started = False            # its "tool_start" sent (a call with no name in its header waits for its JSON's)
+        self.pend = ""                  # plain text held while it may be the start of a marker
 
     # ------------------------------------------------------------------ a block's text
     def _text(self, out: list, kind: str) -> bool:
-        end = self.buf.find(END)
+        end = self.buf.find(_E)
         # a header or a call marker before the block's end: the model opened the next block without closing this one
-        cut = min((i for i in (self.buf.find(HEADER), self.buf.find(TOOL_JSON)) if i >= 0), default=-1)
+        cut = min((i for i in (self.buf.find(_H), self.buf.find(_J)) if i >= 0), default=-1)
         if cut >= 0 and (end < 0 or cut < end):
             if cut:
                 out.append(Event(kind, self.buf[:cut]))
@@ -60,9 +82,9 @@ class _Blocks:
         if end >= 0:
             if end:
                 out.append(Event(kind, self.buf[:end]))
-            self.buf, self.state = self.buf[end + len(END):], "between"
+            self.buf, self.state = self.buf[end + len(_E):], "between"
             return True
-        keep = frontend.hold_back(self.buf, (END, HEADER, TOOL_JSON))
+        keep = frontend.hold_back(self.buf, (_E, _H, _J))
         if len(self.buf) > keep:
             out.append(Event(kind, self.buf[:len(self.buf) - keep]))
             self.buf = self.buf[len(self.buf) - keep:]
@@ -71,38 +93,36 @@ class _Blocks:
     def _between(self, out: list) -> bool:
         if not self.buf:
             return False
-        if self.buf.startswith(END):    # the end of a block already closed
-            self.buf = self.buf[len(END):]
+        if self.buf.startswith(_E):    # the end of a block already closed
+            self.buf = self.buf[len(_E):]
             return True
-        if self.buf.startswith(TOOL_JSON):      # a call with no header: its name is in its JSON
+        if self.buf.startswith(_J):      # a call with no header: its name is in its JSON
             self._open_call(out, "")
-            self.buf = self.buf[len(TOOL_JSON):]
+            self.buf = self.buf[len(_J):]
             return True
-        if not self.buf.startswith(HEADER):
-            if any(m.startswith(self.buf) for m in (HEADER, TOOL_JSON, END)):
+        if not self.buf.startswith(_H):
+            if any(m.startswith(self.buf) for m in (_H, _J, _E)):
                 return False            # a header, a call marker or an end still arriving
-            starts = [i for m in (HEADER, TOOL_JSON, END) if (i := self.buf.find(m)) >= 0]
+            starts = [i for m in (_H, _J, _E) if (i := self.buf.find(m)) >= 0]
             stray = min(starts, default=-1)
             text = self.buf if stray < 0 else self.buf[:stray]
-            keep = 0 if stray >= 0 else frontend.hold_back(text, (HEADER, TOOL_JSON, END))
+            keep = 0 if stray >= 0 else frontend.hold_back(text, (_H, _J, _E))
             if len(text) > keep:        # text outside a block: shown as it is
                 out.append(Event("content", text[:len(text) - keep]))
             self.buf = self.buf[len(text) - keep:]
             return stray >= 0
-        rest = self.buf[len(HEADER):]
-        if rest.startswith(TOOL_JSON):          # a header with no name: the name is in the call's JSON
+        rest = self.buf[len(_H):]
+        if not rest:                    # the block's kind still arriving
+            return False
+        if rest.startswith(_J):          # a header with no name: the name is in the call's JSON
             self._open_call(out, "")
-            self.buf = rest[len(TOOL_JSON):]
+            self.buf = rest[len(_J):]
             return True
-        for tag, state in ((THINK, "reasoning"), (TEXT, "content"), (TOOL_ERROR, "content"), (TOOL_TEXT, "content")):
+        for tag, state in ((_THINK, "reasoning"), (_TEXT, "content"), (_TERR, "content"), (_TTXT, "content")):
             if rest.startswith(tag):
                 self.buf, self.state = rest[len(tag):], state
                 return True
-            if tag.startswith(rest):
-                return False
-        if rest.startswith("<|"):       # another block's marker: not a call
-            if any(t.startswith(rest) for t in (TOOL_JSON, END)):
-                return False
+        if rest[:1] in _PTEXT:          # another block's marker: not a call
             self.buf, self.state = rest, "content"
             return True
         self.buf, self.state = rest, "name"
@@ -110,16 +130,16 @@ class _Blocks:
 
     # ------------------------------------------------------------------ a tool call
     def _name(self, out: list) -> bool:
-        at = self.buf.find(TOOL_JSON)
+        at = self.buf.find(_J)
         if at < 0:
-            if END in self.buf:         # a name with no call: text
-                end = self.buf.find(END)
+            if _E in self.buf:         # a name with no call: text
+                end = self.buf.find(_E)
                 out.append(Event("content", self.buf[:end]))
-                self.buf, self.state = self.buf[end + len(END):], "between"
+                self.buf, self.state = self.buf[end + len(_E):], "between"
                 return True
             return False
         self._open_call(out, self.buf[:at].strip())
-        self.buf = self.buf[at + len(TOOL_JSON):]
+        self.buf = self.buf[at + len(_J):]
         return True
 
     def _open_call(self, out: list, name: str) -> None:
@@ -165,11 +185,11 @@ class _Blocks:
             self.streamed = self.json.safe
 
     def _call(self, out: list) -> bool:
-        end = self.buf.find(END)
-        keep = 0 if end >= 0 else frontend.hold_back(self.buf, (END,))
+        end = self.buf.find(_E)
+        keep = 0 if end >= 0 else frontend.hold_back(self.buf, (_E,))
         take = self.buf[:end] if end >= 0 else self.buf[:len(self.buf) - keep]
         self.raw += take
-        self.buf = self.buf[end + len(END):] if end >= 0 else self.buf[len(self.buf) - keep:]
+        self.buf = self.buf[end + len(_E):] if end >= 0 else self.buf[len(self.buf) - keep:]
         self._start(out)
         self._stream_args(out)
         if end < 0:
@@ -189,7 +209,7 @@ class _Blocks:
         if not isinstance(args, dict):
             args = {}
         if not name or (not self.call.name and not isinstance(obj, dict)):
-            out.append(Event("content", TOOL_JSON + self.raw))      # a marker whose JSON names no function: text
+            out.append(Event("content", _J + self.raw))      # a marker whose JSON names no function: text
             self.call = None
             return
         self.call.name = name
@@ -211,7 +231,14 @@ class _Blocks:
 
     # ------------------------------------------------------------------ interface
     def feed(self, delta: str) -> list[Event]:
-        self.buf += delta
+        if isinstance(delta, Marked):
+            self.buf += _mark(self.pend) + delta
+            self.pend = ""
+        else:                           # plain text: a marker split across deltas waits for its rest
+            text = self.pend + delta
+            keep = frontend.hold_back(text, OWN_TOKENS)
+            self.buf += _mark(text[:len(text) - keep])
+            self.pend = text[len(text) - keep:]
         out: list[Event] = []
         while True:
             if self.state == "between":
@@ -229,6 +256,8 @@ class _Blocks:
         """End of generation: flush what is held. A call cut off mid-way gets no "tool_call", and the arguments it
         streamed are closed into valid JSON (a dangling key, separator or partial literal dropped); text that was only
         the start of a marker is text."""
+        self.buf += self.pend           # the start of a marker that never came whole: text
+        self.pend = ""
         out: list[Event] = []
         if self.state == "call":
             pending, self.buf = self.buf, ""    # at most the start of an end marker: not the call's
@@ -242,14 +271,14 @@ class _Blocks:
                 if close:
                     out.append(Event("tool_args", close, call=self.call))
             elif not self.call.name and not self.started:
-                out.append(Event("content", TOOL_JSON + self.raw + pending))
+                out.append(Event("content", _J + self.raw + pending))
             self.call = None
         elif self.state == "name":
             if self.buf.strip():
                 out.append(Event("content", self.buf))
-        elif self.buf and self.buf != HEADER:
+        elif self.buf and self.buf != _H:
             kind = "reasoning" if self.state == "reasoning" else "content"
-            out.append(Event(kind, self.buf[len(HEADER):] if self.buf.startswith(HEADER) else self.buf))
+            out.append(Event(kind, self.buf[len(_H):] if self.buf.startswith(_H) else self.buf))
         self.buf = ""
         return out
 
@@ -434,6 +463,14 @@ class _XmlCalls(frontend.CodeTracker):
         return out
 
 
+def _text_back(events: list[Event]) -> list[Event]:
+    """A marker the parser kept in text (a stray one, a call that was not one) is its token's text again."""
+    for e in events:
+        if e.text:
+            e.text = _unmark(e.text)
+    return events
+
+
 class Inkling2Parser(_Blocks):
     """The block parser, and the XML-written calls of the answer text read as calls (see _XmlCalls) when the request
     offers tools."""
@@ -458,10 +495,10 @@ class Inkling2Parser(_Blocks):
         return out
 
     def feed(self, delta: str) -> list[Event]:
-        return self._through(super().feed(delta))
+        return self._through(_text_back(super().feed(delta)))
 
     def finish(self) -> list[Event]:
-        return self._through(super().finish(), final=True)
+        return self._through(_text_back(super().finish()), final=True)
 
 
 class _Renderer:
@@ -519,6 +556,21 @@ class Inkling2(Dialect):
 
     def template(self, source):
         return _Renderer(source)
+
+    def out_piece(self, tok, t: int, piece: str) -> str:
+        """A token's text as the parser reads it: the model's own tokens (by id) as marks, other text as it is."""
+        ids = getattr(self, "_own_ids", None)
+        if ids is None or ids[0] is not tok:
+            own = {}
+            for text in OWN_TOKENS:
+                enc = tok.encode(text, parse_special=True)
+                if len(enc) == 1:
+                    own[int(enc[0])] = text
+            ids = self._own_ids = (tok, own)
+        text = ids[1].get(int(t))
+        if text is not None and piece.endswith(text):
+            return Marked(piece[:len(piece) - len(text)] + _PMARK[text])
+        return Marked(piece)
 
     def parser(self, thinking, tools, stream_tools=True):
         return Inkling2Parser(thinking=thinking, tools=tools, stream_tools=stream_tools)

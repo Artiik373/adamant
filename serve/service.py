@@ -1495,7 +1495,7 @@ class Service:
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
                                 state0 = parser.state
-                                evs = cut(parser.feed(piece))
+                                evs = cut(parser.feed(self.dialect.out_piece(self.tok, t, piece)))
                                 if lp_channels is not None:
                                     lp = logprob_entry(self.tok, t) if getattr(t, "lp", None) is not None else None
                                     for item in lp_channels.token(lp, state0, parser.state, evs):
@@ -1644,7 +1644,7 @@ class Service:
                             raw_ids.append(t)
                             thinking_n += parser.state == "reasoning"
                             state0 = parser.state
-                            evs = cut(parser.feed(detok.push(t)))
+                            evs = cut(parser.feed(self.dialect.out_piece(self.tok, t, detok.push(t))))
                             if lp_channels is not None:       # written by the server: no entry of its own
                                 for item in lp_channels.token(None, state0, parser.state, evs):
                                     yield "logprobs", item

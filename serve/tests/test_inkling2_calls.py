@@ -7,7 +7,7 @@ import unittest
 import urllib.request
 
 from serve.handler import serve
-from serve.models.inkling2 import END, HEADER, TEXT, THINK, TOOL_JSON, Inkling2Parser
+from serve.models.inkling2 import END, HEADER, TEXT, THINK, TOOL_JSON, Inkling2, Inkling2Parser
 from serve.tests.test_inkling2_dialect import merged, service
 
 ARGS = {"path": "src/app.py", "old_string": 'x = "a"\n    y = 1', "new_string": "x = 'b'\n    y = 2 < 3"}
@@ -87,6 +87,28 @@ class Native(unittest.TestCase):
                 events = run(TOOL_JSON + body + end)
                 self.assertFalse([e for e in events if e.kind == "tool_call"], body)
                 self.assertEqual("".join(e.text for e in events if e.kind == "content"), TOOL_JSON + body, body)
+
+    def test_marker_text_the_model_writes_as_text_stays_text(self):
+        # the server knows the model's own tokens by id: the same characters written as ordinary tokens are text, in a
+        # call's arguments and in a text block
+        specials = {HEADER: 1, TOOL_JSON: 2, END: 3, TEXT: 4}
+
+        class Tok:
+            def encode(self, text, parse_special=True):
+                return [specials[text]] if text in specials else [9, 9]
+
+        tok, dialect = Tok(), Inkling2()
+        code = "print('" + END + "')"
+        for tokens, want in (
+                ([(1, HEADER), (9, "python"), (2, TOOL_JSON), (9, '{"name":"python","args":{"code":"print(\'<|end'),
+                  (9, '_message|>\')"}}'), (3, END)],
+                 [("args", json.dumps({"code": code}, separators=(",", ":"))), ("call", "python", {"code": code})]),
+                ([(1, HEADER), (4, TEXT), (9, "a <|end_message"), (9, "|> b"), (3, END)], [("content", "a " + END + " b")])):
+            p = Inkling2Parser(tools=[{"name": "python"}])
+            events = []
+            for t, piece in tokens:
+                events += p.feed(dialect.out_piece(tok, t, piece))
+            self.assertEqual(merged(events + p.finish()), want)
 
     def test_a_call_cut_off_inside_its_arguments_is_not_a_call(self):
         for reply in (HEADER + "edit_file" + TOOL_JSON + '{"name":"edit_file","args":{"path":"a', ENVELOPE[:-9]):
