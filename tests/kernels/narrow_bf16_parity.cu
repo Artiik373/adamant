@@ -32,6 +32,12 @@ __global__ void e4m3(unsigned* got, unsigned* alt) {
 #endif
 }
 
+// i: two E4M3 bytes as fp32 (the expert rows' decode)
+__global__ void e4m3_f32(float2* out) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    out[i] = bk::e4m3x2_float2(i);
+}
+
 // the word for i: byte k is the low byte of i plus 37 k, so every byte position sees all 256 values; the high byte of i
 // is the UE4M3 scale
 __host__ __device__ unsigned e2m1_word(unsigned i) {
@@ -108,6 +114,26 @@ int main() {
     for (unsigned i = 0; i < kN; ++i)
         for (int half = 0; half < 2; ++half) check("e4m3x2", i, half, g[i], a[i], e4m3f(i >> (8 * half)));
     std::printf("e4m3x2: NaN 0x7f -> 0x%04x, 0xff -> 0x%04x\n", g[0x7f] & 0xffffu, g[0xff] & 0xffffu);
+
+    {
+        float2* d = nullptr;
+        std::vector<float2> f(kN);
+        if (cudaMalloc(&d, kN * sizeof(float2)) != cudaSuccess) return 77;
+        e4m3_f32<<<kN / 256, 256>>>(d);
+        if (cudaMemcpy(f.data(), d, kN * sizeof(float2), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            std::printf("FAIL: e4m3_f32 kernel: %s\n", cudaGetErrorString(cudaGetLastError()));
+            return 1;
+        }
+        cudaFree(d);
+        for (unsigned i = 0; i < kN; ++i)
+            for (int half = 0; half < 2; ++half) {
+                const unsigned b = (i >> (8 * half)) & 0xffu;
+                const float want = e4m3f(b), have = half ? f[i].y : f[i].x;
+                if ((b & 0x7fu) == 0x7fu) continue;   // NaN codes: none in a pack
+                if (std::memcmp(&want, &have, 4) && fails++ < 8)
+                    std::printf("FAIL e4m3x2_float2 input 0x%x half %d: %a, host %a\n", i, half, have, want);
+            }
+    }
 
     e2m1<<<kN / 256, 256>>>(got, alt);
     if (cudaMemcpy(g.data(), got, 4 * kN * sizeof(unsigned), cudaMemcpyDeviceToHost) != cudaSuccess ||

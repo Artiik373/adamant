@@ -10,6 +10,7 @@
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/kernels/cpu/exl3.hpp"
 #include "basalt/kernels/dp4a.hpp"
+#include "basalt/kernels/narrow_bf16.cuh"
 #include "basalt/kernels/packed_byte.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -677,8 +678,8 @@ __device__ __forceinline__ float vec_dot_mxfp8_q8_1(const void* __restrict__ vbq
     for (int i = 0; i < 2; ++i) {
         const uint32_t q4 = *(const uint32_t*) (q + 4 * i);
         const int a4 = get_int_b4(y->qs, 2 * qtr + i);
-        const float2 f0 = __half22float2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) (q4 & 0xFFFFu), __NV_E4M3));
-        const float2 f1 = __half22float2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) (q4 >> 16), __NV_E4M3));
+        const float2 f0 = basalt::kernels::e4m3x2_float2(q4 & 0xFFFFu);
+        const float2 f1 = basalt::kernels::e4m3x2_float2(q4 >> 16);
         sumf = fmaf(f0.x, (float) (int8_t) (a4), sumf);
         sumf = fmaf(f0.y, (float) (int8_t) (a4 >> 8), sumf);
         sumf = fmaf(f1.x, (float) (int8_t) (a4 >> 16), sumf);
@@ -1471,10 +1472,10 @@ template<> struct Split<46> {   // MXFP8: decode 8 E4M3 codes to fp32 once; appl
         const uint32_t q0 = *(const uint32_t*) (q + 0);
         const uint32_t q1 = *(const uint32_t*) (q + 4);
         W r;
-        r.w[0] = __half22float2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) (q0 & 0xFFFFu), __NV_E4M3));
-        r.w[1] = __half22float2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) (q0 >> 16), __NV_E4M3));
-        r.w[2] = __half22float2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) (q1 & 0xFFFFu), __NV_E4M3));
-        r.w[3] = __half22float2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) (q1 >> 16), __NV_E4M3));
+        r.w[0] = basalt::kernels::e4m3x2_float2(q0 & 0xFFFFu);
+        r.w[1] = basalt::kernels::e4m3x2_float2(q0 >> 16);
+        r.w[2] = basalt::kernels::e4m3x2_float2(q1 & 0xFFFFu);
+        r.w[3] = basalt::kernels::e4m3x2_float2(q1 >> 16);
         r.d = ue8m0_scale_dev(b->d[iqs >> 2]);
         return r;
     }
@@ -1742,8 +1743,11 @@ constexpr int GRP_NC = 6;
 // KC > 0: rows of KC calls (row_dot_multi's KC), and when every group has its own block row (no group stride) the
 // dependents (the SwiGLU, then down) are let in at the start, so their launches and down's weight prefetch overlap the
 // last wave; with the stride the waiting blocks would hold their slots through several waves.
+// MXFP8 rows of 2304 values at 3 blocks an SM (80 registers, no spill) instead of 1 (133)
+template<int TG, int KC> inline constexpr int kGuMultiMinBlocks = TG == 46 && KC == 288 ? 3 : 1;
+
 template<int TG, bool STAGE_GRID = kStageIqGrid<TG>, int KC = 0>
-__global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
+__global__ void __launch_bounds__(256, (kGuMultiMinBlocks<TG, KC>)) native_gu_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                               const int32_t* __restrict__ grp_start,
                                                               const int32_t* __restrict__ n_groups,
                                                               const int32_t* __restrict__ ent_tok,
@@ -2994,7 +2998,7 @@ __device__ void dq_mxfp8(const void* vx, int64_t ibs, dst_t* yy, int tid) {
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const uint16_t pair = (uint16_t) q[2 * j] | ((uint16_t) q[2 * j + 1] << 8);
-        const float2 f = __half22float2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) pair, __NV_E4M3));
+        const float2 f = basalt::kernels::e4m3x2_float2(pair);
         y[2 * j + 0] = cvt<dst_t>(f.x * d);
         y[2 * j + 1] = cvt<dst_t>(f.y * d);
     }

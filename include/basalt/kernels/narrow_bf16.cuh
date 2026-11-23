@@ -8,6 +8,8 @@
 // cvt) the codes are decoded in integer arithmetic and mul.bf16x2 runs as fma.bf16x2 with a -0 addend: the same bits.
 #pragma once
 
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #if defined(__CUDACC_VER_MAJOR__) && \
@@ -42,6 +44,20 @@ __device__ __forceinline__ unsigned e4m3_bf16_soft(unsigned b) {
     if (e == 15u && m == 7u) return 0x7FFFu;
     if (e) return s | ((e + 120u) << 7) | (m << 4);
     return s | (__float_as_uint((float) m * 0x1p-9f) >> 16);
+}
+
+/// two E4M3 bytes (the low 16 bits of x, the low byte .x) as fp32, exact. Below compute capability 8.9 (no E4M3 cvt):
+/// the code's bits as an f16 of 2^-8 times its value, widened and times 256, both exact (the NaN code 0x7F/0xFF reads
+/// as 480: weights and activations hold no NaN codes)
+__device__ __forceinline__ float2 e4m3x2_float2(unsigned x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+    const unsigned t = __byte_perm(x, 0u, 0x4140u);   // bytes [b0, 0, b1, 0]
+    const unsigned h = ((t & 0x007F007Fu) << 7) | ((t & 0x00800080u) << 8);
+    const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
+    return make_float2(f.x * 256.0f, f.y * 256.0f);
+#else
+    return __half22float2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) (x & 0xFFFFu), __NV_E4M3));
+#endif
 }
 
 /// one E2M1 nibble as bf16 bits (exact): magnitudes 0, 0.5, 1, 1.5, 2, 3, 4, 6
