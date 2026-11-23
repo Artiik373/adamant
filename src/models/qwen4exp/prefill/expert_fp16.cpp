@@ -3,6 +3,7 @@
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/exl3_kernels.hpp"
+#include "basalt/kernels/ms_kernels.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/models/qwen4exp/prefill/gemm.hpp"
 #include "basalt/models/qwen4exp/prefill/kernels.hpp"
@@ -90,7 +91,10 @@ bool Prefill::Run::Chunk::Experts::Group::compute_fp16(size_t j, const uint8_t* 
     if (lay.native) {
         // a native pack's layer, dequantized by llama.cpp's own formulas
         const auto& f = lay.fmt[(size_t) l];
-        if (f.exl3_w) {   // EXL3: W_full of the three records, transforms applied
+        if (f.ms_k) {   // MS: each payload's rows, the input rotation undone
+            basalt::kernels::ms_dequant_expert_f16(f.gu_type, blob_dev, f.n_embd, f.n_ff, f.up_off, f.down_off,
+                                                   m.dq_gu[q], m.dq_d[q], dqs);
+        } else if (f.exl3_w) {   // EXL3: W_full of the three records, transforms applied
             basalt::kernels::exl3_dequant_gu_f16(f.gu_type, blob_dev, f.up_off, f.n_ff, f.n_embd, m.dq_gu[q], dqs);
             basalt::kernels::exl3_dequant_down_f16(f.d_type, blob_dev + f.down_off, f.n_embd, f.n_ff, m.dq_d[q], dqs);
         } else {

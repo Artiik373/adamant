@@ -17,7 +17,11 @@ bool draft_proxy(int head_type) { return head_type == 13 || head_type == 14 || h
 
 size_t q80_row_bytes(int64_t n_embd) { return (size_t) (n_embd / 32) * 34; }
 
-bool exl3_draft_rows(const NativeHead& head, int64_t n_embd, int64_t n_vocab, const std::vector<int32_t>& ids,
+bool trellis_head_type(int type) {
+    return basalt::kernels::cpu::exl3_type(type) || basalt::ms_tensor_type((uint32_t) type);
+}
+
+bool trellis_draft_rows(const NativeHead& head, int64_t n_embd, int64_t n_vocab, const std::vector<int32_t>& ids,
                      uint8_t* dst) {
     constexpr int64_t kSlice = 4096;   // head rows dequantized at a time
     const size_t rb = q80_row_bytes(n_embd);
@@ -38,7 +42,10 @@ bool exl3_draft_rows(const NativeHead& head, int64_t n_embd, int64_t n_vocab, co
     for (int64_t r0 = 0; r0 < n_vocab && w < want.size() && ok; r0 += kSlice) {
         const int64_t rows = std::min(kSlice, n_vocab - r0);
         if (want[w].first >= r0 + rows) continue;
-        basalt::kernels::exl3_dequant_dense_f16(head.type(), head.weights(), n_embd, n_vocab, r0, rows, dev, nullptr);
+        if (basalt::ms_tensor_type((uint32_t) head.type()))
+            basalt::kernels::ms_dequant_dense_f16(head.type(), head.weights(), n_embd, n_vocab, r0, rows, dev, nullptr);
+        else
+            basalt::kernels::exl3_dequant_dense_f16(head.type(), head.weights(), n_embd, n_vocab, r0, rows, dev, nullptr);
         ok = cudaMemcpy(half.data(), dev, (size_t) rows * (size_t) n_embd * 2, cudaMemcpyDeviceToHost) == cudaSuccess;
         for (; ok && w < want.size() && want[w].first < r0 + rows; ++w) {
             const uint16_t* h = half.data() + (size_t) (want[w].first - r0) * (size_t) n_embd;
@@ -58,7 +65,7 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int head_type, int64_t 
     if (dhead_ == nullptr && !rows_mapped_) {
         if (!draft_vocab_.empty() && draft_vocab_.exists()) {
             const long size = (long) draft_vocab_.size();
-            if (basalt::kernels::cpu::exl3_type(head_type)) {   // the Q8_0 copy and the map
+            if (trellis_head_type(head_type)) {   // the Q8_0 copy and the map
                 if (size >= 4 && size % 4 == 0) bytes += (uint64_t) (size / 4) * q80_row_bytes(g_->n_embd) + (uint64_t) size;
             } else if (size >= 4 && size % 4 == 0) {
                 const uint64_t xr = (uint64_t) kDraftCtxRows;
@@ -132,7 +139,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     }
     // the draft head's token subset, when the model file carries one
     if (dhead_ == nullptr && !rows_mapped_) {
-        const bool exl3 = basalt::kernels::cpu::exl3_type(head->type());
+        const bool exl3 = trellis_head_type(head->type());
         std::vector<uint8_t> raw;
         if (read_file(draft_vocab_, raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             const int64_t n_raw = (int64_t) (raw.size() / 4);
@@ -182,8 +189,8 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 for (int32_t& v : gmap) if (v < 0) v = ids[0];
                 cudaMemcpy(dvocab_, gmap.data(), gmap.size() * 4, cudaMemcpyHostToDevice);
                 if (exl3) {
-                    if (!exl3_draft_rows(*head, g_->n_embd, n_vocab_, gmap, dhead_)) {
-                        err = "mtp: the draft head's rows could not be built from the EXL3 head";
+                    if (!trellis_draft_rows(*head, g_->n_embd, n_vocab_, gmap, dhead_)) {
+                        err = "mtp: the draft head's rows could not be built from the trellis head";
                         return false;
                     }
                     dhead_type_ = GGML_Q8_0;

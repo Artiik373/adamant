@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Perplexity and KL divergence through the decode path, against a llama.cpp base.
+"""Perplexity and KL divergence through the decode path, against a KL-divergence base.
 
-The base is `llama-perplexity --kl-divergence-base`'s file (wikitext-2, 512-token chunks, second half scored). The
-engine runs as `--serve` with the model plus --ppl-base and --ppl-out; per chunk it reads the first half as a prompt
-and teacher-forces the rest through verify windows of T tokens (see the engine's ppl_gate.hpp). Flags this tool does
+The base is `llama-perplexity --kl-divergence-base`'s file (wikitext-2, 512-token chunks, second half scored) or a
+`_qbench_` base (chunks of their own lengths: a prompt, then its scored response; tools/convert/ms_flashnext_eval.py
+--qbench). The engine runs as `--serve` with the model plus --ppl-base and --ppl-out; per chunk it reads the tokens up
+to the first scored position as a prompt and teacher-forces the rest through verify windows of T tokens (see the
+engine's ppl_gate.hpp). Flags this tool does
 not know are passed to the engine as they are; it sets only what the measurement needs (--spec 5,
 no adaptive swaps, the first two visible GPUs when there are two: --gpu 0,1), and an engine flag given here replaces
 that value.
@@ -27,12 +29,22 @@ ENGINE_BIN = Path(__file__).resolve().parents[1] / "bin" / "basalt"
 
 
 def read_base(path: str):
+    """(n_vocab, [(tokens, first scored position) a chunk]) of a _logits_ or _qbench_ base (basalt/program/ppl_gate.hpp)."""
     with open(path, "rb") as f:
-        if f.read(8) != b"_logits_":
-            sys.exit(f"{path}: not a llama.cpp KL-divergence base")
-        n_ctx, n_vocab, n_chunk = struct.unpack("<Iii", f.read(12))
-        toks = struct.unpack(f"<{n_ctx * n_chunk}i", f.read(4 * n_ctx * n_chunk))
-    return n_ctx, n_vocab, n_chunk, [toks[k * n_ctx:(k + 1) * n_ctx] for k in range(n_chunk)]
+        magic = f.read(8)
+        if magic == b"_logits_":
+            n_ctx, n_vocab, n_chunk = struct.unpack("<Iii", f.read(12))
+            toks = struct.unpack(f"<{n_ctx * n_chunk}i", f.read(4 * n_ctx * n_chunk))
+            return n_vocab, [(toks[k * n_ctx:(k + 1) * n_ctx], n_ctx // 2) for k in range(n_chunk)]
+        if magic != b"_qbench_":
+            sys.exit(f"{path}: not a KL-divergence base (_logits_ or _qbench_)")
+        n_vocab, n_chunk = struct.unpack("<ii", f.read(8))
+        table = struct.unpack(f"<{2 * n_chunk}I", f.read(8 * n_chunk))
+        chunks = []
+        for k in range(n_chunk):
+            n = table[2 * k]
+            chunks.append((struct.unpack(f"<{n}i", f.read(4 * n)), table[2 * k + 1]))
+        return n_vocab, chunks
 
 
 def summary(rows_path: str, extra: dict | None = None) -> str:
@@ -106,10 +118,11 @@ def set_args(args: list[str], extra: list[str]) -> list[str]:
 
 
 def run(a) -> int:
-    n_ctx, n_vocab, n_chunk, chunks = read_base(a.base)
-    first = n_ctx // 2
+    n_vocab, chunks = read_base(a.base)
+    n_chunk = len(chunks)
+    ctx = max(4096, max(len(t) for t, _ in chunks) + 64)
     args = ["--model", str(Path(a.model).resolve()), "--spec", "5",
-            "--adapt-swaps", "0", "--peer-adapt-swaps", "0", "--max-context", "4096"]
+            "--adapt-swaps", "0", "--peer-adapt-swaps", "0", "--max-context", str(ctx)]
     if gpu_count() > 1:
         args += ["--gpu", "0,1"]
     args = set_args(args, a.engine_args + ["--ppl-base", str(Path(a.base).resolve())])
@@ -137,8 +150,9 @@ def run(a) -> int:
         nc = min(a.chunks, n_chunk) if a.chunks > 0 else n_chunk
         t1 = time.time()
         for k in range(nc):
-            ids = ",".join(str(t) for t in chunks[k][:first + 1])
-            eng.stdin.write(f"GEN {n_ctx - 1 - first} ppl={k} ppl_t={a.t} {ids}\n")
+            toks, first = chunks[k]
+            ids = ",".join(str(t) for t in toks[:first + 1])
+            eng.stdin.write(f"GEN {len(toks) - 1 - first} ppl={k} ppl_t={a.t} {ids}\n")
             eng.stdin.flush()
             for line in eng.stdout:
                 if line.startswith("ERR"):

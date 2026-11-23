@@ -594,6 +594,9 @@ bool FileExpertSource::plan_cache_complement(
                      (double) budget_bytes / 1073741824.0, (double) bytes / 1073741824.0);
         lend_cap = lend_room;
     } else if (budget_bytes > 0) {
+        // the swaps' free places are kept out of the fill: a budget filled to the last expert drops them (below), and the
+        // adaptive tier is then left with its exchange buffers alone
+        const uint64_t fill = budget_bytes > spare_bytes ? budget_bytes - spare_bytes : budget_bytes;
         std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
         uint64_t at = 0;
         int64_t held = 0;
@@ -603,7 +606,7 @@ bool FileExpertSource::plan_cache_complement(
                 const size_t i = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
                 if (offsets[i] == kNoComplement || ranked[i] != kNoComplement) continue;   // on a GPU, or twice
                 const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
-                if (b > budget_bytes - at) continue;
+                if (b > fill - at) continue;
                 ranked[i] = at;
                 at += b;
                 ++held;

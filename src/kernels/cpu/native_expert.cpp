@@ -10,6 +10,8 @@
 #include "basalt/kernels/cpu/nvfp4_avx2.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/cpu/exl3.hpp"
+#include "basalt/kernels/cpu/ms_expert.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
 
 #include "basalt/ggml/ggml.h"
 
@@ -99,6 +101,67 @@ void exl3_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     exl3_inputs(p, hq, nt, in);
     exl3_cols(p, in, nt, out, r0, r1);
     for (int t = 0; t < nt; ++t) exl3_finish(p, out[t], r0 / 128, r1 / 128, exl3_variant());
+}
+
+// The rotated inputs of one MS payload's signs for nt tokens, kept while the same bytes come again (a job's parts).
+struct MsIn {
+    std::vector<int8_t> signs;   // by value: a ring slot can hold another expert at the same address
+    std::vector<std::vector<uint8_t>> raw;
+    std::vector<MsAct> act;
+    std::vector<const MsAct*> ptr;
+};
+
+const MsAct* const* ms_inputs(MsIn& c, const int8_t* signs, const void* const* act, int nt, int n) {
+    const size_t bytes = (size_t) n * 4;
+    bool same = (int) c.signs.size() == n && std::memcmp(c.signs.data(), signs, (size_t) n) == 0 &&
+                (int) c.raw.size() == nt;
+    for (int t = 0; same && t < nt; ++t) same = std::memcmp(c.raw[(size_t) t].data(), act[t], bytes) == 0;
+    if (same) return c.ptr.data();
+    c.signs.assign(signs, signs + n);
+    c.raw.resize((size_t) nt);
+    c.act.resize((size_t) nt);
+    c.ptr.resize((size_t) nt);
+    for (int t = 0; t < nt; ++t) {
+        c.raw[(size_t) t].assign((const uint8_t*) act[t], (const uint8_t*) act[t] + bytes);
+        ms_act_prepare((const float*) act[t], signs, n, c.act[(size_t) t]);
+        c.ptr[(size_t) t] = &c.act[(size_t) t];
+    }
+    return c.ptr.data();
+}
+
+void ms_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff, int r0,
+                int r1) {
+    const int n = (int) f.n_embd;
+    const int8_t* sg = (const int8_t*) blob + f.up_off - n;   // each payload's signs follow its rows
+    const int8_t* su = (const int8_t*) blob + f.down_off - n;
+    thread_local MsIn cg, cu;
+    const MsAct* const* ag = ms_inputs(cg, sg, act, nt, n);
+    const MsAct* const* au = std::memcmp(sg, su, (size_t) n) == 0 ? ag : ms_inputs(cu, su, act, nt, n);
+    thread_local std::vector<float> u;
+    thread_local std::vector<float*> up;
+    u.resize((size_t) nt * (size_t) f.n_ff);
+    up.resize((size_t) nt);
+    for (int t = 0; t < nt; ++t) up[(size_t) t] = u.data() + (size_t) t * f.n_ff;
+    ms_rows(f.ms_k, blob, n, ag, nt, ff, r0, r1);
+    ms_rows(f.ms_k, blob + f.up_off, n, au, nt, up.data(), r0, r1);
+    for (int t = 0; t < nt; ++t)
+        for (int r = r0; r < r1; ++r) {
+            float a = ff[t][r], b = up[(size_t) t][r];
+            if (f.swiglu_limit > 0.f) {
+                a = std::fmin(a, f.swiglu_limit);
+                b = std::fmax(std::fmin(b, f.swiglu_limit), -f.swiglu_limit);
+            }
+            ff[t][r] = (a / (1.f + std::exp(-a))) * b;
+        }
+}
+
+void ms_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out, int r0,
+                  int r1) {
+    const int n = (int) f.n_ff;
+    const uint8_t* rows = blob + f.down_off;
+    thread_local MsIn cd;
+    const MsAct* const* a = ms_inputs(cd, (const int8_t*) rows + (size_t) f.n_embd * f.d_row, hq, nt, n);
+    ms_rows(f.ms_k, rows, n, a, nt, out, r0, r1);
 }
 
 }  // namespace
@@ -198,6 +261,41 @@ void gu_rows_mixed(Rows rows, const NativeFmt& f, const uint8_t* blob, const voi
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
                 float swiglu_limit, int up_type) {
     if (up_type < 0) up_type = gu_type;
+    if (basalt::ms_tensor_type((uint32_t) gu_type) || basalt::ms_tensor_type((uint32_t) d_type) ||
+        basalt::ms_tensor_type((uint32_t) up_type)) {
+        if (gu_type != d_type || gu_type != up_type) {
+            err = "native experts: an MS layer has one K for gate, up and down";
+            return false;
+        }
+        if (!cpu_avx2_ok()) {
+            err = "native experts: MS experts need an AVX2 CPU";
+            return false;
+        }
+        if (n_embd % 128 || n_ff % 128) {
+            err = "native experts: MS geometry is not whole 128-column blocks";
+            return false;
+        }
+        const int k = basalt::ms_bits((uint32_t) gu_type);
+        f.gu_type = f.d_type = f.up_type = gu_type;
+        f.ms_k = k;
+        f.n_embd = n_embd;
+        f.n_ff = n_ff;
+        f.swiglu_limit = swiglu_limit;
+        f.gu_act = f.d_act = -1;
+        f.gu_row = f.up_row = (size_t) basalt::ms_row_bytes((uint64_t) n_embd, k);
+        f.d_row = (size_t) basalt::ms_row_bytes((uint64_t) n_ff, k);
+        f.up_off = f.gu_row * (size_t) n_ff + (size_t) n_embd;
+        f.down_off = 2 * f.up_off;
+        f.bytes = f.down_off + f.d_row * (size_t) n_embd + (size_t) n_ff;
+        f.tail = 0;
+        f.act_bytes = (size_t) n_embd * 4;   // fp32: no range limit before the int8 rotated input
+        f.h_bytes = (size_t) n_ff * 4;
+        if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes || n_ff > kNativeMaxFF) {
+            err = "native experts: activation larger than the pool's buffers";
+            return false;
+        }
+        return true;
+    }
     if (exl3_type(gu_type) || exl3_type(d_type) || exl3_type(up_type)) {
         if (gu_type != d_type || gu_type != up_type) {
             err = "native experts: an EXL3 layer has one bit rate for gate, up and down";
@@ -289,6 +387,10 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 }
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+    if (f.ms_k) {
+        std::memcpy(dst, x, (size_t) f.n_embd * 4);
+        return;
+    }
     if (f.exl3_w) {
         exl3_pack_act(x, (int) f.n_embd, (uint16_t*) dst);
         return;
@@ -306,6 +408,10 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
 }
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
+    if (f.ms_k) {
+        std::memcpy(dst, h, (size_t) f.n_ff * 4);
+        return;
+    }
     if (f.exl3_w) {
         exl3_pack_act(h, (int) f.n_ff, (uint16_t*) dst);
         return;
@@ -315,6 +421,10 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    if (f.ms_k) {
+        ms_gu_rows(f, blob, act, nt, ff, r0, r1);
+        return;
+    }
     if (f.exl3_w) {   // whole 128-blocks
         thread_local std::vector<float> u;
         u.resize((size_t) kNativeMaxFF * (size_t) nt);
@@ -389,6 +499,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
+    if (f.ms_k) {
+        ms_down_rows(f, blob, hq, nt, out, r0, r1);
+        return;
+    }
     if (f.exl3_w) {
         exl3_down_rows(f, blob, hq, nt, out, r0, r1);
         return;

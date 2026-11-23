@@ -34,6 +34,11 @@ experts and tiers pinned.
 The bases are published as the [basalt-kld-bases](https://huggingface.co/datasets/jesdga/basalt-kld-bases) dataset on Hugging Face,
 with checksums: pass one to `basalt-bench --quality --kld-base FILE` to score a build or a self-converted pack.
 
+A conversation set scores the same way: `tools/convert/ms_flashnext_eval.py --qbench PROMPTS.json --write-base FILE` writes a
+`_qbench_` base from a qbench prompt file (rows of input and response tokens, as exllamav3's `eval/qbench.py` takes them),
+scored on each response from the input's last position; `tools/ppl_gate.py --base FILE` reads it like the other bases. The
+exllamav3 harness also scores the final position, which has no target here: one row a conversation fewer.
+
 A quantized base is not a reference. llama.cpp's Q8_0 GGUF adds its own rounding, so every pack reads 0.003 to 0.010 KLD higher against a
 Q8_0 base than against BF16 (see [Flash-Next](qwen38-flash-next.md#summary)).
 

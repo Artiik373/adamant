@@ -214,9 +214,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             const uint64_t payload = gguf.file_size() - gguf.data_start();
             for (const auto& tensor : gguf.tensors()) {
                 uint64_t bytes = 0;
-                if (basalt::exl3_tensor_type(tensor.type)) {   // trellis + sign vectors, not whole blocks
+                if (basalt::exl3_tensor_type(tensor.type) || basalt::ms_tensor_type(tensor.type)) {   // trellis + signs
                     bytes = basalt::tensor_payload_bytes(tensor);
-                    if (bytes == 0) { err = "native dense: invalid EXL3 geometry " + tensor.name; return false; }
+                    if (bytes == 0) { err = "native dense: invalid trellis geometry " + tensor.name; return false; }
                 } else {
                     int block_elements = 0, block_bytes = 0;
                     uint64_t elements = 1;

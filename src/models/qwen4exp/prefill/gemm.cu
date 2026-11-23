@@ -2,6 +2,8 @@
 #include "basalt/models/qwen4exp/prefill/gemm.hpp"
 #include "basalt/kernels/dequant_bf16.hpp"
 #include "basalt/kernels/exl3_kernels.hpp"
+#include "basalt/kernels/ms_kernels.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/kernels/cpu/exl3.hpp"
 #include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 
@@ -189,6 +191,18 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;
             basalt::kernels::exl3_dequant_dense_f16(ggml_type, W_blocks, K, N, r0, n, scratch_, stream_);
+            f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
+        }
+        return;
+    }
+    if (basalt::ms_tensor_type((uint32_t) ggml_type)) {   // the signs follow all N rows: the dequantizer needs N
+        int64_t rows = scratch_elems_ / K;
+        if (rows <= 0) { basalt::log::error("basalt", "prefill gemm: scratch too small for K=%lld", (long long) K); std::exit(1); }
+        if (rows > N) rows = N;
+        if (ldy <= 0) ldy = N;
+        for (int64_t r0 = 0; r0 < N; r0 += rows) {
+            const int64_t n = (N - r0 < rows) ? N - r0 : rows;
+            basalt::kernels::ms_dequant_dense_f16(ggml_type, W_blocks, K, N, r0, n, scratch_, stream_);
             f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
         }
         return;

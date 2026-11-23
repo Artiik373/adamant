@@ -65,6 +65,15 @@ inline int ctz32(unsigned m) {
 #endif
 }
 
+/// The 64-bit byte swap.
+inline uint64_t bswap64(uint64_t x) {
+#if defined(_MSC_VER)
+    return _byteswap_uint64(x);
+#else
+    return __builtin_bswap64(x);
+#endif
+}
+
 /// One iteration of a spin wait: yields the pipeline to the core's SMT sibling. A no-op off x86.
 inline void cpu_relax() {
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)

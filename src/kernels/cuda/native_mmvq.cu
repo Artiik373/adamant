@@ -30,6 +30,8 @@
 #include "basalt/kernels/q8_1_finite.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/exl3_kernels.hpp"
+#include "basalt/kernels/ms_kernels.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/kernels/cpu/exl3.hpp"
 #include "basalt/kernels/pdl.hpp"
 
@@ -2053,7 +2055,7 @@ void native_iq4_nl_mmvq(const void* weights, const void* x_q8_1, float* y,
 }
 
 bool native_mmvq_supported(int ggml_type) noexcept {
-    return cpu::exl3_type(ggml_type) || ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 11 ||
+    return cpu::exl3_type(ggml_type) || basalt::ms_tensor_type((uint32_t) ggml_type) || ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 11 ||
            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
            ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
            ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
@@ -2064,6 +2066,12 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
         if (!cpu::exl3_geometry_ok(n_in, n_out, cpu::exl3_words(ggml_type)))
             throw std::invalid_argument("native MMVQ: an EXL3 matrix needs K and N in whole blocks of 128");
         return cpu::exl3_proj_bytes(n_in, n_out, cpu::exl3_words(ggml_type));
+    }
+    if (basalt::ms_tensor_type((uint32_t) ggml_type)) {   // per-row trellis records, then the input signs
+        if (n_in <= 0 || n_in % 32 || n_out <= 0)
+            throw std::invalid_argument("native MMVQ: an MS matrix needs n_in a positive multiple of 32");
+        return (std::size_t) n_out * basalt::ms_row_bytes((uint64_t) n_in, basalt::ms_bits((uint32_t) ggml_type)) +
+               (std::size_t) n_in;
     }
     int block_elems, block_bytes;
     switch (ggml_type) {
@@ -2095,6 +2103,10 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
                  int n_in, int n_out, int ncols, void* stream) {
     if (cpu::exl3_type(ggml_type)) {
         exl3_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream);
+        return;
+    }
+    if (basalt::ms_tensor_type((uint32_t) ggml_type)) {
+        ms_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream);
         return;
     }
     switch (ggml_type) {

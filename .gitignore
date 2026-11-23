@@ -17,3 +17,9 @@ __pycache__/
 /tmp/
 /.ccache/
 .DS_Store
+
+# local downloads, notes and reports (kept, not public)
+/data/dl_*/
+/data/expert-profile-*.prof
+/reports/
+/research_notes/

@@ -1,10 +1,13 @@
 #pragma once
-// Teacher-forced quality gate against a llama.cpp KL-divergence base (`llama-perplexity --kl-divergence-base`).
-// The base file holds "_logits_", n_ctx (u32), n_vocab, n_chunk (i32), the n_chunk * n_ctx evaluation tokens, then
-// per chunk the n_ctx - 1 - n_ctx/2 scored rows (positions n_ctx/2 .. n_ctx-2), each row two floats (scale, min
-// log-prob) and n_vocab log-probs quantized to uint16 over [min, max], padded to an even count.
-// A serve request with `ppl=K` reads chunk K's first half as its prompt and then teacher-forces the rest through
-// the verify windows; every scored row is compared with the base row here and written as one line to
+// Teacher-forced quality gate against a KL-divergence base.  Two layouts:
+//   "_logits_" (llama-perplexity --kl-divergence-base): n_ctx (u32), n_vocab, n_chunk (i32), the n_chunk * n_ctx
+//     evaluation tokens, then per chunk the n_ctx - 1 - n_ctx/2 scored rows (positions n_ctx/2 .. n_ctx-2).
+//   "_qbench_" (chunks of their own lengths, e.g. a prompt and its response): n_vocab, n_chunk (i32), per chunk n_tok
+//     and first (u32 each), the chunks' tokens back to back, then per chunk its n_tok - 1 - first scored rows
+//     (positions first .. n_tok-2).
+// A row is two floats (scale, min log-prob) and n_vocab log-probs quantized to uint16 over [min, max], padded to an even
+// count.  A serve request with `ppl=K` reads chunk K's first `first + 1` tokens as its prompt and then teacher-forces
+// the rest through the verify windows; every scored row is compared with the base row here and written as one line to
 // --ppl-out: chunk pos target nll nll_base kld same_top top top_base dlogp_top_base.
 #include "basalt/platform/file.hpp"
 
@@ -33,18 +36,20 @@ public:
         return g;
     }
     bool available() const { return fd_ >= 0 && out_ != nullptr; }
-    int64_t first() const { return n_ctx_ / 2; }
-    int64_t end() const { return n_ctx_ - 1; }   // one past the last scored position
+    int64_t first() const { return first_; }
+    int64_t end() const { return end_; }   // one past the last scored position
     int32_t token(int64_t pos) const { return tok_[(size_t) pos]; }
 
-    // chunk K's tokens; the request's prompt must be the chunk's first n_ctx/2 + 1 tokens
+    // chunk K's tokens; the request's prompt must be the chunk's first `first + 1` tokens
     bool begin(int chunk, const int64_t* ids, int64_t n, int64_t n_vocab, std::string& err) {
         if (!available()) { err = "ppl: --ppl-base / --ppl-out not set or not readable"; return false; }
         if (n_vocab != n_vocab_) { err = "ppl: the base has another vocabulary size"; return false; }
         if (chunk < 0 || chunk >= n_chunk_) { err = "ppl: chunk out of range"; return false; }
-        if (n != first() + 1) { err = "ppl: the prompt must be the chunk's first n_ctx/2 + 1 tokens"; return false; }
-        tok_.resize((size_t) n_ctx_);
-        if (!read_at(tok_.data(), tok_.size() * 4, 20 + (uint64_t) chunk * n_ctx_ * 4)) {
+        first_ = chunk_first_[(size_t) chunk];
+        end_ = chunk_tok_[(size_t) chunk] - 1;
+        if (n != first_ + 1) { err = "ppl: the prompt must be the chunk's tokens up to its first scored position"; return false; }
+        tok_.resize((size_t) chunk_tok_[(size_t) chunk]);
+        if (!read_at(tok_.data(), tok_.size() * 4, tok_off_[(size_t) chunk])) {
             err = "ppl: reading the chunk tokens failed";
             return false;
         }
@@ -83,24 +88,55 @@ private:
         const char* out = paths().second.c_str();
         if (paths().first.empty() || paths().second.empty()) return;
         fd_ = basalt::platform::open_fd_utf8(paths().first);
-        char magic[8];
-        uint32_t n_ctx = 0;
-        int32_t nv[2] = {0, 0};
-        if (fd_ < 0 || !read_at(magic, 8, 0) || std::memcmp(magic, "_logits_", 8) != 0 || !read_at(&n_ctx, 4, 8) ||
-            !read_at(nv, 8, 12) || n_ctx < 4 || nv[0] <= 0 || nv[1] <= 0) {
-            basalt::log::error("basalt ppl", "%s is not a llama.cpp KL-divergence base", base);
+        if (fd_ < 0 || !open_layout()) {
+            basalt::log::error("basalt ppl", "%s is not a KL-divergence base (_logits_ or _qbench_)", base);
             close_fd();
             return;
         }
-        n_ctx_ = n_ctx;
-        n_vocab_ = nv[0];
-        n_chunk_ = nv[1];
-        row_u16_ = 2 * ((n_vocab_ + 1) / 2) + 4;
         out_ = basalt::platform::open_file_utf8(paths().second, "ab");
         if (out_ == nullptr) {
             basalt::log::error("basalt ppl", "cannot write %s", out);
             close_fd();
         }
+    }
+    // every chunk's token count, first scored position and the file offsets of its tokens and rows
+    bool open_layout() {
+        char magic[8];
+        if (!read_at(magic, 8, 0)) return false;
+        const bool llama = std::memcmp(magic, "_logits_", 8) == 0;
+        if (!llama && std::memcmp(magic, "_qbench_", 8) != 0) return false;
+        uint32_t n_ctx = 0;
+        int32_t nv[2] = {0, 0};
+        if ((llama && !read_at(&n_ctx, 4, 8)) || !read_at(nv, 8, llama ? 12 : 8) || nv[0] <= 0 || nv[1] <= 0) return false;
+        if (llama && n_ctx < 4) return false;
+        n_vocab_ = nv[0];
+        n_chunk_ = nv[1];
+        row_u16_ = 2 * ((n_vocab_ + 1) / 2) + 4;
+        const size_t nc = (size_t) n_chunk_;
+        chunk_tok_.assign(nc, (int64_t) n_ctx);
+        chunk_first_.assign(nc, (int64_t) n_ctx / 2);
+        uint64_t tok_at = 20;
+        if (!llama) {
+            std::vector<uint32_t> table(2 * nc);
+            if (!read_at(table.data(), table.size() * 4, 16)) return false;
+            for (size_t k = 0; k < nc; ++k) {
+                chunk_tok_[k] = table[2 * k];
+                chunk_first_[k] = table[2 * k + 1];
+                if (chunk_first_[k] + 2 > chunk_tok_[k]) return false;   // at least one scored row
+            }
+            tok_at = 16 + (uint64_t) nc * 8;
+        }
+        tok_off_.resize(nc);
+        row_off_.resize(nc);
+        uint64_t rows_at = tok_at;
+        for (size_t k = 0; k < nc; ++k) rows_at += (uint64_t) chunk_tok_[k] * 4;
+        for (size_t k = 0; k < nc; ++k) {
+            tok_off_[k] = tok_at;
+            tok_at += (uint64_t) chunk_tok_[k] * 4;
+            row_off_[k] = rows_at;
+            rows_at += (uint64_t) (chunk_tok_[k] - 1 - chunk_first_[k]) * (uint64_t) row_u16_ * 2;
+        }
+        return true;
     }
     ~PplGate() {
         if (out_ != nullptr) std::fclose(out_);
@@ -124,9 +160,7 @@ private:
 
     // the same arithmetic as llama-perplexity's KL-divergence pass
     bool row(int64_t pos, const std::vector<float>& lg) {
-        const int64_t r = pos - first(), rows = n_ctx_ - 1 - first();
-        const uint64_t off = 20 + (uint64_t) n_chunk_ * n_ctx_ * 4 +
-                             ((uint64_t) chunk_ * rows + (uint64_t) r) * (uint64_t) row_u16_ * 2;
+        const uint64_t off = row_off_[(size_t) chunk_] + (uint64_t) (pos - first_) * (uint64_t) row_u16_ * 2;
         base_.resize((size_t) row_u16_);
         if (!read_at(base_.data(), base_.size() * 2, off)) return false;
         float scale, min_lp;
@@ -160,7 +194,10 @@ private:
 
     int fd_ = -1;
     std::FILE* out_ = nullptr;
-    int64_t n_ctx_ = 0, n_vocab_ = 0, n_chunk_ = 0, row_u16_ = 0;
+    int64_t n_vocab_ = 0, n_chunk_ = 0, row_u16_ = 0;
+    int64_t first_ = 0, end_ = 0;
+    std::vector<int64_t> chunk_tok_, chunk_first_;
+    std::vector<uint64_t> tok_off_, row_off_;
     int chunk_ = -1;
     std::vector<int32_t> tok_;
     std::vector<uint16_t> base_;

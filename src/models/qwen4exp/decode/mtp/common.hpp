@@ -18,6 +18,8 @@
 #include "basalt/kernels/cpu/exl3.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
 #include "basalt/kernels/exl3_kernels.hpp"
+#include "basalt/kernels/ms_kernels.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/models/qwen4exp/kernels/fused_gr.hpp"

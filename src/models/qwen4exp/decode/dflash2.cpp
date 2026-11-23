@@ -458,7 +458,7 @@ bool Dflash2Drafter::bind(const WeightTable &wt, const NativeHead *head, const F
         return false;
     }
     std::vector<int32_t> ids;
-    if (kernels::cpu::exl3_type(head->type()) && !draft_vocab.empty() && draft_vocab.exists() && draft_vocab.size() % 4 == 0) {
+    if (trellis_head_type(head->type()) && !draft_vocab.empty() && draft_vocab.exists() && draft_vocab.size() % 4 == 0) {
         ids.resize((size_t)(draft_vocab.size() / 4));
         FILE *f = basalt::platform::open_file_utf8(draft_vocab.path, "rb");
         const bool read = f != nullptr && basalt::platform::fseek64(f, draft_vocab.offset, SEEK_SET) == 0 &&
@@ -471,8 +471,8 @@ bool Dflash2Drafter::bind(const WeightTable &wt, const NativeHead *head, const F
                 return false;
             }
         const size_t bytes = ids.size() * q80_row_bytes(N_);
-        if (cudaMalloc((void **)&dhead_, bytes) != cudaSuccess || !exl3_draft_rows(*head, N_, vocab_, ids, dhead_)) {
-            err = "dflash2: the draft head's rows could not be built from the EXL3 head";
+        if (cudaMalloc((void **)&dhead_, bytes) != cudaSuccess || !trellis_draft_rows(*head, N_, vocab_, ids, dhead_)) {
+            err = "dflash2: the draft head's rows could not be built from the trellis head";
             return false;
         }
         vram_ += bytes;

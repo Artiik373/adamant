@@ -209,7 +209,8 @@ bool Verifier::dm_init(std::string& err) {
     // memory at once.
     bool stage = d->pdev < 0 && d->xp.empty() && lb_ == 0 && le_ == g.n_layers && hand_in_ == nullptr &&
                  warm_src_ != nullptr && staging_ != nullptr && warm_src_->pcie_layer(0) && lay.fmt[0].bytes % 16 == 0;
-    const bool exl3_experts = lay.fmt[0].exl3_w != 0;   // its rates differ by layer: the slots take the largest blob
+    // trellis experts (EXL3, MS): their rates differ by layer, so the slots take the largest blob
+    const bool exl3_experts = lay.fmt[0].exl3_w != 0 || lay.fmt[0].ms_k != 0;
     for (int64_t l = 1; stage && l < g.n_layers; ++l)
         stage = exl3_experts ? lay.fmt[(size_t) l].bytes % 16 == 0 : lay.fmt[(size_t) l].bytes == lay.fmt[0].bytes;
     const int64_t blob = exl3_experts ? (int64_t) lay.max_blob : (int64_t) lay.fmt[0].bytes, stride = dec_moe_stage_stride(blob);
@@ -220,7 +221,7 @@ bool Verifier::dm_init(std::string& err) {
         // per layer: the pool's experts after its doorbell, the staged ones after the copy, their own launches and
         // the combine's wait for them
         constexpr double kLinkBytesPerUs = 18e3, kPoolFixUs = 15.0, kStageFixUs = 35.0;
-        // the pool's rate: the EXL3 rows are decoded on the CPU, which is slower than reading the other formats
+        // the pool's rate: trellis rows are decoded on the CPU, which is slower than reading the other formats
         const double kPoolBytesPerUs = exl3_experts ? 22e3 : 45e3;
         const double cpu_us = (double) blob / kPoolBytesPerUs, link_us = (double) blob / kLinkBytesPerUs;
         std::vector<int32_t> kt((size_t) kDmCap + 1, 0);
@@ -245,7 +246,7 @@ bool Verifier::dm_init(std::string& err) {
         std::memset(d->stage_host, 0, (size_t) LE * 8);
         d->stage_gen = warm_src_->places_generation() + 1;   // read at the first batch window
         d->stage_stride = stride;
-        d->stage_blocks = exl3_experts ? 2 : 8;   // fewer copy blocks leave the multiprocessors to the EXL3 kernels
+        d->stage_blocks = exl3_experts ? 2 : 8;   // fewer copy blocks leave the multiprocessors to the trellis kernels
         d->stage_min = 1;
         while (d->stage_min < kDmCap && kt[(size_t) d->stage_min] == 0) ++d->stage_min;
     }
