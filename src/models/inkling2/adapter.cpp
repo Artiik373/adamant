@@ -32,6 +32,7 @@ public:
         f.call_close = "<|end_message|>";
         f.json_args = true;
         f.trigger_pattern = "<\\|message_model\\|>[^<]";
+        f.trigger_reach = 32;   // the 17-byte header and one character
         return f;
     }
     // A reply is a list of blocks, each opened by <|message_model|> and ended by <|end_message|>: thinking blocks

@@ -298,6 +298,24 @@ static void test_patterns() {
     GrammarState b(g, w);
     CHECK(b.accept("hi ", 1) && !b.active());
     CHECK(b.accept("<c>", 2) && b.active());
+    // a bounded reach: a long text first (trimmed as it goes), then the trigger split across tokens
+    for (const char* split : {"<", "zz<c"}) {
+        Triggers rr;
+        rr.patterns = {"<c>[a-z]"};
+        rr.pattern_reach = 8;
+        GrammarState q(g, rr);
+        for (int i = 0; i < 2000; ++i) CHECK(q.accept("word and < more ", 10 + i % 7) && !q.active());
+        CHECK(q.accept(split, 1) && !q.active());
+        CHECK(q.accept(std::string(split) == "<" ? "c>" : ">", 2) && !q.active());
+        CHECK(q.accept("ab", 3) && q.active());       // the match starts at "<c>": the grammar has "<c>ab"
+        CHECK(q.accept("</c>") && q.accepting());
+    }
+    // an anchored pattern keeps the whole output whatever the reach
+    Triggers wa;
+    wa.patterns = {"^hi (<c>)$"};
+    wa.pattern_reach = 2;
+    GrammarState ba(g, wa);
+    CHECK(ba.accept("hi ", 1) && !ba.active() && ba.accept("<c>", 2) && ba.active());
     // a bad pattern is refused up front
     Triggers bad;
     bad.patterns = {"(["};

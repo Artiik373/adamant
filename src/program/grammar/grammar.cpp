@@ -633,7 +633,8 @@ struct GrammarState::PatternSet {
     std::vector<std::string> src;
 
     // Where the grammar starts in `input` for pattern i: the first non-empty capture group, else the match itself.
-    size_t find(size_t i, const std::string& input) const {
+    // from > 0: only a match that starts at or after `from` (the bytes before it are context, not searched).
+    size_t find(size_t i, const std::string& input, size_t from = 0) const {
         auto start_of = [](const std::smatch& m) {
             for (size_t g = 1; g < m.size(); ++g) {
                 if (m.length(g) > 0) return (size_t) m.position(g);
@@ -643,7 +644,10 @@ struct GrammarState::PatternSet {
         const std::string& p = src[i];
         std::smatch m;
         if (!p.empty() && p.front() == '^' && p.back() == '$' && std::regex_match(input, m, re[i])) return start_of(m);
-        if (std::regex_search(input, m, re[i])) return start_of(m);
+        if (from == 0) return std::regex_search(input, m, re[i]) ? start_of(m) : std::string::npos;
+        if (std::regex_search(input.begin() + (std::ptrdiff_t) from, input.end(), m, re[i],
+                              std::regex_constants::match_prev_avail))
+            return from + start_of(m);
         return std::string::npos;
     }
 };
@@ -669,11 +673,14 @@ GrammarState::GrammarState(std::shared_ptr<const Grammar> g, Triggers triggers)
         std::string err;
         if (!triggers_.valid(err)) throw std::invalid_argument(err);
         auto set = std::make_shared<PatternSet>();
+        bool anchored = false;
         for (const std::string& p : triggers_.patterns) {
             set->re.emplace_back(p);
             set->src.push_back(p);
+            anchored = anchored || (!p.empty() && p.front() == '^');
         }
         patterns_ = std::move(set);
+        reach_ = anchored ? 0 : triggers_.pattern_reach;
     }
     reset();
 }
@@ -834,8 +841,10 @@ bool GrammarState::accept(std::string_view bytes, int32_t token_id) {
     if (patterns_) {
         pieces = pieces_;
         pieces.push_back({token_id, tail_.size(), buf.size()});
+        // tail_ held no match: a new one ends in this token's bytes, so it starts at most reach_ bytes before them
+        const size_t start = reach_ && tail_.size() > reach_ ? tail_.size() - reach_ : 0;
         for (size_t i = 0; i < patterns_->src.size(); ++i) {
-            size_t p = patterns_->find(i, buf);
+            size_t p = patterns_->find(i, buf, start);
             if (p != std::string::npos) {
                 from = (std::min)(from, p);
                 break;
@@ -846,6 +855,14 @@ bool GrammarState::accept(std::string_view bytes, int32_t token_id) {
         if (patterns_) {
             tail_ = std::move(buf);
             pieces_ = std::move(pieces);
+            if (reach_ && tail_.size() > 2 * reach_) {   // keep the last reach_ bytes and the pieces that made them
+                const size_t cut = tail_.size() - reach_;
+                tail_.erase(0, cut);
+                std::vector<Piece> kept;
+                for (const Piece& p : pieces_)
+                    if (p.end > cut) kept.push_back({p.token, p.begin > cut ? p.begin - cut : 0, p.end - cut});
+                pieces_ = std::move(kept);
+            }
         } else {
             tail_ = buf.size() > tail_keep_ ? buf.substr(buf.size() - tail_keep_) : buf;
         }
