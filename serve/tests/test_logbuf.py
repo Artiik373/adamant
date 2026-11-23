@@ -182,13 +182,13 @@ class Tail(unittest.TestCase):
     def test_on_line_reports_exact_byte_offsets(self):
         with tempfile.TemporaryDirectory() as d:
             log = Path(d) / "events.log"
-            log.write_text("before\n", encoding="utf-8")
+            log.write_text("before\n", encoding="utf-8", newline="")   # the offsets count "\n" alone, on Windows too
             b = LogBuffer()
             seen = []
             threading.Thread(target=tail_file, args=(b, str(log), "eng", 0.02),
                              kwargs={"on_line": lambda text, pos: seen.append((text, pos))}, daemon=True).start()
             time.sleep(0.1)
-            with open(log, "a", encoding="utf-8") as f:
+            with open(log, "a", encoding="utf-8", newline="") as f:
                 f.write("basalt serve: warning: hot\n")
             self.wait_for(b, 1)
             self.assertEqual(seen, [("basalt serve: warning: hot", len("before\nbasalt serve: warning: hot\n"))])

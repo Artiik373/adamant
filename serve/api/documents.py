@@ -94,7 +94,9 @@ def _given(value) -> str:
 def _url_name(source: str) -> str:
     """The file name a URL or a path ends in (either separator)."""
     path = source
-    if re.match(r"[a-zA-Z][a-zA-Z0-9+.-]+://", source):
+    if source[:5].lower() == "file:":                  # `file://C:\x` has no "/" for urlsplit to find a path at
+        path = urllib.parse.unquote(source[5:])
+    elif re.match(r"[a-zA-Z][a-zA-Z0-9+.-]+://", source):
         try:
             path = urllib.parse.unquote(urllib.parse.urlsplit(source).path)
         except ValueError:

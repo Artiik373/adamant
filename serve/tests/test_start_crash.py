@@ -47,6 +47,7 @@ class StartCrash(unittest.TestCase):
 
         return Hooked(str(script), [], cwd=tmp, log=None)
 
+    @unittest.skipIf(os.name == "nt", "a script started as the program itself (a shebang)")
     def test_a_crashed_start_names_the_signal_and_is_not_retried(self):
         with tempfile.TemporaryDirectory() as tmp:
             spawns, sleeps, made = [], [], []
@@ -71,6 +72,7 @@ class StartCrash(unittest.TestCase):
             # the patch records every sleeping thread; only the restart waits answer here
             self.assertEqual([s for s in sleeps if s == process.ProcessEngine.RESTART_RETRY_S], [])   # the crash was not retried
 
+    @unittest.skipIf(os.name == "nt", "a script started as the program itself (a shebang)")
     def test_a_plain_exit_is_still_retried(self):
         with tempfile.TemporaryDirectory() as tmp:
             sleeps, made = [], []

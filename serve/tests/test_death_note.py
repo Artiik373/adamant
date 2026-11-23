@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import signal
 import tempfile
 import unittest
@@ -25,6 +26,7 @@ def note(log: str, rc, last_err: str = "") -> str:
 
 
 class DeathNote(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "a POSIX signal: Windows reports an exit code")
     def test_signal_and_last_error_line(self):
         got = note("basalt load: ready\nbasalt serve: error: GPU watchdog fired\nbasalt serve: bye\n", -int(signal.SIGKILL))
         self.assertIn("killed by SIGKILL", got)
@@ -39,6 +41,7 @@ class DeathNote(unittest.TestCase):
     def test_protocol_error_is_named(self):
         self.assertIn("after it reported: bad request", note("basalt serve: ok\n", 1, "bad request"))
 
+    @unittest.skipIf(os.name == "nt", "a POSIX signal: Windows reports an exit code")
     def test_no_error_line_says_so_and_does_not_guess(self):
         got = note("basalt serve: ready\n", -int(signal.SIGKILL))
         self.assertIn("killed by SIGKILL", got)

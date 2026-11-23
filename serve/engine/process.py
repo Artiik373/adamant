@@ -324,7 +324,8 @@ class ProcessEngine:
             loading.set()                               # the narrator stops and the log handle goes back
             if log:
                 self.log.close()
-            raise EngineStartError(f"the engine could not be started: {e}", log) from e
+            why = str(e) if engine_bin in str(e) else f"{e}: {engine_bin}"   # Windows' message names no file
+            raise EngineStartError(f"the engine could not be started: {why}", log) from e
         frame_pipes(self.proc, sink is not None)
         proc = self.proc
         if sink:
