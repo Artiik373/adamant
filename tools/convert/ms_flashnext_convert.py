@@ -68,7 +68,7 @@ def pack_rows(states: torch.Tensor, scales: torch.Tensor, k: int) -> bytes:
     return out.cpu().numpy().tobytes()
 
 
-VITERBI = (32, 8)   # search window, commit length; set from --window/--commit
+VITERBI = (48, 12)   # search window, commit length; set from --window/--commit
 
 
 def code(ws: torch.Tensor, hs: torch.Tensor, k: int, lut, seeds) -> list:
@@ -453,8 +453,8 @@ def main() -> None:
     p.add_argument("--stop-after", type=int, default=None, help="last layer to convert in this run")
     p.add_argument("--reuse-from", type=Path, help="an earlier output folder (same plan) to copy layers from")
     p.add_argument("--reuse-layers", type=int, default=0, help="copy layers below this from --reuse-from")
-    p.add_argument("--window", type=int, default=32, help="Viterbi search window")
-    p.add_argument("--commit", type=int, default=8, help="Viterbi commit length")
+    p.add_argument("--window", type=int, default=48, help="Viterbi search window")
+    p.add_argument("--commit", type=int, default=12, help="Viterbi commit length")
     p.add_argument("--hess-tau", type=float, default=0.0,
                    help="shrink each expert's Hessians toward the layer's with this many tokens' weight (0: off)")
     p.add_argument("--two-stream", action="store_true",
