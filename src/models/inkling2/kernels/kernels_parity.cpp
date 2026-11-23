@@ -345,11 +345,13 @@ void test_prepare() {
 // ---- attention ---------------------------------------------------------------------------------------------------------
 
 void test_attention() {
-    for (int mode = 0; mode < 3; ++mode) {   // a window ring, a full cache, a full cache of E4M3 codes
-        const bool window = mode == 0, fp8 = mode == 2;
-        const int R = 4;
-        const int p0 = window ? 2900 : 2995;
-        const int64_t cap = window ? kExtent + 8 : 3000;
+    // a window ring, a full cache, a full cache of E4M3 codes, and a full cache whose window's rows lie on both sides of
+    // the 4096 keys from which a row takes the tensor cores
+    for (int mode = 0; mode < 4; ++mode) {
+        const bool window = mode == 0, fp8 = mode == 2, both = mode == 3;
+        const int R = both ? 8 : 4;
+        const int p0 = window ? 2900 : both ? 4091 : 2995;
+        const int64_t cap = window ? kExtent + 8 : both ? 4200 : 3000;
         std::vector<int> pos(R);
         for (int r = 0; r < R; ++r) pos[r] = p0 + r;
         std::vector<double> kd((size_t) kKvHeads * cap * kHeadDim), vd(kd.size());   // the cached values as the kernel reads them
@@ -410,17 +412,19 @@ void test_attention() {
                     ref[((size_t) r * kHeads + h) * kHeadDim + i] = acc / den;
                 }
             }
-        report(window ? "attention (window ring)" : fp8 ? "attention (full, 3k keys, E4M3)" : "attention (full, 3k keys)", got, ref, 2e-3);
-        // row 2 alone, and under a launch bound of a million keys
+        report(window ? "attention (window ring)" : fp8 ? "attention (full, 3k keys, E4M3)" : both ? "attention (full, 4k keys, both kernels)" : "attention (full, 3k keys)",
+               got, ref, 2e-3);
+        // a row alone (with both kernels, one the tensor cores take), and under a launch bound of a million keys
+        const int ro = both ? 6 : 2;
         AttnArgs one = a;
-        one.q = dq + 2 * kHeads * kHeadDim; one.r = drs + 2 * kHeads * kRel; one.sink = dsink + 2 * kHeads; one.pos = dpos + 2;
+        one.q = dq + ro * kHeads * kHeadDim; one.r = drs + ro * kHeads * kRel; one.sink = dsink + ro * kHeads; one.pos = dpos + ro;
         float* out1 = zeros<float>((size_t) kHeads * kHeadDim);
         attention_decode(one, 1, max_keys, scr, out1, nullptr);
         std::vector<float> g1 = host(out1, (size_t) kHeads * kHeadDim);
-        same_bits("  a row alone", g1.data(), &got[(size_t) 2 * kHeads * kHeadDim], g1.size() * 4);
+        same_bits("  a row alone", g1.data(), &got[(size_t) ro * kHeads * kHeadDim], g1.size() * 4);
         attention_decode(one, 1, 1 << 20, scr, out1, nullptr);
         g1 = host(out1, (size_t) kHeads * kHeadDim);
-        same_bits("  any launch bound", g1.data(), &got[(size_t) 2 * kHeads * kHeadDim], g1.size() * 4);
+        same_bits("  any launch bound", g1.data(), &got[(size_t) ro * kHeads * kHeadDim], g1.size() * 4);
         // gated, and as q8_1 blocks
         AttnArgs gq = a;
         gq.gate = dgate + kOffGate;
