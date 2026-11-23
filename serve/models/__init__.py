@@ -76,6 +76,9 @@ def dialect_for(arch: str | None) -> Dialect:
     if arch == "hy4":
         from serve.models.hy4 import Hy4
         return Hy4()
+    if arch == "inkling2":
+        from serve.models.inkling2 import Inkling2
+        return Inkling2()
     if arch in ("qwen4exp", "qwen35", None):
         from serve.models.qwen import Qwen
         return Qwen()

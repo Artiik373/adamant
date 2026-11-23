@@ -96,3 +96,30 @@ The gate is not complete. Kernel parity and memory, race, initialization and
 synchronization checks pass on sm_89; end-to-end quality results and performance
 claims have not been established. The development measurements taken so far, with
 their power limit and configuration, are in the [README](../../README.md#measured-on-ampere).
+
+## Inkling 2 Mini
+
+Upstream's Inkling 2 line, ported to sm_86:
+
+| Operation | Adamant implementation | Numerical consequence |
+|---|---|---|
+| Decode window attention | Preparation, slices and merge as three kernels (no thread-block clusters) | None: upstream's fused kernel computes the same arithmetic in the same order; `inkling2_kernels_parity` checks every window bitwise |
+| Prompt Q8_0 projections (`prefill::q8`) | Swizzled `cp.async` tiles with zero fill and `mbarrier.test_wait` replace TMA | None intended: the int8 MMA and its K order are unchanged; `inkling2_prompt_parity` passes |
+| Prompt NVFP4 experts | MMQ (q8_1 activations) instead of two FP4 terms on FP4 tensor cores | Changes prompt numerics; upstream measured MMQ at 0.00252 KLD against 0.00264 for its FP4 path (20 chunks) |
+| Prompt MXFP8 experts | Each k32 block's E4M3 codes as f16 (exact) through two m16n8k16 f16 products, fp32 sums times the UE8M0 scales | Changes prompt numerics (the scales apply after each block's fp32 sum); `moe_mxfp8_test` passes against a double CPU reference |
+| DSpark window products (`window_gemm`) | E4M3/E2M1 codes decoded in integer arithmetic, `mul.bf16x2` as `fma.bf16x2` with a -0 addend | None: the same bf16 bits; `narrow_bf16_parity` checks every input against the host values |
+| L2 read-ahead | Per-line prefetch replaces bulk prefetch; the expert read-ahead spreads its lines over the warp | None |
+
+DSpark's pick read the picked token from global memory after a barrier through a `__restrict__` pointer; on sm_86 the load
+was not ordered after the barrier and the drafter's next input took another candidate's row. It is now a volatile read
+(`inkling2_dspark_parity` "the pick's w1 row copied out").
+
+Development checks, one RTX 3090 at its 294 W power limit, the `NVFP4-MX8` pack, the whole model on the card:
+
+- `inkling2_kernels_parity`, `inkling2_dspark_parity`, `inkling2_prompt_parity`, `moe_mxfp8_test` and
+  `narrow_bf16_parity`: 0 failures.
+- Greedy decoding with drafting equals `--spec 1` on the prose and struct fixtures (200 tokens each).
+- The 15,806-token `prefill.ids` prompt reads in 4.06 s (about 3,900 tokens/s); its answer is coherent.
+
+Open: decode-path PPL/KLD against the BF16 reference (`basalt-bench --quality`; no Inkling 2 base is built locally), the
+`NVFP4-DQ8` pack, experts in RAM, and two cards.
