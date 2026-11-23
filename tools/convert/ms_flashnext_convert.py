@@ -469,6 +469,8 @@ def main() -> None:
     p.add_argument("--stop-after", type=int, default=None, help="last layer to convert in this run")
     p.add_argument("--reuse-from", type=Path, help="an earlier output folder (same plan) to copy layers from")
     p.add_argument("--reuse-layers", type=int, default=0, help="copy layers below this from --reuse-from")
+    p.add_argument("--only-layers", type=lambda v: {int(x) for x in v.split(",")}, default=None,
+                   help="code these layers only (at the plan's widths); the others only advance the stream")
     p.add_argument("--window", type=int, default=48, help="Viterbi search window")
     p.add_argument("--commit", type=int, default=12, help="Viterbi commit length")
     p.add_argument("--hess-tau", type=float, default=0.0,
@@ -531,10 +533,19 @@ def main() -> None:
         print(f"resuming at layer {start}", flush=True)
     lut = ms.build_1mad_lut(dev)
     last = nl - 1 if args.stop_after is None else args.stop_after
+    if args.only_layers is not None:
+        assert not args.two_stream, "--only-layers codes on the original stream"
+        last = min(last, max(args.only_layers))
 
     for l in range(start, min(last, nl - 1) + 1):
         t0 = time.time()
         layer = load_layer(cfg, args.hf_dir, wmap, l, dev)
+        if args.only_layers is not None and l not in args.only_layers:
+            h = run_layer(layer, h, kws, bs, inplace=True)
+            del layer
+            torch.cuda.empty_cache()
+            print(f"layer {l:2d}: not coded (--only-layers), forward {time.time() - t0:.0f}s", flush=True)
+            continue
         if l < args.reuse_layers:
             # the layer's records come from an earlier run with the same plan; only advance the stream
             h = run_layer(layer, h, kws, bs, inplace=True)

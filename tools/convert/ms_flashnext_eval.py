@@ -94,9 +94,11 @@ def read_payload(path: Path, offset: int, nbytes: int, dev) -> torch.Tensor:
         return torch.frombuffer(bytearray(f.read(nbytes)), dtype=torch.uint8).to(dev)
 
 
-def load_ms_layer(layer, l: int, ms_dir: Path, lut, dev, names=None, experts: bool = True) -> None:
+def load_ms_layer(layer, l: int, ms_dir: Path, lut, dev, names=None, experts: bool = True,
+                  roles=("gate", "up", "down"), scale: float = 1.0) -> None:
     """Replace the layer's coded matrices with their decoded MS records (spine back from the GGUF order).
-    names: only these spine modules (default all); experts: also the routed experts."""
+    names: only these spine modules (default all); experts: also the routed experts, those of `roles`.
+    scale: the routed experts get W + scale * (Q - W), the coded error scaled (a surrogate of another width)."""
     mods = dict(layer.named_modules())
     for hf_name, suffix in SPINE.items():
         if hf_name not in mods or (names is not None and hf_name not in names):
@@ -123,18 +125,45 @@ def load_ms_layer(layer, l: int, ms_dir: Path, lut, dev, names=None, experts: bo
     k = rec["k"]
     n_embd, n_ff = ex.hidden_dim, ex.intermediate_dim
     for name, n_in, n_out in (("gate", n_embd, n_ff), ("up", n_embd, n_ff), ("down", n_ff, n_embd)):
+        if name not in roles:
+            continue
         per = n_out * ms_row_bytes(n_in, k) + n_in
         path = ms_dir / "experts" / f"blk.{l}.ffn_{name}_exps.ms"
         for e0 in range(0, ex.num_experts, 64):
             blob = read_payload(path, e0 * per, 64 * per, dev)
             for e in range(64):
-                w = decode_rows(blob[e * per : (e + 1) * per], n_out, n_in, k, lut).to(ex.down_proj.dtype)
-                if name == "gate":
-                    ex.gate_up_proj.data[e0 + e, :n_ff] = w
-                elif name == "up":
-                    ex.gate_up_proj.data[e0 + e, n_ff:] = w
-                else:
-                    ex.down_proj.data[e0 + e] = w
+                w = decode_rows(blob[e * per : (e + 1) * per], n_out, n_in, k, lut)
+                dst = (ex.gate_up_proj.data[e0 + e, :n_ff] if name == "gate" else
+                       ex.gate_up_proj.data[e0 + e, n_ff:] if name == "up" else ex.down_proj.data[e0 + e])
+                if scale != 1.0:
+                    w = dst.float() + scale * (w - dst.float())
+                dst.copy_(w.to(dst.dtype))
+
+
+PARTS = ("attn", "shared", "experts", "gu", "down")
+
+
+def layer_scales(spec: str) -> dict:
+    """--scale "10:1.8,24:0.5" -> {10: 1.8, 24: 0.5}."""
+    out = {}
+    for item in filter(None, (x.strip() for x in spec.split(","))):
+        l, _, c = item.partition(":")
+        try:
+            out[int(l)] = float(c)
+        except ValueError:
+            raise SystemExit(f"--scale: bad item {item!r} (L:c)")
+    return out
+
+
+def bf16_parts(spec: str) -> dict:
+    """--bf16 "3,7.down,12.attn" -> {3: {"all"}, 7: {"down"}, 12: {"attn"}}."""
+    out: dict = {}
+    for item in filter(None, (x.strip() for x in spec.split(","))):
+        l, _, part = item.partition(".")
+        if not l.isdigit() or (part and part not in PARTS):
+            raise SystemExit(f"--bf16: bad item {item!r} (L or L.{'|'.join(PARTS)})")
+        out.setdefault(int(l), set()).add(part or "all")
+    return out
 
 
 def load_mixer(cfg, hf: Path, wmap: dict, dev):
@@ -279,6 +308,10 @@ def main() -> None:
                    "response_ids); writes a _qbench_ base scored on the responses")
     p.add_argument("--ctx", type=int, default=512)
     p.add_argument("--chunks", type=int, default=None)
+    p.add_argument("--bf16", default="", metavar="SPEC",
+                   help="parts that stay BF16, for probes: L (a layer), L.attn, L.shared, L.experts, L.gu or L.down")
+    p.add_argument("--scale", default="", metavar="SPEC",
+                   help="surrogates: L:c gives layer L's routed experts W + c * (Q - W), e.g. 10:1.8,24:0.5")
     p.add_argument("--ms-layers", type=int, default=1 << 30,
                    help="take MS records for the layers below this only (the rest, and then the head, stay BF16)")
     p.add_argument("--batch-size", type=int, default=4)
@@ -327,7 +360,14 @@ def main() -> None:
         layer = load_layer(cfg, args.hf_dir, wmap, l, dev)
         if not writing and l < args.ms_layers and (args.ms_dir / "experts" / f"blk.{l}.experts.json").exists():
             # else the layer stays BF16
-            load_ms_layer(layer, l, args.ms_dir, lut, dev)
+            keep = bf16_parts(args.bf16).get(l, set())
+            if "all" not in keep:
+                names = [n for n in SPINE if not (("attn" in keep and not n.startswith("mlp.")) or
+                                                  ("shared" in keep and n.startswith("mlp.shared_expert.")))]
+                roles = tuple(r for r in ("gate", "up", "down")
+                              if not ({"experts", "gu" if r != "down" else "down"} & keep))
+                load_ms_layer(layer, l, args.ms_dir, lut, dev, names, bool(roles), roles,
+                              layer_scales(args.scale).get(l, 1.0))
         td = time.time() - tl
         h = run_layer(layer, h, kws, bs)
         del layer
