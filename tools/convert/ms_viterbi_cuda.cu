@@ -6,8 +6,13 @@
 
 namespace {
 
-constexpr uint32_t MAD_MUL = 34038481u;
-constexpr uint32_t MAD_ADD = 76625530u;
+// overridable to probe other 1MAD constants; the format uses these defaults
+#ifndef MS_MAD_MUL
+#define MS_MAD_MUL 34038481u
+#define MS_MAD_ADD 76625530u
+#endif
+constexpr uint32_t MAD_MUL = MS_MAD_MUL;
+constexpr uint32_t MAD_ADD = MS_MAD_ADD;
 constexpr int STATE_BITS = 14;
 constexpr int NUM_STATES = 1 << STATE_BITS;
 constexpr int STATE_MASK = NUM_STATES - 1;

@@ -99,7 +99,7 @@ def code_rows(w: torch.Tensor, h: torch.Tensor, k: int, lut, seed: int, chunk: i
 
 
 def expert_hessians(x: torch.Tensor, idx: torch.Tensor, e: int, w_gu: torch.Tensor, wts=None, tau: float = 0.0,
-                    h_all=None, x_ref=None):
+                    h_all=None, x_ref=None, tok_w=None):
     """Input Hessians of expert e's gate/up and down rows and its routed-token count.  Plain: sums over the tokens
     routed to it (identity Hessians when none is).  wts (the router's top-k scores): each token weighted by its score
     squared, as its error reaches the layer output times the score.  tau > 0: each Hessian, as a mean, shrunk toward
@@ -112,6 +112,8 @@ def expert_hessians(x: torch.Tensor, idx: torch.Tensor, e: int, w_gu: torch.Tens
     if tau <= 0 and not n:
         return torch.eye(x.shape[1], device=x.device), torch.eye(w_gu.shape[0] // 2, device=x.device), 0
     p = (wts.float()[sel] * hit[sel]).sum(-1) ** 2 if wts is not None else torch.ones(n, device=x.device)
+    if tok_w is not None:   # per-token weights (Fisher): on top of the router's
+        p = p * tok_w[sel]
     s_in = torch.zeros(x.shape[1], x.shape[1], device=x.device)
     s_dn = torch.zeros(w_gu.shape[0] // 2, w_gu.shape[0] // 2, device=x.device)
     for c in range(0, n, 65536):   # in chunks: a busy expert's tokens in fp32 would not fit next to x
@@ -126,9 +128,9 @@ def expert_hessians(x: torch.Tensor, idx: torch.Tensor, e: int, w_gu: torch.Tens
     gr, ur = (x_ref.float() @ w_gu.T).chunk(2, -1)
     ar = torch.nn.functional.silu(gr) * ur
     hd_all = ar.T @ ar / ar.shape[0]
-    # tau weighs the prior as tau tokens of the mean routed token's weight
-    w_mean = m / n if n else torch.tensor(1.0, device=x.device)
-    t = tau * w_mean
+    # tau weighs the prior as tau tokens against the expert's effective sample size (n when all weights are equal)
+    ess = m * m / (p * p).sum() if n else torch.tensor(1.0, device=x.device)
+    t = tau * (m / ess if n else torch.tensor(1.0, device=x.device))
     return (s_in + t * h_all) / (m + t), (s_dn + t * hd_all) / (m + t), n
 
 
@@ -184,6 +186,158 @@ def spine_hooks(layer, hess: dict, counts: dict) -> list:
     return hooks
 
 
+# The decoder layer's forward in its parts (Qwen4ExpTextDecoderLayer.forward, no cache): the two-stream step needs
+# the state between them. two_stream_layer checks the parts against the layer's own forward.
+KNOWN_KW = ("position_embeddings", "attention_mask", "conv_mask", "ple_input_ids")
+
+
+def attn_in(layer, h, kw):
+    """(attention input, hyper-connection input, injection weights)"""
+    if layer.ple is not None:
+        h = h + layer.ple(h, kw["ple_input_ids"], None, conv_mask=kw.get("conv_mask"))
+    return layer.attn_hyper_connection(h)
+
+
+def attn(layer, x, kw):
+    rest = {k: v for k, v in kw.items() if k not in KNOWN_KW}
+    if layer.layer_type == "linear_attention":
+        return layer.linear_attn(x, cache_params=None, attention_mask=kw.get("conv_mask"), **rest)
+    return layer.self_attn(x, kw["position_embeddings"], attention_mask=kw["attention_mask"], **rest)[0]
+
+
+def inject(hyper, y, w):
+    return hyper + (y.unsqueeze(-2) * w.unsqueeze(-1)).flatten(-2)
+
+
+def stream_target(d, w):
+    """The block output y that best gives d = sum over streams of y * w_s, per token: (target, weight), the weighted
+    least squares fit over the hyper-connection streams (d [..., hc * hidden], w [..., hc])."""
+    d = d.float().unflatten(-1, (w.shape[-1], -1))
+    w = w.float()
+    c = (w * w).sum(-1)
+    return (w.unsqueeze(-1) * d).sum(-2) / c.unsqueeze(-1), c
+
+
+def input_map(w, hqq, crq):
+    """W M with M = (C_rq + rI)(H_qq + rI)^-1, r = 1% of H_qq's mean diagonal: minimises
+    sum ||W x_ref - W M x_q||^2 + r ||W M - W||^2 (means over the tokens)."""
+    eye = torch.eye(hqq.shape[0], device=hqq.device, dtype=hqq.dtype)
+    r = 0.01 * hqq.diagonal().mean()
+    return w @ torch.linalg.solve((hqq + r * eye).T, (crq + r * eye).T).T
+
+
+def ridge_refit(w, hh, c):
+    """W_t with W_t^T = (HH + (lam + mu) I)^-1 (C + mu W^T), lam = 1e-4 and mu = 0.05 of HH's mean diagonal: the
+    least squares fit of the targets in C = sum z y^T, held toward W."""
+    d = hh.diagonal().mean()
+    eye = torch.eye(hh.shape[0], device=hh.device, dtype=hh.dtype)
+    return torch.linalg.solve(hh + (1e-4 + 0.05) * d * eye, c + 0.05 * d * w.T).T.contiguous()
+
+
+@torch.no_grad()
+def two_stream_layer(layer, l, nl, h, hq, kws, bs, x, code_spine, code_moe, load):
+    """One layer of the two-stream conversion (the MS method's section 6.3 on the hyper-connection layer). h, the
+    original stream, and hq, the converted one, advance in place; x gets the converted MoE inputs. code_spine(name, W,
+    H) and code_moe(x) write records; load(names, experts) puts their decoded values into the layer."""
+    dev = next(layer.parameters()).device
+    tm, t0 = {}, time.time()
+    mark = lambda k: tm.__setitem__(k, time.time() - t0 - sum(tm.values()))
+    mods = dict(layer.named_modules())
+    reads = [n for n in ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "self_attn.q_proj", "self_attn.k_proj",
+                         "self_attn.v_proj") if n in mods]
+    out_name = "linear_attn.out_proj" if "linear_attn.out_proj" in mods else "self_attn.o_proj"
+    sh = layer.mlp.shared_expert
+    n, hid = x.shape
+    att_ref = torch.empty(n, hid, dtype=torch.bfloat16, device=dev)
+    ffn_ref = torch.empty(n, hid, dtype=torch.bfloat16, device=dev)
+    mid_ref = torch.empty(n, h.shape[-1], dtype=torch.bfloat16, device=dev)
+    sl = lambda b: slice(b * bs, (b + 1) * bs)
+    rows = lambda b: slice(b * bs * h.shape[1], (b + 1) * bs * h.shape[1])
+
+    # the original stream through the original layer; its parts checked against the layer's forward once
+    for b, kw in enumerate(kws):
+        hb = h[sl(b)].to(dev)
+        xa, hy, wi = attn_in(layer, hb, kw)
+        mid = inject(hy, attn(layer, xa, kw), wi)
+        xf, hy2, wi2 = layer.mlp_hyper_connection(mid)
+        o = inject(hy2, layer.mlp(xf), wi2)
+        if b == 0:
+            assert torch.equal(o, layer(hb, **kw)), "the layer's parts differ from its forward"
+        att_ref[rows(b)], mid_ref[rows(b)], ffn_ref[rows(b)] = (t.reshape(-1, t.shape[-1]) for t in (xa, mid, xf))
+        h[sl(b)] = o.to(h.device)
+    mark("ref")
+
+    tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False   # attention and shared gate/up statistics in fp32
+    hqq = crq = 0
+    for b, kw in enumerate(kws):
+        xq = attn_in(layer, hq[sl(b)].to(dev), kw)[0].reshape(-1, hid).float()
+        hqq, crq = hqq + xq.T @ xq, crq + att_ref[rows(b)].float().T @ xq
+    for name in reads:
+        code_spine(name, input_map(mods[name].weight.float(), hqq / n, crq / n), hqq / n)
+    load(reads, False)
+    mark("reads")
+
+    z_in = []
+    hk = mods[out_name].register_forward_pre_hook(lambda m, a: z_in.append(a[0]))
+    hh = cc = 0
+    for b, kw in enumerate(kws):
+        xa, hy, wi = attn_in(layer, hq[sl(b)].to(dev), kw)
+        attn(layer, xa, kw)
+        z = z_in.pop().reshape(-1, mods[out_name].in_features).float()
+        t, c = stream_target(mid_ref[rows(b)].float() - hy.reshape(-1, hy.shape[-1]).float(), wi.reshape(-1, wi.shape[-1]))
+        hh, cc = hh + (z * c[:, None]).T @ z, cc + (z * c[:, None]).T @ t
+    hk.remove()
+    del mid_ref
+    code_spine(out_name, ridge_refit(mods[out_name].weight.float(), hh, cc), hh / n)
+    load([out_name], False)
+    mark("out")
+
+    # FFN inputs of the converted stream; the shared expert's target: in the first half of the layers what the layer
+    # output needs (absorbing the error so far), from the half on the original FFN on the converted inputs
+    hnn = cnn = 0
+    tgt = torch.empty(n, hid, dtype=torch.float32, device=dev)
+    tw = torch.empty(n, dtype=torch.float32, device=dev)
+    for b, kw in enumerate(kws):
+        xa, hy, wi = attn_in(layer, hq[sl(b)].to(dev), kw)
+        xf, hy2, wi2 = layer.mlp_hyper_connection(inject(hy, attn(layer, xa, kw), wi))
+        xq = xf.reshape(-1, hid)
+        x[rows(b)] = xq
+        xq = xq.float()
+        hnn, cnn = hnn + xq.T @ xq, cnn + ffn_ref[rows(b)].float().T @ xq
+        d = (h[sl(b)].to(dev).float() - hy2.float() if l < nl // 2 else
+             (layer.mlp(xf).float().unsqueeze(-2) * wi2.float().unsqueeze(-1)).flatten(-2))
+        tgt[rows(b)], tw[rows(b)] = stream_target(d.reshape(-1, d.shape[-1]), wi2.reshape(-1, wi2.shape[-1]))
+    del ffn_ref
+    torch.backends.cuda.matmul.allow_tf32 = tf32
+    for name in ("mlp.shared_expert.gate_proj", "mlp.shared_expert.up_proj"):
+        code_spine(name, input_map(mods[name].weight.float(), hnn / n, cnn / n), hnn / n)
+    mark("ffn-in")
+    rec = code_moe(x)
+    mark("experts")
+    load(["mlp.shared_expert.gate_proj", "mlp.shared_expert.up_proj"], True)
+    mark("load")
+
+    # the shared expert's down refit after the coded routed experts: its output enters times the shared gate
+    moe, ha, ca = layer.mlp, 0, 0
+    for c0 in range(0, n, bs * h.shape[1]):
+        xc = x[c0 : c0 + bs * h.shape[1]]
+        _, wts, sel = moe.gate(xc)
+        rest = tgt[c0 : c0 + xc.shape[0]] - moe.experts(xc, sel, wts).float()
+        s = torch.sigmoid(moe.shared_expert_gate(xc)).float()
+        a = (sh.act_fn(sh.gate_proj(xc)) * sh.up_proj(xc)).float()
+        om = tw[c0 : c0 + xc.shape[0], None]
+        ha, ca = ha + (a * om * s * s).T @ a, ca + (a * om * s).T @ rest
+    del tgt, tw
+    code_spine("mlp.shared_expert.down_proj", ridge_refit(sh.down_proj.weight.float(), ha, ca), ha / n)
+    load(["mlp.shared_expert.down_proj"], False)
+    mark("down")
+    run_layer(layer, hq, kws, bs, inplace=True)
+    mark("advance")
+    rec["times"] = tm
+    return rec
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Qwen3.8-Flash-Next -> MS records, layer-streamed")
     p.add_argument("--hf-dir", type=Path, required=True)
@@ -201,11 +355,17 @@ def main() -> None:
     p.add_argument("--commit", type=int, default=8, help="Viterbi commit length")
     p.add_argument("--hess-tau", type=float, default=0.0,
                    help="shrink each expert's Hessians toward the layer's with this many tokens' weight (0: off)")
+    p.add_argument("--two-stream", action="store_true",
+                   help="keep the converted model's stream beside the original's (the MS method's section 6.3): read "
+                        "projections mapped toward the original inputs, output projections refit toward the original "
+                        "stream, every matrix coded on the converted model's inputs")
     p.add_argument("--hess-affinity", action="store_true",
                    help="weight each routed token in its expert's Hessians by its router score squared")
     args = p.parse_args()
     if args.reuse_layers and not args.reuse_from:
         p.error("--reuse-layers needs --reuse-from")
+    if args.two_stream and args.reuse_layers:
+        p.error("--reuse-layers advances one stream only: not with --two-stream")
 
     dev = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True  # Hessian sums: TF32 inputs, FP32 accumulation
@@ -226,11 +386,13 @@ def main() -> None:
     # a large calibration set's stream (tokens x hyper-connection streams x hidden, bf16) stays in host RAM
     host_h = cal_ids.numel() * cfg.hc_count * cfg.hidden_size * 2 > (4 << 30)
     h, kws = prelude(cfg, args.hf_dir, wmap, cal_ids, dev, bs, host=host_h)
+    hq = h.clone() if args.two_stream else None   # the converted model's stream
     state = out / "state.pt"
     start = 0
     if state.exists():
         st = torch.load(state, map_location="cpu" if host_h else dev, weights_only=True)
-        start, h = st["next_layer"], st["h"]
+        start, h, hq = st["next_layer"], st["h"], st.get("hq")
+        assert (hq is not None) == args.two_stream, "the state was written with another --two-stream setting"
         print(f"resuming at layer {start}", flush=True)
     lut = ms.build_1mad_lut(dev)
     last = nl - 1 if args.stop_after is None else args.stop_after
@@ -246,6 +408,32 @@ def main() -> None:
             del layer
             torch.save({"next_layer": l + 1, "h": h}, state)
             print(f"layer {l:2d}: records reused from {args.reuse_from}, forward {time.time() - t0:.0f}s", flush=True)
+            continue
+        if hq is not None:
+            from ms_flashnext_eval import load_ms_layer   # here: the eval module imports this one
+            mods = dict(layer.named_modules())
+
+            def code_spine(name, w, hh):
+                gguf = f"blk.{l}.{SPINE[name]}"
+                w, hh = to_gguf_order(gguf, w, hh)
+                rows, signs, _ = code(w.unsqueeze(0), hh.unsqueeze(0), args.spine_k, lut, [l * 4096 + 3000 + len(gguf)])[0]
+                write_record(out, gguf, args.spine_k, w.shape[1], w.shape[0], rows, signs)
+
+            def code_moe(xq):
+                with torch.no_grad():
+                    parts = [layer.mlp.gate(c)[1:] for c in xq.split(65536)]
+                    wts, idx = torch.cat([q[0] for q in parts]), torch.cat([q[1] for q in parts])
+                return code_experts(layer.mlp, xq, idx, plan[l], lut, l, out / "experts",
+                                    wts if args.hess_affinity else None, args.hess_tau)
+
+            x = torch.empty(cal_ids.numel(), cfg.hidden_size, dtype=torch.bfloat16, device=dev)
+            rec = two_stream_layer(layer, l, nl, h, hq, kws, bs, x, code_spine, code_moe,
+                                   lambda names, ex: load_ms_layer(layer, l, out, lut, dev, names, ex))
+            del layer, mods, x
+            torch.cuda.empty_cache()
+            torch.save({"next_layer": l + 1, "h": h, "hq": hq}, state)
+            print(f"layer {l:2d} {cfg.layer_types[l]:>17}: experts MS_C{plan[l]} (zero-token {rec['zero_token_experts']}) | "
+                  " ".join(f"{k} {v:.0f}s" for k, v in rec["times"].items()) + f" total {time.time() - t0:.0f}s", flush=True)
             continue
         hess, counts = {}, {}
         hooks = spine_hooks(layer, hess, counts)

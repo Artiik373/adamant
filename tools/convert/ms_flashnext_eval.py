@@ -94,11 +94,12 @@ def read_payload(path: Path, offset: int, nbytes: int, dev) -> torch.Tensor:
         return torch.frombuffer(bytearray(f.read(nbytes)), dtype=torch.uint8).to(dev)
 
 
-def load_ms_layer(layer, l: int, ms_dir: Path, lut, dev) -> None:
-    """Replace the layer's coded matrices with their decoded MS records (spine back from the GGUF order)."""
+def load_ms_layer(layer, l: int, ms_dir: Path, lut, dev, names=None, experts: bool = True) -> None:
+    """Replace the layer's coded matrices with their decoded MS records (spine back from the GGUF order).
+    names: only these spine modules (default all); experts: also the routed experts."""
     mods = dict(layer.named_modules())
     for hf_name, suffix in SPINE.items():
-        if hf_name not in mods:
+        if hf_name not in mods or (names is not None and hf_name not in names):
             continue
         rec = json.loads((ms_dir / f"blk.{l}.{suffix}.json").read_text())
         n_in, n_out = rec["shape"]
@@ -115,6 +116,8 @@ def load_ms_layer(layer, l: int, ms_dir: Path, lut, dev) -> None:
             hf[:, idx] = w
             w = hf
         mods[hf_name].weight.data.copy_(w.to(mods[hf_name].weight.dtype))
+    if not experts:
+        return
     ex = layer.mlp.experts
     rec = json.loads((ms_dir / "experts" / f"blk.{l}.experts.json").read_text())
     k = rec["k"]

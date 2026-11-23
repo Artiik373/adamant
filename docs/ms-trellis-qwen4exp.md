@@ -48,8 +48,8 @@ Hadamard of size `largest_pow2_divisor(n_in)`, at most 512. `n_in` must be a mul
 
 ## Converter Search
 
-Rows are coded after a random block Hadamard rotation with `d = gain_k * std(row) / 147.8` (`gain` 1.0 / 1.15 / 1.2 for
-`k` = 1 / 2 / >= 3). The Viterbi search runs over windows of 32 columns, commits the first 8, feeds their LDLQ error
+Rows are coded after a random block Hadamard rotation with `d = gain_k * std(row) / 147.8` (`gain` 1.0 / 1.15 / 1.2 / 1.2 / 1.3 / 1.2 for
+`k` = 1 / 2 / 3 / 4 / 5 / 6). The Viterbi search runs over windows of 32 columns, commits the first 8, feeds their LDLQ error
 forward (damping 1% of the mean Hessian diagonal) and slides on by 8. Branch costs are weighted by `1 / Hu[c, c]^2`.
 
 Qwen3-1.7B, decoder linears only, against BF16 (`smoke_kld_qwen3.py`, 64 calibration and 32 eval sequences of 512 tokens

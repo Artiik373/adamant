@@ -34,7 +34,7 @@ STATE_BITS = 14
 NUM_STATES = 1 << STATE_BITS
 STATE_MASK = NUM_STATES - 1
 CODEBOOK_STD = 147.8
-GAINS = {1: 1.0, 2: 1.15, 3: 1.2, 4: 1.2, 5: 1.2, 6: 1.2}
+GAINS = {1: 1.0, 2: 1.15, 3: 1.2, 4: 1.2, 5: 1.3, 6: 1.2}
 
 
 @dataclass
@@ -95,6 +95,23 @@ def best_sign_seed(w: torch.Tensor, block_size: int, seed: int, trials: int) -> 
         sd = seed + t
         wr = fwht_blocks(w * random_hadamard_signs(w.shape[1], sd, w.device).unsqueeze(0), block_size)
         m = (wr.pow(4).sum() / wr.pow(2).sum().pow(2)).item()
+        if best_m is None or m < best_m:
+            best, best_m = sd, m
+    return best
+
+
+def best_sign_seed_h(h: torch.Tensor, block_size: int, seed: int, trials: int) -> int:
+    """Of `trials` seeds (seed, seed + 1, ...), the one whose rotated Hessian has the smallest sum of LDLQ pivots
+    1 / Hu[c, c]^2 (tr D of H = L^T D L): the factor on the expected LDLQ error for a fixed per-column noise.
+    The pivots are those of a Cholesky of H in reverse order: one factorization, in float64 on the CPU."""
+    h = h.detach().to("cpu", torch.float64)
+    h = 0.5 * (h + h.T)
+    h = h + 0.01 * h.diagonal().mean() * torch.eye(h.shape[0], dtype=h.dtype)   # cholesky_inv_upper's damping
+    best, best_m = seed, None
+    for t in range(max(trials, 1)):
+        sd = seed + t
+        _, h_rot, _ = rotate_weight_and_hessian(h[:1], h, block_size, sd)
+        m = (torch.linalg.cholesky(h_rot.flip(0, 1)).diagonal() ** 2).sum().item()
         if best_m is None or m < best_m:
             best, best_m = sd, m
     return best

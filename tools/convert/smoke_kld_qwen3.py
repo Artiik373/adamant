@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import re
 import sys
 import time
 from pathlib import Path
@@ -131,7 +132,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="E2E BF16 -> MS_C{k} real-Hessian KLD smoke test")
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--calib", type=Path, required=True, help="Path to calib_2m.pt")
-    parser.add_argument("--k", type=int, default=4, choices=[2, 3, 4, 6])
+    parser.add_argument("--k", type=int, default=4, choices=[2, 3, 4, 5, 6])
     parser.add_argument("--calib-seqs", type=int, default=64, help="Number of 512-tok sequences for Hessian")
     parser.add_argument("--eval-seqs", type=int, default=8, help="Held-out 512-tok sequences for KLD")
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size for Hessian collection")
@@ -157,6 +158,14 @@ def main() -> None:
                         help="MoE: weight each routed token in its expert's Hessians by its router score squared")
     parser.add_argument("--sign-trials", type=int, default=1,
                         help="per matrix, keep the best of this many sign vectors (smallest rotated fourth moment)")
+    parser.add_argument("--gain", nargs="+", default=[], metavar="K=G",
+                        help="row-scale gains instead of ms.GAINS, e.g. 6=1.4")
+    parser.add_argument("--sign-crit", choices=["m4", "trd"], default="m4",
+                        help="--sign-trials criterion: m4, the rotated weights' fourth moment; trd, the rotated "
+                             "Hessian's sum of LDLQ pivots")
+    parser.add_argument("--seed", type=int, default=0, help="offset of every sign-rotation seed (repeat runs)")
+    parser.add_argument("--fisher-alpha", type=float, default=0.0,
+                        help="weight each calibration token's x x^T by (1 - sum_v p(v)^2)^alpha of the BF16 model (0: off)")
     parser.add_argument("--window", type=int, default=32, help="Viterbi search window (columns)")
     parser.add_argument("--commit", type=int, default=8, help="columns committed per window")
     parser.add_argument("--ls-scales", action="store_true",
@@ -165,6 +174,10 @@ def main() -> None:
                         help="after coding, train each coded row's scale (codes fixed: the format's fp16 row scale) on "
                         "KL(BF16 || quantized) over the calibration sequences for STEPS optimizer steps")
     parser.add_argument("--tune-lr", type=float, default=5e-4, help="Adam learning rate of the row-scale factors")
+    parser.add_argument("--tune-last", type=int, default=0, metavar="N",
+                        help="with --tune-scales: tune the last N layers only (and the head, the final norm); 0: all")
+    parser.add_argument("--tune-freeze-experts", action="store_true",
+                        help="with --tune-scales: keep the routed experts' row scales fixed")
     parser.add_argument("--tune-norms", action="store_true", help="with --tune-scales: train the RMSNorm weights too")
     parser.add_argument("--tune-cache", action="store_true",
                         help="with --tune-scales: distill from the calibration logits cached before quantizing "
@@ -202,6 +215,9 @@ def main() -> None:
         calib_all = torch.tensor(rows, dtype=torch.long)
         print(f"re-tokenized the pool: {calib_all.shape[0]} windows of {n_len}", flush=True)
     calib_ids, eval_ids = split_calib(calib_all, args.calib_seqs, args.eval_seqs)
+    for kg in args.gain:
+        k_, g_ = kg.split("=")
+        ms.GAINS[int(k_)] = float(g_)
 
     viterbi_cuda_fn = None
     if not args.fast_greedy and device.type == "cuda":
@@ -233,8 +249,10 @@ def main() -> None:
         k_use = 6 if name == "lm_head" else (args.spine_k or args.k)
         w_f32 = mod.weight.detach().to(device=device, dtype=torch.float32)
         blk = largest_pow2_divisor(int(w_f32.shape[1]), cap=512)
-        seed = (idx + 1) * 10007
-        if args.sign_trials > 1:
+        seed = (idx + 1) * 10007 + args.seed * 7919
+        if args.sign_trials > 1 and args.sign_crit == "trd":
+            seed = ms.best_sign_seed_h(h_f32 if h_f32.dim() == 2 else h_f32[0], blk, seed, args.sign_trials)
+        elif args.sign_trials > 1:
             seed = ms.best_sign_seed(w_target.float(), blk, seed, args.sign_trials)
 
         # h_f32 [in, in], or [groups, in, in] with one Hessian per contiguous block of output rows
@@ -314,9 +332,16 @@ def main() -> None:
     counts: dict[str, int] = {}
     hooks = []
 
+    ess = []   # --fisher-alpha: ESS/N of each batch's token weights
+    tok_w = [None]   # --fisher-alpha: this batch's token weights; None during the weight pass
+
     def make_hook(name: str):
         def hook(_mod, inp, _out):
+            if args.fisher_alpha and tok_w[0] is None:
+                return
             x = inp[0].detach().reshape(-1, inp[0].shape[-1]).to(torch.float32)
+            if args.fisher_alpha:
+                x = x * tok_w[0].sqrt()[:, None]
             h_batch = x.T @ x
             if name not in hessians:
                 hessians[name] = h_batch
@@ -347,9 +372,14 @@ def main() -> None:
     moe_blocks = [(n, m) for n, m in model.named_modules() if hasattr(m, "experts") and hasattr(m, "gate")
                   and hasattr(getattr(m, "experts"), "gate_up_proj")]
     moe_x: dict[str, list] = {n: [] for n, _ in moe_blocks}
+    moe_w: dict[str, list] = {n: [] for n, _ in moe_blocks}   # --fisher-alpha: the token weights of moe_x
 
     def make_moe_hook(name: str):
         def hook(_mod, inp, _out):
+            if args.fisher_alpha:
+                if tok_w[0] is None:
+                    return
+                moe_w[name].append(tok_w[0])
             moe_x[name].append(inp[0].detach().reshape(-1, inp[0].shape[-1]).to("cpu"))
         return hook
 
@@ -367,11 +397,20 @@ def main() -> None:
     print(f"Collecting Hessians across {args.calib_seqs} sequences (batch={args.batch_size})...", flush=True)
     for i in range(0, args.calib_seqs, args.batch_size):
         inp = calib_ids[i : i + args.batch_size].to(device=device, dtype=torch.long)
+        if args.fisher_alpha:   # tr of the softmax Fisher per token: how much a logit change moves the KL
+            tok_w[0] = None
+            p = model(input_ids=inp).logits.float().softmax(-1)
+            w = (1 - (p * p).sum(-1)).clamp(0.05, 1).reshape(-1) ** args.fisher_alpha
+            tok_w[0] = w / w.mean()
+            ess.append(float(w.sum() ** 2 / (w.numel() * (w * w).sum())))
+            del p
         model(input_ids=inp)
     for h in hooks:
         h.remove()
     torch.cuda.synchronize()
     print(f"Hessians collected in {time.time() - t0:.1f}s.", flush=True)
+    if ess:
+        print(f"Fisher token weights: ESS/N {sum(ess) / len(ess):.3f}", flush=True)
 
     print(f"Quantizing {len(target_linears)} linear layers to MS_C{args.k} ({mode_str})...", flush=True)
     for idx, (name, mod) in enumerate(target_linears):
@@ -383,6 +422,7 @@ def main() -> None:
         from ms_flashnext_convert import code, expert_hessians
         for li, (name, blk) in enumerate(moe_blocks):
             x = torch.cat(moe_x.pop(name)).to(device)
+            tw = torch.cat(moe_w.pop(name)).to(device) if args.fisher_alpha else None
             _, wts, idx = blk.gate(x)
             ex = blk.experts
             h_all = x_ref = None
@@ -394,12 +434,12 @@ def main() -> None:
             for e0 in range(0, ex.gate_up_proj.shape[0], 16):
                 es = list(range(e0, min(e0 + 16, ex.gate_up_proj.shape[0])))
                 hs = [expert_hessians(x, idx, e, ex.gate_up_proj[e].float(), wts if args.hess_affinity else None,
-                                      args.hess_tau, h_all, x_ref) for e in es]
+                                      args.hess_tau, h_all, x_ref, tw) for e in es]
                 zero += sum(1 for h in hs if h[2] == 0)
                 gu = code(ex.gate_up_proj[es].float(), torch.stack([h[0] for h in hs]), args.k, lut,
-                          [li * 4096 + 2 * e + 1 for e in es])
+                          [li * 4096 + 2 * e + 1 + args.seed * 7919 for e in es])
                 dn = code(ex.down_proj[es].float(), torch.stack([h[1] for h in hs]), args.k, lut,
-                          [li * 4096 + 2 * e + 2 for e in es])
+                          [li * 4096 + 2 * e + 2 + args.seed * 7919 for e in es])
                 for i, e in enumerate(es):
                     ex.gate_up_proj.data[e].copy_(gu[i][2].to(ex.gate_up_proj.dtype))
                     ex.down_proj.data[e].copy_(dn[i][2].to(ex.down_proj.dtype))
@@ -444,12 +484,19 @@ def tune_scales(model, teacher, target_linears, calib_ids, device, args) -> None
     import torch.nn.utils.parametrize as P
 
     model.requires_grad_(False)
+    nl = model.config.num_hidden_layers
+
+    def tuned(name: str) -> bool:   # --tune-last N: layers below nl - N stay; the head and the final norm are tuned
+        m = re.search(r"layers\.(\d+)\.", name)
+        return not args.tune_last or m is None or int(m.group(1)) >= nl - args.tune_last
+
+    target_linears = [(n, m) for n, m in target_linears if tuned(n)]
     params = []
     for _name, mod in target_linears:
         P.register_parametrization(mod, "weight", _RowScale(mod.weight.shape[0], device))
         params.append(mod.parametrizations.weight[0].alpha)
-    fused = [m for m in model.modules() if hasattr(m, "gate_up_proj") and hasattr(m, "down_proj")
-             and isinstance(getattr(m, "gate_up_proj"), nn.Parameter)]
+    fused = [m for n, m in model.named_modules() if hasattr(m, "gate_up_proj") and hasattr(m, "down_proj")
+             and isinstance(getattr(m, "gate_up_proj"), nn.Parameter) and tuned(n) and not args.tune_freeze_experts]
     for m in fused:   # each expert's rows: the format's row scales, applied to its output channels while training
         m.ms_a_gu = nn.Parameter(torch.ones(m.gate_up_proj.shape[:2], device=device))
         m.ms_a_d = nn.Parameter(torch.ones(m.down_proj.shape[:2], device=device))
@@ -458,7 +505,7 @@ def tune_scales(model, teacher, target_linears, calib_ids, device, args) -> None
     norm_params = []
     if args.tune_norms:
         for name, mod in model.named_modules():
-            if "norm" in type(mod).__name__.lower() and getattr(mod, "weight", None) is not None:
+            if "norm" in type(mod).__name__.lower() and getattr(mod, "weight", None) is not None and tuned(name):
                 mod.weight.requires_grad_(True)
                 norm_params.append(mod.weight)
     groups = [{"params": params, "lr": args.tune_lr}]
@@ -583,6 +630,7 @@ def report(label: str, ref_logits: torch.Tensor, cand_logits: torch.Tensor, t0: 
         f"Tokens:         {metrics['tokens']}\n"
         f"Mean KLD:       {metrics['mean_kld']:.5f}\n"
         f"Max KLD:        {metrics['max_kld']:.5f}\n"
+        f"Median / p99:   {metrics['median_kld']:.5f} / {metrics['p99_kld']:.5f}, worst 0.1% share {metrics['top01_share']:.3f}\n"
         f"Top-1 Match:    {metrics['top1_agreement'] * 100:.2f}%\n"
         f"Elapsed:        {time.time() - t0:.1f}s"
     )

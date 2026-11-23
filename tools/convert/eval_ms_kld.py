@@ -39,6 +39,7 @@ def compute_kld_metrics(ref_logits: torch.Tensor, cand_logits: torch.Tensor, chu
     kld_sum = 0.0
     kld_max = 0.0
     top1_match = 0
+    toks = []
 
     for start in range(0, n_tok, chunk_tokens):
         end = min(start + chunk_tokens, n_tok)
@@ -50,15 +51,21 @@ def compute_kld_metrics(ref_logits: torch.Tensor, cand_logits: torch.Tensor, chu
         p = log_p.exp()
 
         tok_kld = (p * (log_p - log_q)).sum(dim=-1)
+        toks.append(tok_kld)
         kld_sum += float(tok_kld.sum().item())
         kld_max = max(kld_max, float(tok_kld.max().item()))
         top1_match += int((r.argmax(dim=-1) == c.argmax(dim=-1)).sum().item())
 
+    t = torch.cat(toks).double()
     return {
         "tokens": n_tok,
         "mean_kld": kld_sum / max(n_tok, 1),
         "max_kld": kld_max,
         "top1_agreement": top1_match / max(n_tok, 1),
+        "median_kld": float(t.median()),
+        "p99_kld": float(t.quantile(0.99)),
+        # share of the summed KLD from the worst 0.1% of tokens: a few outliers or a broad loss
+        "top01_share": float(t.sort(descending=True).values[: max(1, n_tok // 1000)].sum() / t.sum().clamp(min=1e-20)),
     }
 
 
