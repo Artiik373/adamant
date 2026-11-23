@@ -51,6 +51,10 @@ Hadamard of size `largest_pow2_divisor(n_in)`, at most 512. `n_in` must be a mul
 Rows are coded after a random block Hadamard rotation with `d = gain_k * std(row) / 147.8` (`gain` 1.0 / 1.15 / 1.2 / 1.2 / 1.3 / 1.2 for
 `k` = 1 / 2 / 3 / 4 / 5 / 6). The Viterbi search runs over windows of 32 columns, commits the first 8, feeds their LDLQ error
 forward (damping 1% of the mean Hessian diagonal) and slides on by 8. Branch costs are weighted by `1 / Hu[c, c]^2`.
+The Qwen3.8-Flash-Next converter (`ms_flashnext_convert.py`) uses windows of 48 committing 12 (`--window`, `--commit`),
+and afterwards refits each row's fp16 `d` for its fixed codes in closed form, `d = (c H w^T) / (c H c^T)`, kept only where it
+lowers the H-weighted error. On the 8 busiest experts of layers 0 and 24 the proxy error tr(E H E^T) / tr(W H W^T) is 2.5 to 4%
+below 32 / 8 at the same search time, and the refit takes 0.1 to 0.7% more.
 
 Qwen3-1.7B, decoder linears only, against BF16 (`smoke_kld_qwen3.py`, 64 calibration and 32 eval sequences of 512 tokens
 spread over all four calibration pools, RTX 3090 at 350 W):
