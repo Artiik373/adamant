@@ -9,7 +9,11 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-import torch
+
+try:
+    import torch
+except ImportError:
+    raise unittest.SkipTest("needs torch")
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))

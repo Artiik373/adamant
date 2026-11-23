@@ -47,13 +47,13 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile") o.expert_profile = next();
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next().c_str());
         else {
-            std::fprintf(stderr, "hy4_generate: unknown argument %s\n", a.c_str());
+            basalt::log::error("hy4_generate", "unknown argument %s", a.c_str());
             return 2;
         }
     }
     if (model.empty() || tokens.empty()) {
-        std::fprintf(stderr, "usage: hy4_generate --model PACK --tokens ids [--max-new N] [--ctx N] [--trunk q8_0|q6_k] "
-                             "[--no-dfly] [--dfly-min P] [--suffix-draft N] [--dump DIR]\n");
+        basalt::log::error("hy4_generate", "usage: hy4_generate --model PACK --tokens ids [--max-new N] [--ctx N] "
+                                           "[--trunk q8_0|q6_k] [--no-dfly] [--dfly-min P] [--suffix-draft N] [--dump DIR]");
         return 2;
     }
     o.trunk_type = trunk == "q6_k" ? 14 : 8;
@@ -61,7 +61,7 @@ int main(int argc, char** argv) {
     std::stringstream ss(tokens);
     for (std::string t; std::getline(ss, t, ',');) ids.push_back(std::atoi(t.c_str()));
     if (ids.empty()) {
-        std::fprintf(stderr, "hy4_generate: no prompt tokens\n");
+        basalt::log::error("hy4_generate", "no prompt tokens");
         return 2;
     }
     // the diagnostics compare one position per step

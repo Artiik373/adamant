@@ -161,7 +161,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        model: [qwen4exp, deepseek41, qwen35, hy4flash, inkling2]
+        model: [qwen4exp, hy4flash, hy4, inkling2]
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
@@ -185,7 +185,7 @@ jobs:
           -DWERROR=ON
           -DBUILD_TESTING=ON
           -DBASALT_MODELS=${{ matrix.model }}
-          -DCMAKE_CUDA_ARCHITECTURES=120
+          -DCMAKE_CUDA_ARCHITECTURES=86
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache

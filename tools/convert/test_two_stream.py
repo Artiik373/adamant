@@ -1,7 +1,10 @@
 """The two-stream conversion's closed forms in ms_flashnext_convert against their objectives."""
 import unittest
 
-import torch
+try:
+    import torch
+except ImportError:
+    raise unittest.SkipTest("needs torch")
 
 from ms_flashnext_convert import inject, input_map, ridge_refit, stream_target
 
