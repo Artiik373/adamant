@@ -53,6 +53,9 @@ JOYAI_PATTERNS = [
 ]
 # `hy_v4` (Hy4-flash) is the same three regexes (LLAMA_VOCAB_PRE_TYPE_HY_V4 shares the JOYAI_LLM case).
 PRE_PATTERNS = {"joyai-llm": JOYAI_PATTERNS, "hy_v4": JOYAI_PATTERNS, "hy4": JOYAI_PATTERNS}
+PRE_SOURCES = {"joyai-llm": "JOYAI_LLM", "hy_v4": "HY_V4", "hy4": "HY_V4"}
+# pre-tokenizers whose checkpoint sets Hugging Face BPE's ignore_merges: a piece that is a vocabulary entry is that token
+IGNORE_MERGES = set()
 
 
 class Tokenizer:
@@ -76,6 +79,7 @@ class Tokenizer:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
         self._res = [regex.compile(p) for p in PRE_PATTERNS.get(pre, [QWEN35_PATTERN])]
+        self.ignore_merges = pre in IGNORE_MERGES
 
         # Literals matched directly instead of through BPE (GGUF token types):
         #   * type 4 (USER_DEFINED: `<think>`, `<tool_call>`, ...) always matches, with or without parse_special;
@@ -205,7 +209,10 @@ class Tokenizer:
             if got is None:
                 mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
                 got = []
-                for tok in self._bpe(mapped):
+                whole = self.ids.get(mapped) if self.ignore_merges else None
+                if whole is not None and mapped not in self.special_tokens:
+                    got.append(whole)
+                for tok in self._bpe(mapped) if not got else ():
                     i = self.ids.get(tok)
                     if i is None:
                         raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
@@ -290,7 +297,7 @@ def extract_metadata(md: dict, out_dir) -> dict:
     if tk.pre in PRE_PATTERNS:
         cfg["pre_patterns"] = PRE_PATTERNS[tk.pre]
         cfg["pre_pattern_source"] = ("llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_%s), applied in order"
-                                     % {"hy_v4": "HY_V4"}.get(tk.pre, "JOYAI_LLM"))
+                                     % PRE_SOURCES[tk.pre])
     else:
         cfg["pre_pattern"] = QWEN35_PATTERN
         cfg["pre_pattern_source"] = "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_QWEN35)"

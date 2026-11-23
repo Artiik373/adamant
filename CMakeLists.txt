@@ -132,7 +132,7 @@ target_link_libraries(artifact INTERFACE platform warnings)
 # `model` is the registry and the adapter interface (shared code may use it). Each model is its own library under
 # src/models/<arch>/; `models` is the composition root that registers them. tools/check_model_layering.sh keeps
 # shared code from including src/models and models from including each other.
-add_library(model STATIC src/model/registry.cpp src/model/rope_flags.cpp src/model/start.cpp)
+add_library(model STATIC src/model/registry.cpp src/model/rope_flags.cpp src/model/route_flags.cpp src/model/start.cpp src/model/batch_check.cpp)
 target_compile_definitions(model PRIVATE BASALT_KNOWN_MODELS="${_basalt_known}" BASALT_BUILT_MODELS="${_basalt_built}")
 target_include_directories(model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(model PUBLIC artifact warnings)
@@ -158,7 +158,6 @@ add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwe
   src/models/qwen4exp/load/prefill.cpp
   src/models/qwen4exp/load/decode.cpp
   src/models/qwen4exp/serve/batch.cpp
-  src/models/qwen4exp/serve/batch_pipeline.cpp
   src/models/qwen4exp/serve/qfn_commands.cpp
   src/models/qwen4exp/serve/qfn_restore.cpp
   src/models/qwen4exp/serve/qfn_image.cpp
@@ -174,6 +173,7 @@ add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwe
   src/models/qwen4exp/serve/prompt_split.cpp
   src/models/qwen4exp/serve/prompt_windows.cpp
   src/models/qwen4exp/serve/qfn_decode.cpp
+  src/models/qwen4exp/serve/slot_session.cpp
   src/models/qwen4exp/serve/slots.cpp
   src/models/qwen4exp/serve/tier_profile.cpp
   src/models/qwen4exp/serve/tiers.cpp
@@ -188,6 +188,13 @@ add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwe
 target_include_directories(model_qwen4exp PRIVATE ${_gpu_include_directories})
 target_include_directories(model_qwen4exp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
 target_link_libraries(model_qwen4exp PUBLIC model tokenizer serve_shared model_qwen4exp_engine engine_session grammar model_qwen4exp_prefill spec ${_gpu_runtime_target})
+if(BUILD_TESTING)
+  # which --kv formats run with batch slots, and the refusal for the rest (host only)
+  add_executable(qwen4exp_kv_batch_test tests/models/qwen4exp/cli/kv_batch_test.cpp)
+  target_include_directories(qwen4exp_kv_batch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(qwen4exp_kv_batch_test PRIVATE warnings)
+  basalt_cpu_test(NAME qwen4exp_kv_batch_test COMMAND qwen4exp_kv_batch_test)
+endif()
 endif()
 
 if(BASALT_MODEL_HY4FLASH)
@@ -348,6 +355,11 @@ if(BUILD_TESTING)
   target_link_libraries(adapter_registry_test PRIVATE model)
   basalt_embed_manifest(adapter_registry_test)
   basalt_cpu_test(NAME adapter_registry_test COMMAND adapter_registry_test)
+  # several sessions' windows as one window of segments, and the composition graphs' eviction (header-only, CPU)
+  add_executable(batch_window_test tests/model/batch_window_test.cpp)
+  target_include_directories(batch_window_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_gpu_include_directories})
+  target_link_libraries(batch_window_test PRIVATE warnings)
+  basalt_cpu_test(NAME batch_window_test COMMAND batch_window_test)
   # the real adapters, through the program's registration (needs the CUDA runtime, not a GPU's work)
   add_executable(adapter_builtin_test tests/model/adapter_builtin_test.cpp)
   target_link_libraries(adapter_builtin_test PRIVATE models)
@@ -430,6 +442,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/elementwise.cu
                         src/kernels/cuda/bf16_gemv.cu
                         src/kernels/cuda/native_mmvq.cu
+                        src/kernels/cuda/q80_screen.cu
                         src/kernels/cuda/native_bf16.cu
                         src/kernels/cuda/dequant_bf16.cu
                         src/kernels/cuda/wait_abort.cu
@@ -446,6 +459,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/mhc.cu
                         src/kernels/cuda/mhc_plain.cu
                         src/kernels/cuda/router.cu
+                        src/kernels/cuda/route_tail_skip.cu
                         src/kernels/cuda/row_norm.cu
                         src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact kernels_cpu)
@@ -470,6 +484,7 @@ endif()
 endif()
 # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
 set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/native_bf16.cu
+    src/kernels/cuda/q80_screen.cu
     src/models/qwen4exp/kernels/native_gr_norm.cu
     src/models/qwen4exp/kernels/native_moe.cu
     src/models/qwen4exp/kernels/native_gdn.cu
@@ -638,6 +653,7 @@ endif()
 # The prompt path: batched prompt processing (tensor-core GEMMs through cuBLAS).
 
 add_library(serve_shared STATIC src/program/serve/commands.cpp
+            src/program/serve/batch_round.cpp
             src/program/probe_rates.cpp
             src/program/serve/protocol.cpp
             src/program/serve/runtime.cpp
@@ -682,7 +698,7 @@ add_library(engine_session STATIC src/program/engine_session.cpp src/program/loa
             src/program/gpu_select.cpp src/program/multi_gpu_plan.cpp src/program/image_loan.cpp)
 target_include_directories(engine_session PUBLIC include)
 find_package(Threads REQUIRED)
-target_link_libraries(engine_session PUBLIC platform Threads::Threads)
+target_link_libraries(engine_session PUBLIC platform kernels_cpu Threads::Threads)   # the pool's sizing rule (auto_pool_workers)
 # the GBNF grammar engine and the JSON-schema and tool-call grammar builders (CPU only, no engine dependency)
 add_library(grammar STATIC src/program/grammar/grammar.cpp src/program/grammar/schema.cpp src/program/grammar/json_schema.cpp
             src/program/grammar/schema_convert.cpp src/program/grammar/guard.cpp)
@@ -732,6 +748,7 @@ if(BUILD_TESTING)
   add_executable(vision_resize_test tests/vision/preprocess_test.cpp)
   target_link_libraries(vision_resize_test PRIVATE vision_core warnings)
   basalt_cpu_test(NAME vision_resize_test COMMAND vision_resize_test)
+  basalt_gpu_test(NAME cls_encoder_parity COMMAND cls_encoder_parity)
   # FFmpeg found at run time, or the reason it is not (any machine: CI has no FFmpeg)
   add_executable(ffmpeg_load_test tests/vision/ffmpeg_load_test.cpp)
   target_link_libraries(ffmpeg_load_test PRIVATE vision_core warnings)
@@ -757,6 +774,8 @@ if(BUILD_TESTING)
   endif()
 endif()
 add_dependencies(basalt-bench basalt basalt-device git_stamp)
+add_dependencies(serve_shared git_stamp)   # the engine's INFO commit=
+target_include_directories(serve_shared PRIVATE ${CMAKE_BINARY_DIR}/stamp)
 target_include_directories(basalt-bench PRIVATE ${CMAKE_BINARY_DIR}/stamp)
 target_link_libraries(basalt-bench PRIVATE engine_session platform warnings ${CMAKE_DL_LIBS})
 basalt_embed_manifest(basalt-bench)
@@ -810,6 +829,13 @@ if(BASALT_GRAMMAR_MODEL AND Python3_Interpreter_FOUND)
   set_tests_properties(grammar_batch_test PROPERTIES TIMEOUT 1500)
 endif()
 
+# the route tail skip against a plain CPU rule: which entries it drops over random windows, tables and ranks at each MoE
+# model's geometry (GPU, synthetic, no model; --bench times the window kernel)
+add_executable(route_tail_skip_parity tests/kernels/route_tail_skip_parity.cpp)
+target_include_directories(route_tail_skip_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(route_tail_skip_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME route_tail_skip_parity COMMAND route_tail_skip_parity)
+set_tests_properties(route_tail_skip_parity PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(dense_window_bench tests/kernels/dense_window_bench.cpp)
 target_link_libraries(dense_window_bench PRIVATE kernels mmq ${_gpu_runtime_target})
 add_executable(dense_ops_parity tests/kernels/dense_ops_parity.cpp)
@@ -939,6 +965,12 @@ add_executable(mmvq_multi_parity tests/kernels/mmvq_multi_parity.cpp)
 target_include_directories(mmvq_multi_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(mmvq_multi_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME mmvq_multi_parity COMMAND mmvq_multi_parity)
+# the draft head screen (q80_screen) against native_mmvq's one-column logits and their argmax, and against a CPU reference
+# (synthetic at the real width, GPU, no model; --bench adds the microbench)
+add_executable(q80_screen_parity tests/kernels/q80_screen_parity.cpp)
+target_include_directories(q80_screen_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(q80_screen_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME q80_screen_parity COMMAND q80_screen_parity)
 if(BASALT_MODEL_QWEN4EXP)
 # the decode GDN block against the per-stage verify kernels, bitwise (synthetic, GPU, no model; --bench)
 add_executable(dec_gdn_parity tests/models/qwen4exp/kernels/dec_gdn_parity.cpp)
@@ -960,13 +992,6 @@ target_include_directories(dm_table_put_parity PRIVATE ${_gpu_include_directorie
 target_link_libraries(dm_table_put_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME dm_table_put_parity COMMAND dm_table_put_parity)
 set_tests_properties(dm_table_put_parity PROPERTIES SKIP_RETURN_CODE 77)
-# the route tail skip against a plain CPU rule: which entries it drops over random windows, tables and ranks (GPU, synthetic,
-# no model; --bench times the window kernel)
-add_executable(route_tail_skip_parity tests/models/qwen4exp/kernels/route_tail_skip_parity.cpp)
-target_include_directories(route_tail_skip_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(route_tail_skip_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
-basalt_gpu_test(NAME route_tail_skip_parity COMMAND route_tail_skip_parity)
-set_tests_properties(route_tail_skip_parity PROPERTIES SKIP_RETURN_CODE 77)
 # the residency-biased router against native_router (lambda 0, bitwise) and a double-precision CPU rule (GPU, synthetic,
 # no model; --bench times it beside the native router)
 add_executable(route_prior_parity tests/models/qwen4exp/kernels/route_prior_parity.cpp)
@@ -1406,6 +1431,13 @@ target_link_libraries(reply_rows_test PRIVATE warnings)
 basalt_embed_manifest(reply_rows_test)
 basalt_cpu_test(NAME reply_rows_test COMMAND reply_rows_test)
 set_tests_properties(reply_rows_test PROPERTIES TIMEOUT 60)
+# the console's per-slot counts and the expert map's sample (CPU only)
+add_executable(console_stats_test tests/program/console_stats_test.cpp)
+target_include_directories(console_stats_test PRIVATE src/program/serve include)
+target_link_libraries(console_stats_test PRIVATE warnings)
+basalt_embed_manifest(console_stats_test)
+basalt_cpu_test(NAME console_stats_test COMMAND console_stats_test)
+set_tests_properties(console_stats_test PROPERTIES TIMEOUT 60)
 # a sent pick's log probability and the row's likeliest tokens (CPU only)
 add_executable(logprobs_test tests/program/logprobs_test.cpp)
 target_include_directories(logprobs_test PRIVATE src/program/serve include)
@@ -1547,6 +1579,10 @@ if(BUILD_TESTING)
   add_executable(bf16_bits_test tests/kernels/bf16_bits_test.cpp)
   target_include_directories(bf16_bits_test PRIVATE include)
   basalt_cpu_test(NAME bf16_bits_test COMMAND bf16_bits_test)
+  # the tail skip's rule (rank, residency, drop) against hand-made and random windows (header-only, CPU)
+  add_executable(route_lossy_test tests/kernels/route_lossy_test.cpp)
+  target_include_directories(route_lossy_test PRIVATE include)
+  basalt_cpu_test(NAME route_lossy_test COMMAND route_lossy_test)
 endif()
 
 add_library(kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
@@ -1591,7 +1627,10 @@ foreach(_isa avx2 avx512)
   add_library(ggml_dots_${_isa} OBJECT src/kernels/cpu/ggml/ggml_cpu_dots.c)
   target_include_directories(ggml_dots_${_isa} PRIVATE include src/kernels/cpu/ggml)
   target_compile_options(ggml_dots_${_isa} PRIVATE ${_ggml_dots_${_isa}_flags})
-  target_compile_definitions(ggml_dots_${_isa} PRIVATE ggml_get_type_traits_cpu=ggml_get_type_traits_cpu_${_isa})
+  target_compile_definitions(ggml_dots_${_isa} PRIVATE ggml_get_type_traits_cpu=ggml_get_type_traits_cpu_${_isa}
+                             ggml_vec_dot_mxfp8_q8_0_scalar=ggml_vec_dot_mxfp8_q8_0_scalar_${_isa}
+                             ggml_mxfp8_q8_0_prep=ggml_mxfp8_q8_0_prep_${_isa}
+                             ggml_mxfp8_q8_0_rows=ggml_mxfp8_q8_0_rows_${_isa})
   set_target_properties(ggml_dots_${_isa} PROPERTIES C_STANDARD 11 C_EXTENSIONS ON POSITION_INDEPENDENT_CODE ON)
 endforeach()
 # part of kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
@@ -1873,6 +1912,12 @@ if(BUILD_TESTING)
   target_link_libraries(nvfp4_cpu_rows_test PRIVATE kernels_cpu)
   basalt_cpu_test(NAME nvfp4_cpu_rows_test COMMAND nvfp4_cpu_rows_test)
   set_tests_properties(nvfp4_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;avx2")
+
+  # the MXFP8 CPU dot on each instruction set, bit for bit against the scalar row (the AVX-512 rows run where the host has them)
+  add_executable(mxfp8_cpu_rows_test tests/kernels/cpu/mxfp8_cpu_rows_test.cpp)
+  target_link_libraries(mxfp8_cpu_rows_test PRIVATE kernels_cpu)
+  basalt_cpu_test(NAME mxfp8_cpu_rows_test COMMAND mxfp8_cpu_rows_test)
+  set_tests_properties(mxfp8_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;avx2")
 
   # Both tests run on a synthetic expert fixture by default; --file experts.bin (the pack's experts section) checks real blobs.
 

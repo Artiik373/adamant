@@ -4,6 +4,11 @@
 
 namespace basalt::models::qwen4exp::serve {
 
+namespace {
+// The ring depth of a read laid out for an idle card: deeper than any chunk needs, so the layout takes its own.
+constexpr int kFullRing = 1 << 20;
+}  // namespace
+
 int64_t QfnRuntime::part_slots(const PfPart& p, int64_t c) {
     return serve_loans::cache_slots_for(*p.cache, basalt::prefill::Prefill::bytes_needed(g, *p.ses, c));
 }
@@ -122,11 +127,15 @@ bool QfnRequest::refill(std::string& e) {
 // participant's own cache, and marking only that participant's own layers
 // `chunk` > 0: that chunk (a split read's), its first one `head` tokens (0: none)
 bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t head) {
+    // whether the slots decode while this part is read: it decides the layout, and read_part() reads the part alone
+    // when it is false
+    // --read-beside: a short read beside a decoding slot takes the beside path too
+    beside_ = runtime_.batch_on() && (tokens > runtime_.kReadAlone || resumed_chunk > 0 || runtime_.o.read_beside);
     if (runtime_.pf_parts.empty()) return true;                     // its own buffers: nothing to lend
-    // --read-beside: a short read beside a decoding slot takes the beside path too (read_part's decision), so its
-    // chunks follow the same rule
-    const bool beside = runtime_.batch_on() &&
-                        (tokens > runtime_.kReadAlone || resumed_chunk > 0 || runtime_.o.read_beside);
+    // the ring depth this read's layout uses; every size computed below (and the layout) follows it, and
+    // the full depth is restored on the way out for the sizing done elsewhere
+    basalt::prefill::Prefill::set_ring_depth(beside_ ? runtime_.kRingDecoding : kFullRing);
+    struct RingReset { ~RingReset() { basalt::prefill::Prefill::set_ring_depth(kFullRing); } } ring_reset;
     // what this segment needs, capped by the configured chunk: a request lends only what its own
     // prompt needs, so a large chunk costs a short prompt nothing
     // A bare `auto` reads a prompt in equal chunks of at most this many tokens: past a few thousand tokens
@@ -140,25 +149,30 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
     // from the file, while the slots decode).  A read that runs alone, on an idle engine or while the slots wait
     // for it, lends as an idle engine does and may refill lent slots from the file: a chunk cut to the RAM copies
     // (few when RAM is short or the KV has taken the cache's tail) would stream the experts again every few
-    // hundred tokens, and the waiting slots would wait for all of it.  The chunk shrinks to the loan, but not
-    // below the smallest chunk the prompt path runs.
+    // hundred tokens, and the waiting slots would wait for all of it.  A loan under kBesideChunkFloor is not worth
+    // sharing the card for: the part reads alone, below.
     int64_t loan_lim = std::numeric_limits<int64_t>::max();
-    if (beside) {
+    if (beside_) {
         loan_lim = runtime_.kLendCapDecoding;
         // the RAM-backed slots are the cache's last ones: those still live after the KV took its share
         if (runtime_.src.complement_ready())
             loan_lim = std::max<int64_t>(0, runtime_.src.resident_lent_slots() -
                                                 (runtime_.xcache.full_slots() - runtime_.xcache.slots()));
-        else if (beside)
-            loan_lim = runtime_.kLendCapDecoding;
     }
     if (loan_lim != std::numeric_limits<int64_t>::max() && !runtime_.pf_parts.empty() && runtime_.pf_parts[0].first >= 0) {
-        const int64_t lc = std::max<int64_t>(256, engine_local::biggest_chunk(cap, [&](int64_t t) {
-            return runtime_.part_slots(runtime_.pf_parts[0], t) <= loan_lim;
-        }));
-        cap = std::min(cap, lc);
+        // the loan must hold a chunk worth sharing the card: one under the floor streams a chunk's experts again for
+        // fewer tokens than the slots' windows cost, so the part reads alone then, in the full ring, and they wait
+        beside_ = runtime_.part_slots(runtime_.pf_parts[0], runtime_.kBesideChunkFloor) <= loan_lim;
+        if (beside_) {
+            const int64_t lc = std::max<int64_t>(256, engine_local::biggest_chunk(cap, [&](int64_t t) {
+                return runtime_.part_slots(runtime_.pf_parts[0], t) <= loan_lim;
+            }));
+            cap = std::min(cap, lc);
+        } else {
+            basalt::prefill::Prefill::set_ring_depth(kFullRing);
+        }
     }
-    auto [want_full, head_tok] = serve_loans::one_card_chunks(tokens, cap, !beside && runtime_.stages.empty(),
+    auto [want_full, head_tok] = serve_loans::one_card_chunks(tokens, cap, !beside_ && runtime_.stages.empty(),
                                                            runtime_.o.prefill_auto_fit);
     // a chunk the read must have: a split read's, or the one the read this continues had (if it fits)
     const int64_t fixed_chunk = chunk > 0 ? chunk : (resumed_chunk > 0 && resumed_chunk <= cap) ? resumed_chunk : 0;
@@ -197,7 +211,7 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
             if (!refill_one(p, e)) return false;
         }
         const basalt::core::OnDevice on(p.dev);
-        if (beside && &p == &runtime_.pf_parts[0] && p.lent.empty()) {
+        if (beside_ && &p == &runtime_.pf_parts[0] && p.lent.empty()) {
             if (runtime_.ba_job) { runtime_.ba_thr.join(); runtime_.ba_job = false; }   // no adaptive copy lands in a slot it moves
             if (!runtime_.xq_drain()) { e = "an adaptive refill failed"; return false; }
             if (!runtime_.move_routed_below(first, "prompt loan", e, &again)) return false;

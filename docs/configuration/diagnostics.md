@@ -10,7 +10,7 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--tokens`, `--tokens-file` | CLI | required | The prompt as token ids. |
 | `--max-new` | CLI | 16 | Tokens to generate. |
 | `--greedy` | CLI | on | Argmax decoding. |
-| `--seed` | CLI | | Sample with this seed under `--top-k` 20, `--top-p` 0.95, `--temperature` 1.0. |
+| `--seed` | CLI | | Sample with this seed under `--top-k` 20, `--top-p` 0.95, `--temperature` 1.0; the same seed gives the same text on every model, and `--temperature 0` stays greedy. |
 | `--stop-eos` | CLI | off | Stop at an end-of-turn token. |
 | `--eos-ids` | engine | the pack's | The end-of-turn tokens. |
 | `--gpu-plan` | engine | | Print the `--gpu` choice as JSON and exit. |
@@ -40,6 +40,7 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--spec-oracle FILE` | CLI | With `--spec N` on a pack without a drafter: draft from an expected continuation. The verify exactness test. |
 | `--prefill-until P` | CLI | Batch the first P prompt positions; run the rest teacher-forced. |
 | `--spec-corrupt N` | CLI | Replace every Nth draft with a wrong token, to test rejection. |
+| `--diag-batch-check` | CLI | With `--batch N` (2 or more) and a prompt: every session's windows alone against the same windows batched, bitwise ([batched decoding](../design/batching.md)). |
 | `--diag-teacher` | CLI | With `--spec-oracle`: teacher-forces the file's tokens and counts differing picks. |
 | `--diag-tier-frozen` | CLI, serve | Fixed placement: the VRAM tier keeps what it holds, with no copies or promotion. |
 | `--diag-drafter-gpu DEV` | CLI, serve | The card the drafter runs on. |
@@ -94,7 +95,6 @@ build runs on it), `--link-rates` (one `pcie_h2d BUS_ID GB_PER_S` line per GPU, 
 `--exp NAME=VALUE[,...]` sets experiment switches. They carry no stability promise and go away with their experiment.
 
 - `concur9_logit_hash=1`: print a hash of each accepted row's head logits on stderr.
-- `concur5_digest=1`: batch slots print a state digest per window.
 - `spec_log=1`: with `--draft-log`, also write each row's target distribution.
 - `expert_trace=N`: with `--draft-log FILE`, write `FILE.trace` for the first N windows: each layer's experts, tiers and FFN input rows, after the 4-bit router tables. The layout is in `decode/verify/execution.cpp`.
 - `host_ev=1`: print GPU time per window's verify, commit and draft, and the idle gap.

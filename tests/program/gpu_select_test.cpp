@@ -115,6 +115,10 @@ int main() {
         CHECK_STR(gpu_plan_json(v, pick("1,0", v)),
                   "{\"devices\":\"1,0\",\"cards\":[{\"visible\":1,\"token\":\"1\",\"smi\":1,\"name\":\"small\"},"
                   "{\"visible\":0,\"token\":\"0\",\"smi\":0,\"name\":\"fast\"}],\"notes\":[],\"warning\":\"\",\"error\":\"\"}");
+        CHECK_STR(gpu_plan_json({}, GpuChoice{}, "qwen4exp", "", 0, 8, 8192, "Qwen3.8-Flash-Next", "--route-tail-skip"),
+                  "{\"arch\":\"qwen4exp\",\"model\":\"Qwen3.8-Flash-Next\",\"community_kv\":\"\",\"quality_flags\":\"\",\"quality_window\":\"0\","
+                  "\"lossy\":\"--route-tail-skip\",\"spec\":8,\"max_context\":8192,\"devices\":\"\",\"cards\":[],\"notes\":[],"
+                  "\"warning\":\"\",\"error\":\"\"}");
     }
     // Bandwidth precedes memory size; ties keep the lowest visible number.
     {
