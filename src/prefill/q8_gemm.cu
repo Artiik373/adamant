@@ -1,13 +1,11 @@
 // src/prefill/q8_gemm.cu - see include/basalt/prefill/q8_gemm.hpp.
-// 2-CTA/SM warp-specialized Blackwell TMA + int8 tensor-core GEMM for block-32 Q8_0 matrices in planes:
-// one producer warp streams 128B-swizzled TMA int8 tiles (64 tokens x 128 K, 64 weight rows x 128 K) alongside
-// coalesced 16B cp.async scale transfers (2 per lane for activations, 1 per lane for weights) on a dedicated
-// mbarrier; four consumer warps (2 x 2, each 32 tokens x 32 rows) double-buffer ldmatrix fragments across the four
+// 2-CTA/SM warp-specialized int8 tensor-core GEMM for block-32 Q8_0 matrices in planes:
+// one producer warp streams 128B-swizzled int8 tiles (64 tokens x 128 K, 64 weight rows x 128 K, zero past the
+// edges) and the coalesced scales with 16B cp.async on one mbarrier per stage; four consumer warps (2 x 2, each 32 tokens x 32 rows) double-buffer ldmatrix fragments across the four
 // K=32 sub-blocks, execute mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32, and accumulate scaled int32 block dots
-// in deterministic K order. 35 KiB shared memory per CTA lets two CTAs occupy each sm_120 SM concurrently.
+// in deterministic K order. 35 KiB shared memory per CTA lets two CTAs share an SM.
 #include "basalt/prefill/q8_gemm.hpp"
 
-#include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -29,7 +27,7 @@ constexpr int ACT_B = ST * BT * BK;                       // 16 KiB
 constexpr int W_B = ST * BR * BK;                         // 16 KiB
 constexpr int ASC_B = ST * 4 * BT * (int) sizeof(float);  // 2 KiB: [ST][4][BT] float
 constexpr int WSC_B = ST * 4 * BR * (int) sizeof(__half); // 1 KiB: [ST][4][BR] half
-constexpr int SMEM = ACT_B + W_B + ASC_B + WSC_B + 3 * ST * 8;
+constexpr int SMEM = ACT_B + W_B + ASC_B + WSC_B + 2 * ST * 8;
 constexpr int MAX_SEG = 3;
 
 void ck(const char* what) {
@@ -40,13 +38,8 @@ void ck(const char* what) {
     }
 }
 
-struct alignas(64) TmaDesc {
-    unsigned long long w[16];
-};
-static_assert(sizeof(TmaDesc) == sizeof(CUtensorMap), "a descriptor argument is the descriptor size");
-static_assert(alignof(CUtensorMap) >= 64, "CUtensorMap lost its alignas: the build needs /Zc:__cplusplus");
-
 struct Seg {
+    const int8_t* w;
     const __half* w_scale;
     float* dst;
     int64_t ld;
@@ -56,10 +49,10 @@ struct Seg {
 };
 
 struct Args {
-    TmaDesc tm[1 + MAX_SEG];
     Seg seg[MAX_SEG];
+    const int8_t* act;
     const float* a_scale;
-    int nseg, ntok, tok_tiles, total_tiles, k_tiles, k_blocks, a_sc_ld, epi;
+    int nseg, ntok, tok_tiles, total_tiles, k_tiles, k_blocks, k_cols, a_sc_ld, epi;
 };
 
 __device__ __forceinline__ unsigned su(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
@@ -83,14 +76,11 @@ __device__ __forceinline__ void mb_init(unsigned long long* b, unsigned n) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(su(b)), "r"(n) : "memory");
 }
 __device__ __forceinline__ void mb_wait(unsigned long long* b, unsigned phase) {
-    asm volatile("{\n.reg .pred d;\nw_%=:\nmbarrier.try_wait.parity.shared::cta.b64 d, [%0], %1, %2;\n@d bra e_%=;\nbra w_%=;\ne_%=:\n}\n"
-                 ::"r"(su(b)), "r"(phase), "r"(0x989680u) : "memory");
+    asm volatile("{\n.reg .pred d;\nw_%=:\nmbarrier.test_wait.parity.shared::cta.b64 d, [%0], %1;\n@!d bra w_%=;\n}\n"
+                 ::"r"(su(b)), "r"(phase) : "memory");
 }
 __device__ __forceinline__ void mb_arrive(unsigned long long* b) {
     asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(su(b)) : "memory");
-}
-__device__ __forceinline__ void mb_expect(unsigned long long* b, unsigned bytes) {
-    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(su(b)), "r"(bytes) : "memory");
 }
 __device__ __forceinline__ void cp_mb_arrive(unsigned long long* b) {
     asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(su(b)) : "memory");
@@ -98,11 +88,23 @@ __device__ __forceinline__ void cp_mb_arrive(unsigned long long* b) {
 __device__ __forceinline__ void cp16(void* dst, const void* src) {
     asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::"r"(su(dst)), "l"(src) : "memory");
 }
-__device__ __forceinline__ void tma2d(void* dst, const TmaDesc* m, int k, int r, unsigned long long* b) {
-    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
-                 ::"r"(su(dst)), "l"(m), "r"(k), "r"(r), "r"(su(b)) : "memory");
+// 16 bytes, or zeros when `ok` is false (src-size 0 reads nothing)
+__device__ __forceinline__ void cp16z(void* dst, const void* src, bool ok) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(su(dst)), "l"(src), "r"(ok ? 16 : 0) : "memory");
 }
 __device__ __forceinline__ int sw(int row, int byte) { return row * BK + (byte ^ ((row & 7) << 4)); }
+
+// a [64 x BK] int8 tile of `src` (rows `ld` bytes apart) at (r0, k0) in the 128B-swizzled layout, zero past nrows/ncols
+__device__ __forceinline__ void load_tile(unsigned char* dst, const int8_t* src, int64_t ld, int r0, int nrows, int k0,
+                                          int ncols, int lane) {
+#pragma unroll
+    for (int i = 0; i < 64 * BK / 16 / 32; ++i) {
+        const int c = i * 32 + lane, row = c >> 3, ch = c & 7;
+        const int r = r0 + row, k = k0 + ch * 16;
+        const bool ok = r < nrows && k < ncols;
+        cp16z(dst + sw(row, ch * 16), ok ? src + (int64_t) r * ld + k : src, ok);
+    }
+}
 
 __global__ __launch_bounds__(NT, 2) void gemm_kernel(const __grid_constant__ Args p) {
     extern __shared__ __align__(1024) unsigned char raw[];
@@ -111,13 +113,11 @@ __global__ __launch_bounds__(NT, 2) void gemm_kernel(const __grid_constant__ Arg
     float* asc = reinterpret_cast<float*>(wt + W_B);
     __half* wsc = reinterpret_cast<__half*>(asc + ST * 4 * BT);
     unsigned long long* full = reinterpret_cast<unsigned long long*>(wsc + ST * 4 * BR);
-    unsigned long long* full_sc = full + ST;
-    unsigned long long* empty = full_sc + ST;
+    unsigned long long* empty = full + ST;
 
     if (threadIdx.x == 0) {
         for (int s = 0; s < ST; ++s) {
-            mb_init(full + s, 1);
-            mb_init(full_sc + s, 32);
+            mb_init(full + s, 32);
             mb_init(empty + s, WT * WR);
         }
     }
@@ -146,11 +146,8 @@ __global__ __launch_bounds__(NT, 2) void gemm_kernel(const __grid_constant__ Arg
         for (int kt = 0; kt < p.k_tiles; ++kt) {
             const int st = kt & 1;
             mb_wait(empty + st, 1u ^ ((kt >> 1) & 1u));
-            if (lane == 0) {
-                mb_expect(full + st, (BT + BR) * BK);
-                tma2d(act + st * BT * BK, &p.tm[0], kt * BK, tok0, full + st);
-                tma2d(wt + st * BR * BK, &p.tm[1 + si], kt * BK, row0, full + st);
-            }
+            load_tile(act + st * BT * BK, p.act, p.k_cols, tok0, p.ntok, kt * BK, p.k_cols, lane);
+            load_tile(wt + st * BR * BK, seg.w, p.k_cols, row0, seg.rows, kt * BK, p.k_cols, lane);
             const int kb = kt * 4;
             float* ad = asc + st * 4 * BT;
             __half* wd = wsc + st * 4 * BR;
@@ -168,7 +165,7 @@ __global__ __launch_bounds__(NT, 2) void gemm_kernel(const __grid_constant__ Arg
                 if (kb + ks_w < p.k_blocks)
                     cp16(wd + ks_w * BR + off_w, seg.w_scale + (int64_t) (kb + ks_w) * seg.w_sc_ld + row0 + off_w);
             }
-            cp_mb_arrive(full_sc + st);
+            cp_mb_arrive(full + st);
         }
         return;
     }
@@ -192,7 +189,6 @@ __global__ __launch_bounds__(NT, 2) void gemm_kernel(const __grid_constant__ Arg
 
     const auto stage = [&]<int NKS>(int st, unsigned ph) {
         mb_wait(full + st, ph);
-        mb_wait(full_sc + st, ph);
         const unsigned char* as = act + st * BT * BK;
         const unsigned char* ws = wt + st * BR * BK;
         const float* a_sc = asc + st * 4 * BT;
@@ -233,7 +229,6 @@ __global__ __launch_bounds__(NT, 2) void gemm_kernel(const __grid_constant__ Arg
                 }
             }
         }
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         __syncwarp();
         if (lane == 0) mb_arrive(empty + st);
     };
@@ -303,40 +298,6 @@ __global__ void transpose_scales_kernel(const uint16_t* __restrict__ src, int64_
 
 size_t scale_off(int64_t rows, int64_t cols) { return ((size_t) rows * (size_t) cols + 15) & ~size_t(15); }
 
-using EncodeFn = CUresult (*)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*,
-                              const cuuint64_t*, const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave,
-                              CUtensorMapSwizzle, CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
-EncodeFn encode_fn() {
-    static const EncodeFn f = []() -> EncodeFn {
-        void* fp = nullptr;
-        cudaDriverEntryPointQueryResult st{};
-        if (cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &fp, 12000, cudaEnableDefault, &st) !=
-                cudaSuccess ||
-            !fp)
-            return nullptr;
-        return reinterpret_cast<EncodeFn>(fp);
-    }();
-    return f;
-}
-
-void tmap(TmaDesc* out, const void* base, int64_t rows, int64_t cols, int box_rows) {
-    const EncodeFn f = encode_fn();
-    CUtensorMap m{};
-    const cuuint64_t dim[2] = {(cuuint64_t) cols, (cuuint64_t) rows}, str[1] = {(cuuint64_t) cols};
-    const cuuint32_t box[2] = {(cuuint32_t) BK, (cuuint32_t) box_rows}, es[2] = {1, 1};
-    const CUresult rc =
-        f ? f(&m, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(base), dim, str, box, es,
-              CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-              CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE)
-          : CUDA_ERROR_NOT_FOUND;
-    if (rc != CUDA_SUCCESS) {
-        basalt::log::error("basalt", "prefill q8: tensor map for [%lld x %lld] failed (rc=%d)", (long long) rows,
-                           (long long) cols, (int) rc);
-        std::exit(1);
-    }
-    std::memcpy(out, &m, sizeof m);
-}
-
 }  // namespace
 
 size_t act_bytes(int64_t rows, int64_t cols) {
@@ -393,7 +354,7 @@ void gemm_segmented(const Segment* seg, int nseg, int64_t w_cols, const void* ac
         configured[dev].store(true, std::memory_order_release);
     }
     Args p{};
-    tmap(&p.tm[0], act, rows, w_cols, BT);
+    p.act = static_cast<const int8_t*>(act);
     int tiles = 0;
     for (int i = 0; i < nseg; ++i) {
         const Segment& s = seg[i];
@@ -404,8 +365,7 @@ void gemm_segmented(const Segment* seg, int nseg, int64_t w_cols, const void* ac
                                (long long) w_cols, (long long) s.ld_dst);
             std::exit(1);
         }
-        tmap(&p.tm[1 + i], s.w, s.rows, w_cols, BR);
-        p.seg[i] = {reinterpret_cast<const __half*>(s.w_scales_t), s.dst, s.ld_dst, (int) s.rows,
+        p.seg[i] = {s.w, reinterpret_cast<const __half*>(s.w_scales_t), s.dst, s.ld_dst, (int) s.rows,
                     (int) scale_plane_ld(s.rows), tiles};
         tiles += (int) ((s.rows + BR - 1) / BR);
     }
@@ -416,6 +376,7 @@ void gemm_segmented(const Segment* seg, int nseg, int64_t w_cols, const void* ac
     p.total_tiles = tiles;
     p.k_tiles = (int) ((w_cols + BK - 1) / BK);
     p.k_blocks = (int) (w_cols >> 5);
+    p.k_cols = (int) w_cols;
     p.a_sc_ld = (int) act_scale_ld(rows);
     p.epi = (int) epi;
     gemm_kernel<<<(unsigned) (tiles * p.tok_tiles), NT, SMEM, (cudaStream_t) stream>>>(p);

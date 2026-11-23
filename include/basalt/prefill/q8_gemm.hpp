@@ -1,4 +1,4 @@
-// include/basalt/prefill/q8_gemm.hpp - a prompt chunk's products against Q8_0 matrices in planes on Blackwell int8
+// include/basalt/prefill/q8_gemm.hpp - a prompt chunk's products against Q8_0 matrices in planes on int8
 // tensor cores (mma m16n8k32 s8). Weights use wgemm::q8_planes int8 codes [rows][K] alongside coalesced transposed
 // fp16 block scales [K / 32][scale_plane_ld(rows)]. Activations are quantized per 32-value block to int8 codes
 // [rows][K] with coalesced fp32 block scales [K / 32][act_scale_ld(rows)]. Each K=32 integer dot product is scaled

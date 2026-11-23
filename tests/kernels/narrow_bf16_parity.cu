@@ -2,7 +2,9 @@
 // against the f16 route the header takes before CUDA 13.2 and against the host's values: every pair of E4M3 bytes, and
 // every E2M1 byte at every UE4M3 scale byte in each byte of the word, bit for bit, NaNs included (their bits against the
 // other route; the host only says NaN).  Built with CUDA 13.2 or later this checks the direct instruction against the
-// fallback; built with 13.0 or 13.1 both sides are the fallback and the host values check it.  Exit 77 without a GPU.
+// fallback; built with 13.0 or 13.1 both sides are the fallback and the host values check it.  Below compute capability
+// 10.0 (the integer decoding) there is no f16 route on the device and the host values check it alone.  Exit 77 without
+// a GPU.
 #include "basalt/kernels/narrow_bf16.cuh"
 
 #include <cuda_fp8.h>
@@ -23,7 +25,11 @@ constexpr int kN = 1 << 16;
 __global__ void e4m3(unsigned* got, unsigned* alt) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     got[i] = bk::e4m3x2_bf16x2(i);
+#if BASALT_NARROW_SOFT
+    alt[i] = got[i];
+#else
     alt[i] = bk::e4m3x2_bf16x2_via_f16(i);
+#endif
 }
 
 // the word for i: byte k is the low byte of i plus 37 k, so every byte position sees all 256 values; the high byte of i
@@ -38,8 +44,12 @@ __global__ void e2m1(unsigned* got, unsigned* alt) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned s = i >> 8;
     const unsigned sc = bk::e4m3x2_bf16x2(s | (s << 8));
-    unsigned h[4], t[4];
+    unsigned h[4];
     bk::e2m1x8_bf16x2_scaled(e2m1_word(i), sc, h);
+#if BASALT_NARROW_SOFT
+    for (int k = 0; k < 4; ++k) got[4 * i + k] = alt[4 * i + k] = h[k];
+#else
+    unsigned t[4];
     bk::e2m1x8_bf16x2_via_f16(e2m1_word(i), t);
     for (int k = 0; k < 4; ++k) {
         unsigned d;
@@ -47,6 +57,7 @@ __global__ void e2m1(unsigned* got, unsigned* alt) {
         got[4 * i + k] = h[k];
         alt[4 * i + k] = d;
     }
+#endif
 }
 
 float e4m3f(unsigned b) {
@@ -112,8 +123,6 @@ int main() {
                 check("e2m1x8 scaled", i, half, g[4 * i + k], a[4 * i + k], e2m1f(w >> (8 * k + 4 * half)) * sc);
     }
 
-    std::printf("%s (%s): %d failures\n", fails ? "FAIL" : "OK",
-                BASALT_CVT_BF16X2_NARROW ? "the direct cvt against the f16 route" : "the f16 route on both sides",
-                fails);
+    std::printf("%s: %d failures\n", fails ? "FAIL" : "OK", fails);
     return fails ? 1 : 0;
 }

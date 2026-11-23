@@ -53,16 +53,42 @@ __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_grou
 template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
 __device__ __forceinline__ int swa(int rr, int lb) { return rr * kBK + (lb ^ ((rr & 7) << 4)); }
 
-template <int KS>
-__device__ __forceinline__ void mma_mxfp8(float* c, const unsigned* a, unsigned b0, unsigned b1, unsigned sfa,
-                                          unsigned sfb) {
-    constexpr unsigned short kBid = (unsigned short) KS;
-    constexpr unsigned short kTid = 0;
-    asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
+// two E4M3 bytes (bytes lo and lo + 1 of x, the lower byte the lower half) as f16x2 of 2^-8 times their values, exact
+// (normals and subnormals alike: the code's exponent and mantissa bits are the f16's, its exponent bias 8 lower)
+template <int LO>
+__device__ __forceinline__ unsigned e4m3x2_f16x2_scaled(unsigned x) {
+    const unsigned t = __byte_perm(x, 0u, LO == 0 ? 0x4140u : 0x4342u);   // bytes [b_lo, 0, b_lo+1, 0]
+    return ((t & 0x007F007Fu) << 7) | ((t & 0x00800080u) << 8);
+}
+__device__ __forceinline__ void mma_f16(float* c, const unsigned (&a)[4], unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1),
-                   "r"(sfa), "h"(kBid), "h"(kTid), "r"(sfb), "h"(kBid), "h"(kTid));
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+// a UE8M0 byte as its fp32 power of two times 2^8, undoing one operand's 2^-8 (0 is 2^-127)
+__device__ __forceinline__ float ue8m0f_x256(unsigned e) { return e ? __uint_as_float((e + 8u) << 23) : 0x1p-119f; }
+
+// A k32 block's m16n8k32 E4M3 fragment (ldmatrix's 8-bit layout) as the f16 fragments of two m16n8k16 products: a
+// thread's k 4t..4t+3 of each 16-wide half are its k 2t, 2t+1, 2t+8, 2t+9 there, the same for A and B, so the two
+// products sum the block's dot product.
+__device__ __forceinline__ void a_f16(const unsigned (&a)[4], unsigned (&lo)[4], unsigned (&hi)[4]) {
+    lo[0] = e4m3x2_f16x2_scaled<0>(a[0]); lo[1] = e4m3x2_f16x2_scaled<0>(a[1]);
+    lo[2] = e4m3x2_f16x2_scaled<2>(a[0]); lo[3] = e4m3x2_f16x2_scaled<2>(a[1]);
+    hi[0] = e4m3x2_f16x2_scaled<0>(a[2]); hi[1] = e4m3x2_f16x2_scaled<0>(a[3]);
+    hi[2] = e4m3x2_f16x2_scaled<2>(a[2]); hi[3] = e4m3x2_f16x2_scaled<2>(a[3]);
+}
+
+// One k32 block of the block-scaled product: fp32 sums of the f16 products times the row and column scales. sa: the
+// scales of the thread's rows g and g+8, sb: of its columns 2t and 2t+1.
+__device__ __forceinline__ void mma_mxfp8(float* c, const unsigned (&alo)[4], const unsigned (&ahi)[4], const unsigned (&b)[4],
+                                          const float (&sa)[2], const float (&sb)[2]) {
+    float t[4] = {};
+    mma_f16(t, alo, b[0], b[1]);
+    mma_f16(t, ahi, b[2], b[3]);
+    c[0] += t[0] * sa[0] * sb[0];
+    c[1] += t[1] * sa[0] * sb[1];
+    c[2] += t[2] * sa[1] * sb[0];
+    c[3] += t[3] * sa[1] * sb[1];
 }
 
 // ---------------------------------------------------------------------------------------- planning & quantizer
@@ -265,18 +291,35 @@ __global__ __launch_bounds__(kThreads, 1) void gemm_kernel(const GemmArgs a) {
             }
 
             auto step = [&]<int KS>() {
+                // the k32 block's scales of this thread's rows (held by lanes 4g, 4g + 1) and columns (by lane 4 col)
+                float sa[4][2], sb[4][2];
+#pragma unroll
+                for (int mt = 0; mt < 4; ++mt) {
+                    sa[mt][0] = ue8m0f_x256((__shfl_sync(0xffffffffu, sfa[mt], lane & ~3) >> (8 * KS)) & 0xFFu);
+                    sa[mt][1] = ue8m0f_x256((__shfl_sync(0xffffffffu, sfa[mt], (lane & ~3) | 1) >> (8 * KS)) & 0xFFu);
+                }
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    sb[r][0] = ue8m0f_x256((__shfl_sync(0xffffffffu, sfb[r], 8 * tig) >> (8 * KS)) & 0xFFu);
+                    sb[r][1] = ue8m0f_x256((__shfl_sync(0xffffffffu, sfb[r], 8 * tig + 4) >> (8 * KS)) & 0xFFu);
+                }
                 unsigned af[4][4];
 #pragma unroll
                 for (int mt = 0; mt < 4; ++mt)
                     ldsm4(af[mt][0], af[mt][1], af[mt][2], af[mt][3],
                           smem_addr(as + swa(warp_m * 64 + mt * 16 + a_row, KS * 32 + a_col)));
+                unsigned alo[4][4], ahi[4][4];
+#pragma unroll
+                for (int mt = 0; mt < 4; ++mt) a_f16(af[mt], alo[mt], ahi[mt]);
 #pragma unroll
                 for (int r = 0; r < 4; ++r) {
                     const uint8_t* q = bp[r] + KS * 32;
                     const unsigned b0 = *reinterpret_cast<const uint32_t*>(q + 4 * tig);
                     const unsigned b1 = *reinterpret_cast<const uint32_t*>(q + 16 + 4 * tig);
+                    const unsigned bf[4] = {e4m3x2_f16x2_scaled<0>(b0), e4m3x2_f16x2_scaled<2>(b0), e4m3x2_f16x2_scaled<0>(b1),
+                                            e4m3x2_f16x2_scaled<2>(b1)};
 #pragma unroll
-                    for (int mt = 0; mt < 4; ++mt) mma_mxfp8<KS>(acc[mt][r], af[mt], b0, b1, sfa[mt], sfb[r]);
+                    for (int mt = 0; mt < 4; ++mt) mma_mxfp8(acc[mt][r], alo[mt], ahi[mt], bf, sa[mt], sb[r]);
                 }
             };
             step.template operator()<0>();

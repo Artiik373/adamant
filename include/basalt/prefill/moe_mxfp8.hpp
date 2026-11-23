@@ -1,5 +1,5 @@
-// include/basalt/prefill/moe_mxfp8.hpp - the prompt path's native MXFP8 experts on the Blackwell FP8 block-scaled
-// tensor cores (mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32).
+// include/basalt/prefill/moe_mxfp8.hpp - the prompt path's native MXFP8 experts on f16 tensor cores: each k32 block's
+// E4M3 codes as f16 (exact) through two m16n8k16 products, fp32 sums times the block's UE8M0 scales.
 // Weights stay in the pack's block_mxfp8 blocks (128 values = 4 UE8M0 scales + 128 E4M3 codes = 132 bytes, read in
 // place from each expert's blob); activations are rounded per 32-value block to E4M3 codes + UE8M0 scales.
 #pragma once
