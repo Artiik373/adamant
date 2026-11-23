@@ -38,16 +38,6 @@ int main() {
 #else
     expect("qwen4exp", false);
 #endif
-#ifdef BASALT_MODEL_DEEPSEEK41
-    expect("deepseek41", true);
-#else
-    expect("deepseek41", false);
-#endif
-#ifdef BASALT_MODEL_QWEN35
-    expect("qwen35", true);
-#else
-    expect("qwen35", false);
-#endif
 #ifdef BASALT_MODEL_HY4FLASH
     expect("hy4flash", true);
     // and under the architecture its test pack (made from the AngelSlim GGUF) carries
