@@ -211,7 +211,7 @@ def check_mixed() -> None:
         lines = m.read("experts.layout").decode().splitlines()
         assert lines[0].startswith("# experts v9:"), lines[0]
         l0 = len(b"".join(want[0]))
-        assert lines[1:] == ["0 124 124 0 %d 124" % len(want[0][0]), "1 127 127 %d %d 127 253" % (l0, slot1)], lines
+        assert lines[1:] == ["0 124 124 0 %d 124" % len(want[0][0]), "1 135 135 %d %d 135 253" % (l0, slot1)], lines
         assert json.loads(m.read("meta"))["ms"]["experts"]["k"] == [4, [2, 5, 3]]
     print("ms_pack: mixed experts, layout v9")
 

@@ -18,7 +18,7 @@ The tensor type id is 120 + K (MS_C2 = 122 .. MS_C6 = 126).  The rows must alrea
 With `<ms-dir>/experts/blk.<l>.experts.json` for every layer (ms_flashnext_convert.py), the `experts` section and
 `experts.layout` are rebuilt too.  An expert blob is three such payloads back to back, [gate | up | down], one K per
 layer; the layout is `# experts v8` with type 120 + K for gate, up and down.  A record whose k is a list (one K per
-expert) makes a mixed layer: layout v9, type 127, the K list as the line's last column, each blob a 16-byte head
+expert) makes a mixed layer: layout v9, type 130 + its widest K, the K list as the line's last column, each blob a 16-byte head
 (byte 0 = K) then the payloads at that K, blobs at their own sizes; blob_bytes is the widest, and the section ends in
 one slot of zeros.
 
@@ -101,7 +101,7 @@ def read_records(ms_dir: Path, tensors: dict) -> dict:
     return out
 
 
-MS_MIX = 127      # a layer whose experts carry their own K (layout v9)
+MS_MIX = 130      # + the widest K: a layer whose experts carry their own K (layout v9)
 MIX_HEAD = 16     # a mixed layer's blob: byte 0 = K, zero pad, then gate | up | down at that K
 
 
@@ -187,14 +187,15 @@ class Experts:
                 t = MS_TYPE_BASE + k
                 lines.append(f"{l} {t} {t} {off} {blob} {t}\n")
             else:
-                lines.append(f"{l} {MS_MIX} {MS_MIX} {off} {blob} {MS_MIX} {''.join(str(v) for v in k)}\n")
+                t = MS_MIX + max(k)
+                lines.append(f"{l} {t} {t} {off} {blob} {t} {''.join(str(v) for v in k)}\n")
             off += self.layer_bytes(l)
         ver = 9 if self.mixed else LAYOUT_VERSION
         head = (f"# experts v{ver}: layer gu_type d_type offset blob_bytes up_type (n_expert {self.n_expert}, "
                 f"total {off}); MS blobs: per projection gate, up, down: rows, int8 signs[n_in]; type = "
                 f"{MS_TYPE_BASE} + K")
         if self.mixed:
-            head += (f"; type {MS_MIX}: each expert its own K (the last column, one digit an expert), its blob a "
+            head += (f"; type {MS_MIX}+K: each expert its own K (the last column, one digit an expert), its blob a "
                      f"{MIX_HEAD}-byte head (byte 0 = K) then gate, up, down at that K, blobs back to back, "
                      f"blob_bytes the widest")
         return (head + "\n" + "".join(lines)).encode("utf-8")
