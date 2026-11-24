@@ -154,25 +154,29 @@ def quant_batch(ws, hs, k, seeds, lut):
     return [ms.fwht_blocks(q[i], block_size=blk) * rot[i][2].unsqueeze(0) for i in range(len(ws))]
 
 
-def quantize_experts(moe, x, idx, k, lut, experts, eb: int = 16):
-    """Quantize the listed experts; all others keep their BF16 weights."""
+@torch.no_grad()
+def quantize_experts(moe, x, idx, k, lut, experts, eb: int = 8, tau: float = 0.0, l: int = 0):
+    """Quantize the listed experts in place; all others keep their BF16 weights. tau > 0: the converter's shrunk
+    Hessians. Each expert's Hessians are built before its weights are overwritten."""
+    from ms_flashnext_convert import expert_hessians
     ex = moe.experts
-    gu_q = ex.gate_up_proj.data.clone()
-    dn_q = ex.down_proj.data.clone()
+    dev = ex.gate_up_proj.device   # x may be in host RAM: each expert's tokens go to the GPU on their own
+    h_all = x_ref = None
+    if tau > 0:   # as code_experts: all tokens' x x^T mean, and a fixed sample of tokens
+        h_all = sum((c := b.to(dev).float()).T @ c for b in x.split(65536)) / x.shape[0]
+        x_ref = x[torch.randperm(x.shape[0], generator=torch.Generator().manual_seed(l))[:2048].to(x.device)].to(dev)
+    gu_q, dn_q = ex.gate_up_proj.data, ex.down_proj.data
     for e0 in range(0, len(experts), eb):
         es = experts[e0 : e0 + eb]
         gus, dns, hgu, hdn = [], [], [], []
         for e in es:
-            xe = x[(idx == e).any(-1)].float()
             wgu = ex.gate_up_proj[e].float()
-            wdn = ex.down_proj[e].float()
-            g, u = (xe @ wgu.T).chunk(2, -1)
-            a = F.silu(g) * u
             gus.append(wgu)
-            dns.append(wdn)
-            # an expert no calibration token reached falls back to an identity Hessian
-            hgu.append(xe.T @ xe if xe.shape[0] else torch.eye(wgu.shape[1], device=x.device))
-            hdn.append(a.T @ a if xe.shape[0] else torch.eye(wdn.shape[1], device=x.device))
+            dns.append(ex.down_proj[e].float())
+            sel = (idx == e).any(-1).nonzero().squeeze(1)
+            h_gu, h_dn, _ = expert_hessians(x[sel.to(x.device)].to(dev), idx[sel], e, wgu, None, tau, h_all, x_ref)
+            hgu.append(h_gu)
+            hdn.append(h_dn)
         for e, q in zip(es, quant_batch(gus, hgu, k, [2 * e + 1 for e in es], lut)):
             gu_q[e] = q.to(gu_q.dtype)
         for e, q in zip(es, quant_batch(dns, hdn, k, [2 * e + 2 for e in es], lut)):
@@ -228,6 +232,7 @@ def main() -> None:
     p.add_argument("--experts", type=int, default=64, help="experts quantized per layer, spread over token counts")
     p.add_argument("--widths", type=lambda s: [int(k) for k in s.split(",")], default=[3, 4],
                    help="comma-separated trellis widths K to scan, e.g. 2,3,4,5,6")
+    p.add_argument("--hess-tau", type=float, default=0.0, help="the converter's Hessian shrinkage (0: plain sums)")
     p.add_argument("--stop-after", type=int, default=None, help="last layer to scan in this run")
     args = p.parse_args()
     assert args.widths and all(k in MS_BITS for k in args.widths), args.widths
@@ -242,13 +247,14 @@ def main() -> None:
     assert args.calib_seqs % bs == 0 and args.eval_seqs % bs == 0
 
     cal_ids, ev_ids = split_calib(calib, args.calib_seqs, args.eval_seqs)
-    h_cal, kw_cal = prelude(cfg, args.hf_dir, wmap, cal_ids, dev, bs)
+    host = cal_ids.numel() * cfg.hc_count * cfg.hidden_size * 2 > (4 << 30)   # as the converter: a large stream in RAM
+    h_cal, kw_cal = prelude(cfg, args.hf_dir, wmap, cal_ids, dev, bs, host=host)
     h_ev, kw_ev = prelude(cfg, args.hf_dir, wmap, ev_ids, dev, bs)
     state = args.out_dir / "state.pt"
     start = 0
     if state.exists():
-        st = torch.load(state, map_location=dev, weights_only=True)
-        start, h_cal, h_ev = st["next_layer"], st["h_cal"], st["h_ev"]
+        st = torch.load(state, map_location="cpu", weights_only=True)
+        start, h_cal, h_ev = st["next_layer"], st["h_cal"].to("cpu" if host else dev), st["h_ev"].to(dev)
         print(f"resuming at layer {start}", flush=True)
     lut = ms.build_1mad_lut(dev)
     last = cfg.num_hidden_layers - 1 if args.stop_after is None else args.stop_after
@@ -258,12 +264,14 @@ def main() -> None:
         layer = load_layer(cfg, args.hf_dir, wmap, l, dev)
         t_load = time.time() - t0
         xs = []
-        h_cal = run_layer(layer, h_cal, kw_cal, bs, grab_in=xs)
+        h_cal = run_layer(layer, h_cal, kw_cal, bs, grab_in=xs, inplace=host)
         x = torch.cat(xs)
         del xs
         moe = layer.mlp
-        with torch.no_grad():
-            _, _, idx = moe.gate(x)
+        with torch.no_grad():   # in chunks, as the converter: only the top-k ids stay
+            idx = torch.cat([moe.gate(c)[2] for c in x.split(65536)])
+        if host:
+            x = x.cpu()
         counts = torch.bincount(idx.flatten(), minlength=moe.experts.num_experts)
         y_ref, xe_ev = [], []
         h_ref = run_layer(layer, h_ev, kw_ev, bs, grab_in=xe_ev, grab_out=y_ref)
@@ -272,6 +280,7 @@ def main() -> None:
         with torch.no_grad():
             shared = (torch.sigmoid(moe.shared_expert_gate(xe_ev)) * moe.shared_expert(xe_ev)).float()
         routed_ref = y_ref - shared
+        torch.cuda.empty_cache()   # the forward's cached blocks back to the driver before the coder
         rec = {
             "layer": l,
             "type": cfg.layer_types[l],
@@ -283,15 +292,15 @@ def main() -> None:
         order = torch.argsort(counts).tolist()
         sample = order[:: max(1, len(order) // args.experts)][: args.experts]
         t_fwd = time.time() - t0 - t_load
-        gu_ref, dn_ref = moe.experts.gate_up_proj.data, moe.experts.down_proj.data
+        gu_ref, dn_ref = moe.experts.gate_up_proj.data.cpu(), moe.experts.down_proj.data.cpu()   # originals in RAM
         for k in args.widths:
             tq = time.time()
-            gu_q, dn_q = quantize_experts(moe, x, idx, k, lut, sample)
-            moe.experts.gate_up_proj.data, moe.experts.down_proj.data = gu_q, dn_q
+            gu_q, dn_q = quantize_experts(moe, x, idx, k, lut, sample, tau=args.hess_tau, l=l)
             y_q = []
             h_q = run_layer(layer, h_ev, kw_ev, bs, grab_out=y_q)
             y_q = torch.cat(y_q)
-            moe.experts.gate_up_proj.data, moe.experts.down_proj.data = gu_ref, dn_ref
+            moe.experts.gate_up_proj.data.copy_(gu_ref)
+            moe.experts.down_proj.data.copy_(dn_ref)
             del gu_q, dn_q
             rec[f"C{k}"] = {
                 "routed_rel": ((y_q - y_ref).norm() / routed_ref.norm()).item(),
