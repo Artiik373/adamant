@@ -256,10 +256,10 @@ def main() -> None:
                    help="comma-separated trellis widths K to scan, e.g. 2,3,4,5,6")
     p.add_argument("--hess-tau", type=float, default=0.0, help="the converter's Hessian shrinkage (0: plain sums)")
     p.add_argument("--stop-after", type=int, default=None, help="last layer to scan in this run")
+    p.add_argument("--mix", action="store_true", help="with --per-expert: measure the per-expert mixes too")
     p.add_argument("--expert-batch", type=int, default=8, help="experts coded per Viterbi call (fewer: less GPU memory)")
     p.add_argument("--per-expert", action="store_true",
-                   help="also: each expert's own output error at every width (experts_<layer>.json), and the layer "
-                        "coded with per-expert widths at the bytes of each uniform width")
+                   help="also: each expert's own output error at every width (experts_<layer>.json)")
     args = p.parse_args()
     assert args.widths and all(k in MS_BITS for k in args.widths), args.widths
 
@@ -353,7 +353,7 @@ def main() -> None:
             from ms_plan_solver import layer_bytes, solve
             size = lambda k: layer_bytes(k, n_exp=1)
             (args.out_dir / f"experts_{l}.json").write_text(json.dumps({"counts": counts.tolist(), "errs": errs}))
-            for k0 in args.widths[1:-1]:   # a mix needs a narrower and a wider width than its budget
+            for k0 in args.widths[1:-1] if args.mix else []:   # a mix needs a narrower and a wider width than its budget
                 pick = solve({e: {k: errs[k][e] for k in args.widths} for e in sample}, len(sample) * size(k0), size)
                 plan = {k: [e for e in sample if pick[e] == k] for k in args.widths}
                 measure({k: es for k, es in plan.items() if es}, f"mix{k0}")
