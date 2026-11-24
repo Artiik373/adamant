@@ -27,6 +27,14 @@ class PlanSolver(unittest.TestCase):
             got = sum(costs[l][str(k)] for l, k in plan.items())
             self.assertAlmostEqual(got, best[0], places=12, msg=(plan, best))
 
+    def test_floor(self):
+        costs = {"0": {"2": 1.0, "3": 0.99, "4": 0.98}, "1": {"2": 9.0, "3": 0.1, "4": 0.01}}
+        budget = layer_bytes(2) + layer_bytes(4)
+        self.assertEqual(solve(costs, budget), {"0": 2, "1": 4})
+        self.assertEqual(solve(costs, budget, min_k=3), {"0": 3, "1": 3})
+        with self.assertRaises(SystemExit):
+            solve(costs, budget, min_k=5)
+
     def test_budget_too_small(self):
         with self.assertRaises(SystemExit):
             solve({"0": {"2": 1.0, "3": 0.5}}, layer_bytes(2) - 1)

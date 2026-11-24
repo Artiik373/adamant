@@ -34,9 +34,12 @@ def hull(costs: dict, size) -> list:
     return [k for _, _, k in out]
 
 
-def solve(costs: dict, budget: int, size=layer_bytes) -> dict:
-    """{layer: k} with sum of bytes <= budget and the least sum of predicted KL."""
-    f = {l: {int(k): float(v) for k, v in c.items()} for l, c in costs.items()}
+def solve(costs: dict, budget: int, size=layer_bytes, min_k: int = 0) -> dict:
+    """{layer: k >= min_k} with sum of bytes <= budget and the least sum of predicted KL."""
+    # The floor keeps an additive cost sum away from widths whose real (joint) loss it underestimates
+    f = {l: {int(k): float(v) for k, v in c.items() if int(k) >= min_k} for l, c in costs.items()}
+    if not all(f.values()):
+        raise SystemExit(f"no width >= {min_k} for layer(s) {[l for l, c in f.items() if not c]}")
     steps = {l: hull(c, size) for l, c in f.items()}
     pick = {l: 0 for l in steps}
     used = sum(size(s[0]) for s in steps.values())
@@ -61,9 +64,10 @@ def main() -> None:
     p.add_argument("--costs", type=Path, required=True)
     p.add_argument("--budget-gib", type=float, required=True, help="routed experts of all layers")
     p.add_argument("--out", type=Path, required=True, help='the converter plan {"experts_k": [k per layer]}')
+    p.add_argument("--min-k", type=int, default=0, help="narrowest width any layer may take (default: no floor)")
     args = p.parse_args()
     costs = json.loads(args.costs.read_text())
-    plan = solve(costs, int(args.budget_gib * 2**30))
+    plan = solve(costs, int(args.budget_gib * 2**30), min_k=args.min_k)
     ks = [plan[l] for l in sorted(plan, key=int)]
     args.out.write_text(json.dumps({"experts_k": ks}))
     gib = sum(layer_bytes(k) for k in ks) / 2**30
