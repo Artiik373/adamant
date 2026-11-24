@@ -154,6 +154,9 @@ def k_label(k) -> str:
     return f"MS_C{k}" if isinstance(k, int) else "MS mix " + "/".join(f"C{w}:{k.count(w)}" for w in sorted(set(k)))
 
 
+EXPERT_BATCH = 0   # --expert-batch; 0: from the window
+
+
 def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0.0) -> dict:
     """k: one width for the layer, or a list with one width per expert (a mixed layer)."""
     ex = moe.experts
@@ -165,7 +168,8 @@ def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0
     n_exp, two_ff, n_embd = ex.gate_up_proj.shape
     n_ff = two_ff // 2
     files = {n: open(out_dir / f"blk.{l}.ffn_{n}_exps.ms", "wb") for n in ("gate", "up", "down")}
-    eb = 8 * 32 // VITERBI[0]   # experts per batch: the back-pointer buffer grows with the window
+    # experts per batch: the back-pointer buffer grows with the window
+    eb = EXPERT_BATCH or 8 * 32 // VITERBI[0]
     zero = 0
     try:
         for e0 in range(0, n_exp, eb):
@@ -484,6 +488,7 @@ def main() -> None:
     p.add_argument("--reuse-layers", type=int, default=0, help="copy layers below this from --reuse-from")
     p.add_argument("--only-layers", type=lambda v: {int(x) for x in v.split(",")}, default=None,
                    help="code these layers only (at the plan's widths); the others only advance the stream")
+    p.add_argument("--expert-batch", type=int, default=0, help="experts coded per Viterbi call (0: from the window)")
     p.add_argument("--window", type=int, default=48, help="Viterbi search window")
     p.add_argument("--commit", type=int, default=12, help="Viterbi commit length")
     p.add_argument("--hess-tau", type=float, default=0.0,
@@ -508,8 +513,9 @@ def main() -> None:
 
     dev = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True  # Hessian sums: TF32 inputs, FP32 accumulation
-    global VITERBI
+    global VITERBI, EXPERT_BATCH
     VITERBI = (args.window, args.commit)
+    EXPERT_BATCH = args.expert_batch
     out = args.out_dir
     (out / "experts").mkdir(parents=True, exist_ok=True)
     tc = json.loads((args.hf_dir / "config.json").read_text())["text_config"]
