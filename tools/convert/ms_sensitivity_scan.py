@@ -132,7 +132,7 @@ def prelude(cfg, hf: Path, wmap: dict, ids: torch.Tensor, dev, batch: int, host:
         raise Stop
 
     model.layers[0].register_forward_pre_hook(hook, with_kwargs=True)
-    hs, kws = [], []
+    out, kws = None, []
     with torch.no_grad():
         for i in range(0, ids.shape[0], batch):
             try:
@@ -140,10 +140,12 @@ def prelude(cfg, hf: Path, wmap: dict, ids: torch.Tensor, dev, batch: int, host:
             except Stop:
                 pass
             h, kw = got.pop()
-            hs.append(h.cpu() if host else h)
+            if out is None:   # one buffer: a list plus torch.cat would hold the stream twice
+                out = torch.empty((ids.shape[0], *h.shape[1:]), dtype=h.dtype, device="cpu" if host else dev)
+            out[i : i + h.shape[0]] = h
             kws.append({n: v for n, v in kw.items() if n != "past_key_values"})
     del model
-    return torch.cat(hs), kws
+    return out, kws
 
 
 def quant_batch(ws, hs, k, seeds, lut):
@@ -263,15 +265,21 @@ def main() -> None:
         t0 = time.time()
         layer = load_layer(cfg, args.hf_dir, wmap, l, dev)
         t_load = time.time() - t0
-        xs = []
-        h_cal = run_layer(layer, h_cal, kw_cal, bs, grab_in=xs, inplace=host)
-        x = torch.cat(xs)
-        del xs
+        # the MoE inputs go straight into one buffer (in host RAM for a large set): a list plus torch.cat holds them twice
+        x = torch.empty(cal_ids.numel(), cfg.hidden_size, dtype=torch.bfloat16, device="cpu" if host else dev)
+        fill = [0]
+
+        def grab(_m, a):
+            t = a[0].reshape(-1, a[0].shape[-1])
+            x[fill[0] : fill[0] + t.shape[0]] = t
+            fill[0] += t.shape[0]
+        hk = layer.mlp.register_forward_pre_hook(grab)
+        h_cal = run_layer(layer, h_cal, kw_cal, bs, inplace=host)
+        hk.remove()
+        assert fill[0] == x.shape[0], (fill[0], x.shape)
         moe = layer.mlp
         with torch.no_grad():   # in chunks, as the converter: only the top-k ids stay
-            idx = torch.cat([moe.gate(c)[2] for c in x.split(65536)])
-        if host:
-            x = x.cpu()
+            idx = torch.cat([moe.gate(c.to(dev))[2] for c in x.split(65536)])
         counts = torch.bincount(idx.flatten(), minlength=moe.experts.num_experts)
         y_ref, xe_ev = [], []
         h_ref = run_layer(layer, h_ev, kw_ev, bs, grab_in=xe_ev, grab_out=y_ref)
