@@ -19,7 +19,7 @@ int weights(Context& context) {
     // and every expert (what the RAM and VRAM checks below weigh; the start's total is what its pass places).
     uint64_t model_bytes = 0, expert_total_bytes = 0, cuda0_fixed_bytes = 0;   // the latter: all but the cache fill
     for (int64_t l = 0; l < g.n_layers; ++l)
-        expert_total_bytes += (uint64_t) g.n_expert * basalt::kernels::cpu::expert_layout().blob_bytes(l);
+        expert_total_bytes += basalt::kernels::cpu::expert_layout().layer_bytes(l);
     // The default expert mode copies every expert into RAM and keeps it there, so a machine that cannot hold them
     // would swap until it froze.  Refuse before anything is allocated.  (A shared arena may already be in RAM.)
     if (!o.mmap_experts && o.shared_expert_arena.empty()) {

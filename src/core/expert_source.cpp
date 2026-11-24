@@ -225,6 +225,11 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
             err = "FileExpertSource: the native expert layout is invalid at layer " + std::to_string(layer);
             return false;
         }
+        if (!layout.eoff[i].empty()) {   // shortcut: the file source maps fixed-size blobs; mixed layers need the arena
+            err = "FileExpertSource: layer " + std::to_string(layer) + " has per-expert MS widths; they need the "
+                  "RAM arena (run without --mmap-experts)";
+            return false;
+        }
         const uint64_t layer_bytes = bytes * (uint64_t) n_expert;
         if (at > want || layer_bytes > want - at) {
             err = "FileExpertSource: the native expert layout exceeds its declared size at layer " +
@@ -1745,7 +1750,7 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
     for (int64_t l = 0; l < n_layers; ++l) {
         bounds.push_back(lay.layer_offset(l));
         loff.push_back(lay.layer_offset(l));
-        lbytes.push_back(lay.blob_bytes(l) * (uint64_t) n_expert);
+        lbytes.push_back(lay.layer_bytes(l));
     }
     bounds.push_back(want);
     PinnedArena* a = new PinnedArena(want + (uint64_t) blob, bounds, shared_arena_file,
@@ -1849,7 +1854,7 @@ const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) co
     if (slice_bytes_ == 0) return dev_slice_[0] + lay.blob_offset(layer, expert);
     // one registration slice per layer
     if ((size_t) layer >= dev_slice_.size()) return nullptr;
-    return dev_slice_[(size_t) layer] + (uint64_t) expert * lay.blob_bytes(layer);
+    return dev_slice_[(size_t) layer] + (lay.blob_offset(layer, expert) - lay.layer_offset(layer));
 }
 
 const uint8_t* ArenaExpertSource::resident_blob(int64_t layer, int64_t expert) const {

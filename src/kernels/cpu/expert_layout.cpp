@@ -1,6 +1,9 @@
 // src/kernels/cpu/expert_layout.cpp - the per-layer expert table.  See the header.
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
+#include "basalt/artifact/gguf_reader.hpp"
+
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -144,6 +147,8 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
     L.fmt.resize((size_t) n_layers);
     L.offset.assign((size_t) n_layers, ~0ull);
     L.bytes.assign((size_t) n_layers, 0);
+    L.eoff.assign((size_t) n_layers, {});
+    L.ek.assign((size_t) n_layers, {});
     L.max_blob = 0;
     std::string line;
     while (std::getline(in, line)) {
@@ -177,7 +182,42 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
             return false;
         }
         NativeFmt f;
-        if (!native_fmt((int) gt, (int) dt, n_embd, n_ff, f, err, swiglu_limit, (int) ut)) return false;
+        std::vector<uint64_t> eo;
+        std::vector<uint8_t> ekl;
+        if (basalt::ms_mix_type((uint32_t) gt)) {   // v9: one K an expert; the format is the widest K's, the slot its blob plus the head
+            std::string ks;
+            if (L.version < 9 || dt != gt || ut != gt || !(ss >> ks) || (int64_t) ks.size() != L.n_expert) {
+                err = "expert layout: a malformed mixed line: " + line.substr(0, 80);
+                return false;
+            }
+            int kmax = 0;
+            for (char c : ks) {
+                if (c < '2' || c > '6') {
+                    err = "expert layout: layer " + std::to_string(l) + ": K " + std::string(1, c);
+                    return false;
+                }
+                kmax = std::max(kmax, c - '0');
+            }
+            if (kmax != basalt::ms_mix_bits((uint32_t) gt)) {
+                err = "expert layout: layer " + std::to_string(l) + ": type " + std::to_string(gt) + " but widest K " +
+                      std::to_string(kmax);
+                return false;
+            }
+            if (!native_fmt(120 + kmax, 120 + kmax, n_embd, n_ff, f, err, swiglu_limit, 120 + kmax)) return false;
+            f.ms_mix = true;
+            f.gu_type = f.d_type = f.up_type = (int) gt;
+            f.bytes += kMsMixHead;
+            eo.resize(ks.size() + 1);
+            ekl.resize(ks.size());
+            for (size_t e = 0; e < ks.size(); ++e) {
+                NativeFmt g;
+                if (!native_fmt(120 + (ks[e] - '0'), 120 + (ks[e] - '0'), n_embd, n_ff, g, err, swiglu_limit)) return false;
+                eo[e + 1] = eo[e] + kMsMixHead + g.bytes;
+                ekl[e] = (uint8_t) (ks[e] - '0');
+            }
+        } else if (!native_fmt((int) gt, (int) dt, n_embd, n_ff, f, err, swiglu_limit, (int) ut)) {
+            return false;
+        }
         if (f.bytes != blob) {
             err = "expert layout: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);
@@ -186,6 +226,8 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
         L.fmt[(size_t) l] = f;
         L.offset[(size_t) l] = off;
         L.bytes[(size_t) l] = blob;
+        L.eoff[(size_t) l] = std::move(eo);
+        L.ek[(size_t) l] = std::move(ekl);
         if (blob > L.max_blob) L.max_blob = blob;
     }
     uint64_t at = 0;
@@ -194,7 +236,7 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
             err = "expert layout: layer " + std::to_string(l) + " is missing or not contiguous";
             return false;
         }
-        at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
+        at += L.layer_bytes(l);
     }
     L.total = at;
     g_layout = L;

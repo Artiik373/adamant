@@ -221,6 +221,7 @@ struct Prefill::Run::Chunk::Experts::Group {
                               MMQ_GROUP <= mmq::kGatherGroupMax;
     mmq::GatherGroup gg;
     int gg_slots[MMQ_GROUP];
+    uint8_t gg_k[MMQ_GROUP] = {};   // a mixed MS layer: the gathered experts' K
     int gg_nslots = 0;   // ring slots gathered by the next flush
 };
 

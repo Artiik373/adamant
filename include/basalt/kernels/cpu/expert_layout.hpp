@@ -18,7 +18,10 @@ struct ExpertLayout {
     bool native = false;
     int64_t n_layers = 0, n_expert = 0;
     std::vector<NativeFmt> fmt;           ///< per layer
-    std::vector<uint64_t> offset, bytes;  ///< per layer: where its 512 blobs start, bytes per blob
+    std::vector<uint64_t> offset, bytes;  ///< per layer: where its 512 blobs start, bytes per blob (a slot)
+    std::vector<std::vector<uint64_t>> eoff;   ///< per layer: a mixed layer's blob offsets from its start (n_expert + 1),
+                                               ///< empty for a layer of one format
+    std::vector<std::vector<uint8_t>> ek;       ///< per layer: a mixed layer's K an expert (empty otherwise)
     int version = 0;                      ///< the layout header's version (0 = none given)
     uint64_t max_blob = 0;
     uint64_t total = 0;                   ///< the experts section's size
@@ -28,7 +31,13 @@ struct ExpertLayout {
         return offset[(size_t) layer];
     }
     uint64_t blob_offset(int64_t layer, int64_t expert) const {
-        return layer_offset(layer) + (uint64_t) expert * blob_bytes(layer);
+        const auto& e = eoff[(size_t) layer];
+        return layer_offset(layer) + (e.empty() ? (uint64_t) expert * blob_bytes(layer) : e[(size_t) expert]);
+    }
+    /// All of a layer's blobs (a mixed layer's are smaller than its slot).
+    uint64_t layer_bytes(int64_t layer) const {
+        const auto& e = eoff[(size_t) layer];
+        return e.empty() ? (uint64_t) n_expert * blob_bytes(layer) : e.back();
     }
 };
 
@@ -58,12 +67,12 @@ void act_quant_any(const float* x, int n, ActQ& a);
 /// The process-wide layout (empty until `expert_layout_load_text` succeeds).
 const ExpertLayout& expert_layout();
 /// Loads the layout from its text (the model's `experts.layout` section: "# experts vN: ..." then one line per layer,
-/// `layer gu_type d_type offset blob_bytes`, from v7 then `up_type`; further columns are ignored).  A newer version is
-/// refused.
+/// `layer gu_type d_type offset blob_bytes`, from v7 then `up_type`; from v9 a mixed MS layer (type 127) then one K
+/// digit an expert; further columns are ignored).  A newer version is refused.
 /// `n_embd` / `n_ff` / `swiglu_limit`: the model's expert geometry.
 bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err,
                              int64_t n_embd, int64_t n_ff, float swiglu_limit = 0.f);
 /// The newest layout version this engine reads.
-inline constexpr int kExpertLayoutVersion = 8;   // v6: NVFP4 blobs end in a 16-byte scale tail; v7: up_type column; v8: EXL3 types (exl3.hpp)
+inline constexpr int kExpertLayoutVersion = 9;   // v6: NVFP4 blobs end in a 16-byte scale tail; v7: up_type column; v8: EXL3 types (exl3.hpp); v9: mixed MS layers
 
 }  // namespace basalt::kernels::cpu

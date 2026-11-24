@@ -150,7 +150,7 @@ int resident_plan(Context& context) {
     basalt::core::FileCache file_cache;
     for (int64_t l = 0; l < g.n_layers; ++l)
         file_cache.layer_bytes = std::max<uint64_t>(file_cache.layer_bytes,
-                                                    (uint64_t) g.n_expert * basalt::kernels::cpu::expert_layout().blob_bytes(l));
+                                                    basalt::kernels::cpu::expert_layout().layer_bytes(l));
     // --serve: free places in the RAM copy take the evicted experts (no exchange buffers)
     const bool adapt_fast_on = o.serve && o.adapt_every > 0 && o.adapt_swaps > 0;
     // ---- the host buffers serving takes at its peak, before the RAM copy reads the free memory: RAM held for the prompt

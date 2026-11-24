@@ -38,6 +38,9 @@ struct NativeFmt {
                                         ///< EXL3 projection records [gate | up | down] (exl3.hpp), activations are fp16
     int ms_k = 0;                       ///< MS layer: K bits a weight (0: another format); the blob is three MS payloads
                                         ///< [gate | up | down] (ms_expert.hpp), activations are fp32
+    bool ms_mix = false;                ///< MS layer whose experts carry their own K (layout v9): each blob is a
+                                        ///< kMsMixHead-byte head (byte 0 = K), then the payloads at that K; the other
+                                        ///< fields describe the widest K, bytes the slot
     float gate_softcap = 0.f, up_softcap = 0.f;   ///< > 0: the softcapped SwiGLU (swiglu.hpp); the caller sets them
 };
 
@@ -50,6 +53,14 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);
 /// h (n_ff floats) -> the down activation (h_bytes).
 void native_quant_h(const NativeFmt& f, const float* h, void* dst);
+
+/// A mixed MS layer's blob head (layout v9).
+inline constexpr size_t kMsMixHead = 16;
+/// The format of one blob of an MS layer: f itself, or for a mixed layer the format at the blob's own K, with
+/// `blob` moved past the head.
+const NativeFmt& ms_blob_fmt(const NativeFmt& f, const uint8_t*& blob);
+/// A mixed MS layer's format at width k (2..6): its geometry and SwiGLU limit, one K.
+const NativeFmt& ms_fmt_k(const NativeFmt& f, int k);
 
 /// NVFP4 blobs end in FP32 {s_gate, s_up, s_down, 0}: the scale tail's byte count.
 inline constexpr size_t kNvfp4Tail = 16;

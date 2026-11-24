@@ -255,7 +255,7 @@ bool dec_moe_formats_ok(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, i
         return d_type == gu_type && (up_type < 0 || up_type == gu_type) && n_embd == 2560 && n_ff == 640 &&
                !native_grouped_v1();
     // MS experts: the same, on ms_expert_grouped
-    if (basalt::ms_tensor_type((uint32_t) gu_type))
+    if (basalt::ms_expert_type((uint32_t) gu_type))
         return d_type == gu_type && (up_type < 0 || up_type == gu_type) && ms_expert_supported(gu_type, n_embd, n_ff) &&
                !native_grouped_v1();
     if (up_type >= 0 && up_type != gu_type) {

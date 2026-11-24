@@ -7,6 +7,7 @@
 #include "basalt/kernels/ms_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/cpu/native_expert.hpp"
 #include "kernels/ms_1mad_avx2.h"
 
 #include <cuda_fp16.h>
@@ -53,6 +54,27 @@ void ref_gemv(const std::vector<uint8_t>& p, const float* x, float* y, int n_in,
     const int8_t* signs = (const int8_t*) p.data() + (size_t) n_out * ms::ms_row_bytes(n_in, K);
     ms::fwht_rotate_input(x, signs, xr.data(), n_in, basalt::ms_hadamard_block((uint64_t) n_in));
     ms::ms_1mad_gemv<K>(p.data(), xr.data(), y, n_out, n_in);
+}
+
+void ref_gemv_k(int k, const std::vector<uint8_t>& p, const float* x, float* y, int n_in, int n_out) {
+    switch (k) {
+    case 2: ref_gemv<2>(p, x, y, n_in, n_out); break;
+    case 3: ref_gemv<3>(p, x, y, n_in, n_out); break;
+    case 4: ref_gemv<4>(p, x, y, n_in, n_out); break;
+    case 5: ref_gemv<5>(p, x, y, n_in, n_out); break;
+    default: ref_gemv<6>(p, x, y, n_in, n_out); break;
+    }
+}
+
+// One expert's blob [gate | up | down] at K; a mixed layer's blob starts with its head (byte 0 = K).
+std::vector<uint8_t> random_blob(int k, bool mix, std::mt19937& rng) {
+    const int H = 2560, FF = 640;
+    std::vector<uint8_t> b(mix ? basalt::kernels::cpu::kMsMixHead : 0, 0);
+    if (mix) b[0] = (uint8_t) k;
+    for (const std::vector<uint8_t>& p : {random_payload(k, H, FF, rng), random_payload(k, H, FF, rng),
+                                          random_payload(k, FF, H, rng)})
+        b.insert(b.end(), p.begin(), p.end());
+    return b;
 }
 
 template <int K>
@@ -313,13 +335,16 @@ void bench_dequant_expert() {
 
 // native_expert_grouped on MS experts (2560 x 640): groups of 1, 3, 6 (two passes of the block's 4) and 2 entries on
 // random tokens and output rows, against gate/up -> SwiGLU -> down on the CPU from the same dequantized q8_1 inputs.
-template <int K>
-void run_grouped(float limit, uint32_t seed) {
-    const int type = 120 + K, H = 2560, FF = 640, NT = 5;
+// ks: each group's K; more than one K makes a mixed layer (type 130 + the widest K, blobs with their head).
+void run_grouped(const std::vector<int>& ks, float limit, uint32_t seed) {
+    const int kmax = *std::max_element(ks.begin(), ks.end());
+    const bool mix = *std::min_element(ks.begin(), ks.end()) != kmax;
+    const int type = (mix ? 130 : 120) + kmax, H = 2560, FF = 640, NT = 5;
     const gpu::NativeExpertLayout L = gpu::native_expert_layout(type, type, H, FF, limit);
     if (!gpu::native_expert_supported(type, type, H, FF) ||
-        L.bytes != 2 * (FF * ms::ms_row_bytes(H, K) + H) + H * ms::ms_row_bytes(FF, K) + FF) {
-        std::printf("  %s grouped: unsupported or blob %zu FAIL\n", basalt::ggml_type_name(type), L.bytes);
+        L.bytes != 2 * (FF * ms::ms_row_bytes(H, kmax) + H) + H * ms::ms_row_bytes(FF, kmax) + FF +
+                       (mix ? basalt::kernels::cpu::kMsMixHead : 0)) {
+        std::printf("  type %d grouped: unsupported or blob %zu FAIL\n", type, L.bytes);
         ++g_fail;
         return;
     }
@@ -327,13 +352,7 @@ void run_grouped(float limit, uint32_t seed) {
     const std::vector<int> sizes = {1, 3, 6, 2};
     const int G = (int) sizes.size();
     std::vector<std::vector<uint8_t>> blobs;
-    for (int g = 0; g < G; ++g) {
-        std::vector<uint8_t> b = random_payload(K, H, FF, rng), u = random_payload(K, H, FF, rng),
-                             d = random_payload(K, FF, H, rng);
-        b.insert(b.end(), u.begin(), u.end());
-        b.insert(b.end(), d.begin(), d.end());
-        blobs.push_back(std::move(b));
-    }
+    for (int g = 0; g < G; ++g) blobs.push_back(random_blob(ks[g], mix, rng));
     std::vector<int32_t> start(G + 1, 0), tok, dst;
     for (int g = 0; g < G; ++g) start[g + 1] = start[g] + sizes[g];
     const int E = start[G];
@@ -394,9 +413,10 @@ void run_grouped(float limit, uint32_t seed) {
     double err = 0, mag = 0;
     std::vector<float> xd(H), gg(FF), uu(FF), hh(FF), y(H);
     for (int g = 0; g < G; ++g) {
-        const std::vector<uint8_t>& b = blobs[g];
-        const std::vector<uint8_t> pg(b.begin(), b.begin() + L.up_off), pu(b.begin() + L.up_off, b.begin() + L.down_off),
-            pd(b.begin() + L.down_off, b.end());
+        const int K = ks[g];
+        const auto b = blobs[g].begin() + (mix ? basalt::kernels::cpu::kMsMixHead : 0);
+        const size_t up_off = FF * ms::ms_row_bytes(H, K) + H, down_off = 2 * up_off;
+        const std::vector<uint8_t> pg(b, b + up_off), pu(b + up_off, b + down_off), pd(b + down_off, blobs[g].end());
         for (int e = start[g]; e < start[g + 1]; ++e) {
             for (int i = 0; i < H; ++i) {
                 const uint8_t* qb8 = q.data() + ((size_t) tok[e] * (H / 32) + i / 32) * 36;
@@ -404,8 +424,8 @@ void run_grouped(float limit, uint32_t seed) {
                 std::memcpy(&d16, qb8, 2);
                 xd[i] = ms::fp16_to_fp32(d16) * (float) (int8_t) qb8[4 + i % 32];
             }
-            ref_gemv<K>(pg, xd.data(), gg.data(), H, FF);
-            ref_gemv<K>(pu, xd.data(), uu.data(), H, FF);
+            ref_gemv_k(K, pg, xd.data(), gg.data(), H, FF);
+            ref_gemv_k(K, pu, xd.data(), uu.data(), H, FF);
             for (int i = 0; i < FF; ++i) {
                 float a = gg[i], c = uu[i];
                 if (limit > 0.f) {
@@ -414,7 +434,7 @@ void run_grouped(float limit, uint32_t seed) {
                 }
                 hh[i] = a / (1.f + std::exp(-a)) * c;
             }
-            ref_gemv<K>(pd, hh.data(), y.data(), FF, H);
+            ref_gemv_k(K, pd, hh.data(), y.data(), FF, H);
             for (int r = 0; r < H; ++r) {
                 err = std::max(err, (double) std::fabs(got[(size_t) dst[e] * H + r] - y[r]));
                 mag = std::max(mag, (double) std::fabs(y[r]));
@@ -424,21 +444,18 @@ void run_grouped(float limit, uint32_t seed) {
     const double rel = err / (mag + 1e-30), tol = 1e-4;
     const bool ok = rel <= tol;
     std::printf("  %s grouped experts limit %g, %d groups, %d entries  max err %.2e of max |y| %.2e  (rel %.1e, tol %.0e) %s\n",
-                basalt::ggml_type_name(type), limit, G, E, err, mag, rel, tol, ok ? "ok" : "FAIL");
+                mix ? "MS mixed" : basalt::ggml_type_name(type), limit, G, E, err, mag, rel, tol, ok ? "ok" : "FAIL");
     if (!ok) ++g_fail;
 }
 
 // One layer's experts as decode runs them: `groups` experts of `per` entries each, blobs rotating through more memory
-// than the L2 holds, replayed in a CUDA graph (the engine's launch form).
+// than the L2 holds, replayed in a CUDA graph (the engine's launch form).  mix: the same K as a mixed layer's blobs.
 template <int K>
-void bench_grouped(int groups, int per) {
-    const int type = 120 + K, H = 2560, FF = 640, SETS = 8;
+void bench_grouped(int groups, int per, bool mix = false) {
+    const int type = (mix ? 130 : 120) + K, H = 2560, FF = 640, SETS = 8;
     const gpu::NativeExpertLayout L = gpu::native_expert_layout(type, type, H, FF, 0.f);
     std::mt19937 rng(9);
-    std::vector<uint8_t> b = random_payload(K, H, FF, rng), u = random_payload(K, H, FF, rng),
-                         d = random_payload(K, FF, H, rng);
-    b.insert(b.end(), u.begin(), u.end());
-    b.insert(b.end(), d.begin(), d.end());
+    const std::vector<uint8_t> b = random_blob(K, mix, rng);
     std::vector<unsigned long long> hp((size_t) groups * SETS);
     std::vector<void*> dbl(hp.size());
     for (size_t i = 0; i < hp.size(); ++i) {
@@ -497,8 +514,8 @@ void bench_grouped(int groups, int per) {
     float ms_ = 0;
     CK(cudaEventElapsedTime(&ms_, e0, e1));
     const double us = ms_ * 1e3 / (IT / PER * PER);
-    std::printf("  bench %s grouped: %.1f us per layer (%d experts x %d entries, %.1f MB) = %.0f GB/s\n",
-                basalt::ggml_type_name(type), us, groups, per, (double) L.bytes * groups / 1e6,
+    std::printf("  bench %s%s grouped: %.1f us per layer (%d experts x %d entries, %.1f MB) = %.0f GB/s\n",
+                basalt::ggml_type_name(120 + K), mix ? " mixed" : "", us, groups, per, (double) L.bytes * groups / 1e6,
                 (double) L.bytes * groups / (us * 1e-6) / 1e9);
     CK(cudaGraphExecDestroy(exec));
     CK(cudaGraphDestroy(graph));
@@ -594,15 +611,18 @@ int main() {
     bench_dequant_expert<3>();
     bench_dequant_expert<2>();
     bench_dequant_expert<5>();
-    run_grouped<4>(0.f, 12);
-    run_grouped<3>(0.f, 13);
-    run_grouped<6>(0.f, 14);
-    run_grouped<2>(0.f, 46);
-    run_grouped<5>(0.f, 47);
-    run_grouped<5>(7.f, 48);
-    run_grouped<4>(7.f, 15);
+    run_grouped({4, 4, 4, 4}, 0.f, 12);
+    run_grouped({3, 3, 3, 3}, 0.f, 13);
+    run_grouped({6, 6, 6, 6}, 0.f, 14);
+    run_grouped({2, 2, 2, 2}, 0.f, 46);
+    run_grouped({5, 5, 5, 5}, 0.f, 47);
+    run_grouped({5, 5, 5, 5}, 7.f, 48);
+    run_grouped({4, 4, 4, 4}, 7.f, 15);
+    run_grouped({3, 2, 4, 3}, 0.f, 49);
+    run_grouped({6, 2, 5, 3}, 7.f, 50);
     bench_grouped<4>(10, 1);
     bench_grouped<3>(10, 1);
+    bench_grouped<3>(10, 1, true);
     bench_grouped<2>(10, 1);
     bench_grouped<5>(10, 1);
     bench_grouped<4>(20, 2);

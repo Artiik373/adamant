@@ -48,7 +48,14 @@ void Prefill::Run::Chunk::Experts::Group::flush() {
     for (int i = 0; i < gg_nslots; ++i)
         cudaStreamWaitEvent(m.cs, m.copied[gg_slots[i]], 0);
     float* sc = f.tail ? grp_scales(m.grp_d) : nullptr;
-    if (f.ms_k) {   // MS: the group's Q8_0 slots from the trellis, one launch
+    if (f.ms_mix) {   // shortcut: a mixed layer converts one blob a launch (each its own K); group by K if prompts show it
+        for (int i = gg.first; i < gg.n; ++i) {
+            const auto& g = basalt::kernels::cpu::ms_fmt_k(f, gg_k[i]);
+            basalt::kernels::ms_expert_to_q8_0(g.gu_type, gg.blob[i] + basalt::kernels::cpu::kMsMixHead, g.n_embd,
+                                               g.n_ff, g.up_off, g.down_off, m.grp_gu + i * mmq_gub,
+                                               m.grp_d + i * mmq_db, m.cs);
+        }
+    } else if (f.ms_k) {   // MS: the group's Q8_0 slots from the trellis, one launch
         basalt::kernels::ms_experts_to_q8_0(f.gu_type, gg.blob + gg.first, gg.n - gg.first, f.n_embd, f.n_ff, f.up_off,
                                             f.down_off, m.grp_gu + gg.first * mmq_gub, mmq_gub,
                                             m.grp_d + gg.first * mmq_db, mmq_db, m.cs);
@@ -75,14 +82,17 @@ bool Prefill::Run::Chunk::Experts::Group::compute_mmq(size_t j, const uint8_t* b
     const size_t q = j % MMQ_GROUP;
     if (group_gather) {
         gg.blob[q] = blob_dev;
+        if (lay.native && lay.fmt[(size_t) l].ms_mix) gg_k[q] = lay.ek[(size_t) l][(size_t) order[j]];
         gg.n = (int) q + 1;
         if (slot >= 0) gg_slots[gg_nslots++] = slot;
         if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
         flush();
         gg = mmq::GatherGroup{};
     } else if (lay.native && lay.fmt[(size_t) l].ms_k) {   // MS: the slot's Q8_0 rows from the trellis
-        const auto& f = lay.fmt[(size_t) l];
-        basalt::kernels::ms_expert_to_q8_0(f.gu_type, blob_dev, f.n_embd, f.n_ff, f.up_off, f.down_off,
+        const auto& fl = lay.fmt[(size_t) l];
+        const auto& f = fl.ms_mix ? basalt::kernels::cpu::ms_fmt_k(fl, lay.ek[(size_t) l][(size_t) order[j]]) : fl;
+        basalt::kernels::ms_expert_to_q8_0(f.gu_type, blob_dev + (fl.ms_mix ? basalt::kernels::cpu::kMsMixHead : 0),
+                                           f.n_embd, f.n_ff, f.up_off, f.down_off,
                                            m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
     } else if (lay.native) {
         const auto& f = lay.fmt[(size_t) l];

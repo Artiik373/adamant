@@ -49,6 +49,10 @@ inline bool exl3_tensor_type(uint32_t t) { return t > 96 && t <= 112; }
 // y = W_rot * H(signs * x). H is the orthonormal block Hadamard of size ms_hadamard_block(n_in).
 inline bool ms_tensor_type(uint32_t t) { return t >= 122 && t <= 126; }
 inline int ms_bits(uint32_t t) { return (int) t - 120; }
+// A routed-expert layer whose experts carry their own K (experts.layout v9) is type 130 + its widest K.
+inline bool ms_mix_type(uint32_t t) { return t >= 132 && t <= 136; }
+inline int ms_mix_bits(uint32_t t) { return (int) t - 130; }
+inline bool ms_expert_type(uint32_t t) { return ms_tensor_type(t) || ms_mix_type(t); }
 inline uint64_t ms_row_bytes(uint64_t n_in, int k) { return (4 + ((n_in - 1) * (uint64_t) k + 7) / 8 + 3) & ~uint64_t{3}; }
 // Largest power-of-two divisor of n_in, at most 512 (the converter uses the same rule).
 inline int ms_hadamard_block(uint64_t n_in) {

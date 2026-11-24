@@ -34,7 +34,7 @@ constexpr int RING_MAX = 384;           // the arrays; the ring itself is ring_s
 extern int64_t g_stream_all_min;
 inline int64_t stream_all_min() { return g_stream_all_min; }
 // The type a layer's experts take on the MMQ path: MS experts become Q8_0 as they are gathered (ms_expert_to_q8_0)
-inline int mmq_type_of(int t) { return basalt::ms_tensor_type((uint32_t) t) ? 8 : t; }
+inline int mmq_type_of(int t) { return basalt::ms_expert_type((uint32_t) t) ? 8 : t; }
 // The streamed ring's slots (one whole expert blob each, the same for every pack).  g_ring_depth caps the depth the
 // next layout is laid out with.
 constexpr int kPrefillRing = 256;

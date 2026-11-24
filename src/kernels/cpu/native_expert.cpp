@@ -13,6 +13,7 @@
 #include "basalt/kernels/cpu/ms_expert.hpp"
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/kernels/cpu/swiglu.hpp"
+#include "basalt/log.hpp"
 
 #include "basalt/ggml/ggml.h"
 
@@ -130,8 +131,9 @@ const MsAct* const* ms_inputs(MsIn& c, const int8_t* signs, const void* const* a
     return c.ptr.data();
 }
 
-void ms_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff, int r0,
+void ms_gu_rows(const NativeFmt& fl, const uint8_t* blob, const void* const* act, int nt, float* const* ff, int r0,
                 int r1) {
+    const NativeFmt& f = ms_blob_fmt(fl, blob);
     const int n = (int) f.n_embd;
     const int8_t* sg = (const int8_t*) blob + f.up_off - n;   // each payload's signs follow its rows
     const int8_t* su = (const int8_t*) blob + f.down_off - n;
@@ -156,8 +158,9 @@ void ms_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act,
         }
 }
 
-void ms_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out, int r0,
+void ms_down_rows(const NativeFmt& fl, const uint8_t* blob, const void* const* hq, int nt, float* const* out, int r0,
                   int r1) {
+    const NativeFmt& f = ms_blob_fmt(fl, blob);
     const int n = (int) f.n_ff;
     const uint8_t* rows = blob + f.down_off;
     thread_local MsIn cd;
@@ -427,6 +430,26 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
         return false;
     }
     return true;
+}
+
+const NativeFmt& ms_blob_fmt(const NativeFmt& f, const uint8_t*& blob) {
+    if (!f.ms_mix) return f;
+    const NativeFmt& g = ms_fmt_k(f, blob[0]);
+    blob += kMsMixHead;
+    return g;
+}
+
+const NativeFmt& ms_fmt_k(const NativeFmt& f, int k) {
+    thread_local NativeFmt by_k[7];
+    NativeFmt& g = by_k[k < 2 || k > 6 ? 0 : k];
+    if (g.ms_k != k || g.n_embd != f.n_embd || g.n_ff != f.n_ff || g.swiglu_limit != f.swiglu_limit) {
+        std::string err;
+        if (k < 2 || k > 6 || !native_fmt(120 + k, 120 + k, f.n_embd, f.n_ff, g, err, f.swiglu_limit)) {
+            basalt::log::error("basalt", "mixed MS expert: bad K %d", k);
+            std::exit(1);
+        }
+    }
+    return g;
 }
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {

@@ -91,9 +91,10 @@ bool Prefill::Run::Chunk::Experts::Group::compute_fp16(size_t j, const uint8_t* 
     if (lay.native) {
         // a native pack's layer, dequantized by llama.cpp's own formulas
         const auto& f = lay.fmt[(size_t) l];
-        if (f.ms_k) {   // MS: each payload's rows, the input rotation undone
-            basalt::kernels::ms_dequant_expert_f16(f.gu_type, blob_dev, f.n_embd, f.n_ff, f.up_off, f.down_off,
-                                                   m.dq_gu[q], m.dq_d[q], dqs);
+        if (f.ms_k) {   // MS: each payload's rows, the input rotation undone (a mixed layer: the expert's own K)
+            const auto& g = f.ms_mix ? basalt::kernels::cpu::ms_fmt_k(f, lay.ek[(size_t) l][(size_t) e]) : f;
+            basalt::kernels::ms_dequant_expert_f16(g.gu_type, blob_dev + (f.ms_mix ? basalt::kernels::cpu::kMsMixHead : 0),
+                                                   g.n_embd, g.n_ff, g.up_off, g.down_off, m.dq_gu[q], m.dq_d[q], dqs);
         } else if (f.exl3_w) {   // EXL3: W_full of the three records, transforms applied
             basalt::kernels::exl3_dequant_gu_f16(f.gu_type, blob_dev, f.up_off, f.n_ff, f.n_embd, m.dq_gu[q], dqs);
             basalt::kernels::exl3_dequant_down_f16(f.d_type, blob_dev + f.down_off, f.n_embd, f.n_ff, m.dq_d[q], dqs);
