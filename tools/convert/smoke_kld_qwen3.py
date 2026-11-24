@@ -16,7 +16,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import copy
 import re
 import sys
 import time
@@ -289,15 +288,21 @@ def main() -> None:
         from ms_viterbi_cuda import viterbi_code_batched_cuda
 
         jobs = []
-        for idx, name, mod, w_target, (a, b) in items:
+        while items:   # popped, so each Hessian is freed once its factors exist
+            idx, name, mod, w_target, (a, b) = items.pop(0)
             blk = largest_pow2_divisor(int(w_target.shape[1]), cap=512)
             w_rot, a_rot, signs = ms.rotate_weight_and_hessian(w_target, a, block_size=blk, seed=(idx + 1) * 10007)
+            del a
             jobs.append({"idx": idx, "name": name, "mod": mod, "blk": blk, "signs": signs, "w": w_rot,
+                         "w0": w_target if (idx + 1) % 28 == 0 else None,
                          "q": torch.empty_like(w_rot), "ua": ms.cholesky_inv_upper(a_rot), "ub": ms.cholesky_inv_upper(b)})
+            del a_rot, b
         for in_f in sorted({j["w"].shape[1] for j in jobs}):
             group = sorted((j for j in jobs if j["w"].shape[1] == in_f), key=lambda j: -j["w"].shape[0])
             assert all(j["w"].shape[0] % rows == 0 for j in group)
-            hu = torch.stack([j["ua"] for j in group])
+            hu = torch.empty(len(group), in_f, in_f, device=group[0]["w"].device)
+            for i, j in enumerate(group):
+                hu[i] = j.pop("ua")
             for r0 in range(0, group[0]["w"].shape[0], rows):
                 act = [j for j in group if j["w"].shape[0] > r0]  # a prefix: the group is sorted by rows
                 r1 = r0 + rows
@@ -308,11 +313,13 @@ def main() -> None:
                         coef = j["ub"][r0:r1, r1:] / torch.diagonal(j["ub"])[r0:r1, None]
                         j["w"][r1:] -= coef.T @ (j["w"][r0:r1] - qj)
             del hu
+            for j in group:
+                del j["ub"]
         for j in jobs:
             w_q = ms.fwht_blocks(j["q"], block_size=j["blk"]) * j["signs"].unsqueeze(0)
             j["mod"].weight.data.copy_(w_q.to(dtype=j["mod"].weight.dtype))
             if (j["idx"] + 1) % 28 == 0:
-                w0 = items[[i[0] for i in items].index(j["idx"])][3]
+                w0 = j["w0"]
                 print(f"  [{j['idx'] + 1}/{len(target_linears)}] {j['name']} rel_err="
                       f"{((w_q - w0).norm() / w0.norm()).item():.4f} ({time.time() - t0:.1f}s)", flush=True)
 
@@ -545,41 +552,51 @@ def tune_scales(model, teacher, target_linears, calib_ids, device, args) -> None
         w.requires_grad_(False)
 
 
-def quantize_guided(model, target_linears, quantize_linear, quantize_many, calib_ids, device, args, chunk_layers: int = 7) -> None:
+def quantize_guided(model, target_linears, quantize_linear, quantize_many, calib_ids, device, args, chunk_layers: int = 10) -> None:
     """Gradient-weighted Hessians from the BF16 model, a few layers at a time. g is the gradient of the next-token
     loss with respect to the layer output. guided (GuidedQuant): per output-row group j, H_j = sum_t (sum_{i in j}
     g_ti^2) x_t x_t^T. kron-*: the pair (A, B) = (sum x x^T, sum g g^T); kron-true samples the labels from the
     model, so E[g g^T] is the Fisher of the model's own distribution."""
     kron = args.calib_mode.startswith("kron")
-    grad_model = copy.deepcopy(model)
-    grad_model.requires_grad_(False)
+    # Gradients come from the model itself; coded weights wait on the CPU until every chunk is done, so the model
+    # stays BF16 for all passes without a second copy on the GPU
+    grad_model = model
+    req = {n: q.requires_grad for n, q in model.named_parameters()}
+    model.requires_grad_(False)
+    coded: dict[nn.Module, torch.Tensor] = {}
     gmods = dict(grad_model.named_modules())
     n_groups = args.guided_groups
-    emb_hook = grad_model.get_input_embeddings().register_forward_hook(lambda _m, _i, out: out.requires_grad_(True))
+    n_layers = model.config.num_hidden_layers
+    a_cache: dict[int, tuple] = {}   # x x^T of one batch, shared by the linears that read the same input
 
     def layer_of(name: str) -> int:
         return int(name.split(".")[2]) if name.startswith("model.layers.") else model.config.num_hidden_layers
 
-    for c in range(0, model.config.num_hidden_layers + 1, chunk_layers):
+    for c in range(0, n_layers + 1, chunk_layers):
         chunk = [(i, n, m) for i, (n, m) in enumerate(target_linears) if c <= layer_of(n) < c + chunk_layers]
         if not chunk:
             continue
         hess: dict[str, torch.Tensor] = {}
-        hooks = []
+        # The graph starts at the chunk's first layer: layers below it build none, backward stops there
+        start = grad_model.model.layers[c] if c < n_layers else grad_model.model.norm
+        hooks = [start.register_forward_pre_hook(lambda _m, a: (a[0].detach().requires_grad_(True), *a[1:]))]
         for _, name, mod in chunk:
             def fwd(_m, inp, out, name=name):
                 x = inp[0].detach().reshape(-1, inp[0].shape[-1]).float()
 
                 def bwd_kron(g):
                     g = g.reshape(x.shape[0], -1).float()
-                    a, b = x.T @ x, g.T @ g
                     if name in hess:
                         hess[name][0].add_(a)
-                        hess[name][1].add_(b)
+                        hess[name][1].addmm_(g.T, g)
                     else:
-                        hess[name] = (a, b)
+                        hess[name] = (a.clone(), g.T @ g)
 
                 if kron:
+                    key = inp[0].data_ptr()
+                    if key not in a_cache:   # the input is held too, so its address is not reused within the batch
+                        a_cache[key] = (inp[0], x.T @ x)
+                    a = a_cache[key][1]
                     out.register_hook(bwd_kron)
                     return
 
@@ -601,6 +618,7 @@ def quantize_guided(model, target_linears, quantize_linear, quantize_many, calib
         with torch.enable_grad():
             for i in range(0, calib_ids.shape[0], args.batch_size):
                 inp = calib_ids[i : i + args.batch_size].to(device=device, dtype=torch.long)
+                a_cache.clear()
                 if args.calib_mode == "kron-true":
                     logits = grad_model(input_ids=inp).logits.float()
                     y = torch.distributions.Categorical(logits=logits.detach()).sample()
@@ -613,14 +631,26 @@ def quantize_guided(model, target_linears, quantize_linear, quantize_many, calib
             hk.remove()
         torch.cuda.synchronize()
         t1 = time.time()
+        bf16 = {mod: mod.weight.detach().clone() for _, _, mod in chunk}
         if kron:
-            quantize_many([(idx, name, mod, mod.weight.detach().float(), hess.pop(name)) for idx, name, mod in chunk])
+            ls = sorted({layer_of(n) for _, n, _ in chunk})
+            for l0 in range(0, len(ls), 3):   # 3 layers per call: full batches, fp32 weight copies of 3 layers only
+                sub = set(ls[l0:l0 + 3])
+                quantize_many([(idx, name, mod, mod.weight.detach().float(), hess.pop(name))
+                               for idx, name, mod in chunk if layer_of(name) in sub])
         for idx, name, mod in chunk if not kron else []:
             quantize_linear(idx, name, mod, mod.weight.detach().float(), hess.pop(name))
+        for mod, w in bf16.items():
+            coded[mod] = mod.weight.detach().cpu()
+            mod.weight.data.copy_(w)
+        del bf16
         torch.cuda.synchronize()
-        print(f"  layers {c}-{c + chunk_layers - 1}: gradients+Hessians {t1 - t0:.0f}s, quantize {time.time() - t1:.0f}s", flush=True)
-    emb_hook.remove()
-    del grad_model
+        print(f"  layers {c}-{c + chunk_layers - 1}: gradients+Hessians {t1 - t0:.0f}s, quantize {time.time() - t1:.0f}s, "
+              f"peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
+    for mod, w in coded.items():
+        mod.weight.data.copy_(w)
+    for n, q in model.named_parameters():
+        q.requires_grad_(req[n])
 
 
 def report(label: str, ref_logits: torch.Tensor, cand_logits: torch.Tensor, t0: float) -> None:
