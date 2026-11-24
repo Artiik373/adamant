@@ -306,7 +306,8 @@ def main() -> None:
             for r0 in range(0, group[0]["w"].shape[0], rows):
                 act = [j for j in group if j["w"].shape[0] > r0]  # a prefix: the group is sorted by rows
                 r1 = r0 + rows
-                q = viterbi_code_batched_cuda(torch.stack([j["w"][r0:r1] for j in act]), hu[: len(act)], args.k, lut)[2]
+                q = viterbi_code_batched_cuda(torch.stack([j["w"][r0:r1] for j in act]), hu[: len(act)], args.k, lut,
+                                              window=args.window, commit=args.commit)[2]
                 for j, qj in zip(act, q):
                     j["q"][r0:r1] = qj
                     if r1 < j["w"].shape[0]:
@@ -438,8 +439,8 @@ def main() -> None:
                 h_all = xf.T @ xf / xf.shape[0]
                 x_ref = x[torch.randperm(x.shape[0], generator=torch.Generator().manual_seed(li))[:2048].to(device)]
             zero = 0
-            for e0 in range(0, ex.gate_up_proj.shape[0], 16):
-                es = list(range(e0, min(e0 + 16, ex.gate_up_proj.shape[0])))
+            for e0 in range(0, ex.gate_up_proj.shape[0], 8):   # 8 per call keeps the search under the GPU's memory
+                es = list(range(e0, min(e0 + 8, ex.gate_up_proj.shape[0])))
                 hs = [expert_hessians(x, idx, e, ex.gate_up_proj[e].float(), wts if args.hess_affinity else None,
                                       args.hess_tau, h_all, x_ref, tw) for e in es]
                 zero += sum(1 for h in hs if h[2] == 0)
@@ -469,6 +470,46 @@ def _scaled_experts_forward(self, hidden_states, top_k_index, top_k_weights):
         gu = nn.functional.linear(hidden_states[tok], self.gate_up_proj[e]) * self.ms_a_gu[e].to(hidden_states.dtype)
         g, u = gu.chunk(2, dim=-1)
         y = nn.functional.linear(self.act_fn(g) * u, self.down_proj[e]) * self.ms_a_d[e].to(hidden_states.dtype)
+        out.index_add_(0, tok, (y * top_k_weights[tok, pos, None]).to(out.dtype))
+    return out
+
+
+class _View:
+    """A slice of a fused weight where the coders expect a module with .weight."""
+
+    def __init__(self, w: torch.Tensor):
+        self.weight = w
+
+
+def _kron_experts_forward(self, hidden_states, top_k_index, top_k_weights):
+    """The fused experts' forward, summing each expert's two-sided Hessian pairs into self.ms_hess: gate/up rows
+    (x x^T, g g^T of the gate/up output) and down rows (a a^T, g g^T of the down output, before the router weight)."""
+    out = torch.zeros_like(hidden_states)
+    mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts + 1).permute(2, 1, 0)
+    hess = self.ms_hess
+
+    def acc(key, a):
+        def hook(g):
+            g = g.reshape(-1, g.shape[-1]).float()
+            if key in hess:
+                hess[key][0].add_(a)
+                hess[key][1].addmm_(g.T, g)
+            else:
+                hess[key] = (a, g.T @ g)
+        return hook
+
+    for e in torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero()[:, 0].tolist():
+        if e == self.num_experts:
+            continue
+        pos, tok = torch.where(mask[e])
+        x = hidden_states[tok]
+        gu = nn.functional.linear(x, self.gate_up_proj[e])
+        g, u = gu.chunk(2, dim=-1)
+        act = self.act_fn(g) * u
+        y = nn.functional.linear(act, self.down_proj[e])
+        xf, af = x.detach().float(), act.detach().float()
+        gu.register_hook(acc(f"{self.ms_name}.gu.{e}", xf.T @ xf))
+        y.register_hook(acc(f"{self.ms_name}.dn.{e}", af.T @ af))
         out.index_add_(0, tok, (y * top_k_weights[tok, pos, None]).to(out.dtype))
     return out
 
@@ -567,6 +608,10 @@ def quantize_guided(model, target_linears, quantize_linear, quantize_many, calib
     gmods = dict(grad_model.named_modules())
     n_groups = args.guided_groups
     n_layers = model.config.num_hidden_layers
+    moe_blocks = [(n, m) for n, m in model.named_modules() if hasattr(m, "experts") and hasattr(m, "gate")
+                  and hasattr(getattr(m, "experts"), "gate_up_proj")]
+    if moe_blocks and kron:
+        chunk_layers = 1   # every expert's two Hessian pairs: one layer per pass
     a_cache: dict[int, tuple] = {}   # x x^T of one batch, shared by the linears that read the same input
 
     def layer_of(name: str) -> int:
@@ -577,6 +622,10 @@ def quantize_guided(model, target_linears, quantize_linear, quantize_many, calib
         if not chunk:
             continue
         hess: dict[str, torch.Tensor] = {}
+        experts = [(n, m.experts) for n, m in moe_blocks if c <= layer_of(n) < c + chunk_layers] if kron else []
+        for n, ex in experts:
+            ex.forward = _kron_experts_forward.__get__(ex)
+            ex.ms_hess, ex.ms_name = hess, n
         # The graph starts at the chunk's first layer: layers below it build none, backward stops there
         start = grad_model.model.layers[c] if c < n_layers else grad_model.model.norm
         hooks = [start.register_forward_pre_hook(lambda _m, a: (a[0].detach().requires_grad_(True), *a[1:]))]
@@ -629,15 +678,30 @@ def quantize_guided(model, target_linears, quantize_linear, quantize_many, calib
         torch.backends.cuda.matmul.allow_tf32 = tf32
         for hk in hooks:
             hk.remove()
+        for _, ex in experts:
+            del ex.forward, ex.ms_hess, ex.ms_name
         torch.cuda.synchronize()
         t1 = time.time()
+        for n, ex in experts:   # each expert's gate/up and down rows as views of the fused weights
+            for e in range(ex.gate_up_proj.shape[0]):
+                for part, wt in (("gu", ex.gate_up_proj), ("dn", ex.down_proj)):
+                    key = f"{n}.{part}.{e}"
+                    if key not in hess:   # no routed token: no statistics, plain rounding
+                        o, i = wt.shape[1:]
+                        hess[key] = (torch.eye(i, device=device), torch.eye(o, device=device))
+                    chunk.append((10**6 + 4096 * layer_of(n) + 2 * e + (part == "dn"), key, _View(wt.data[e])))
         bf16 = {mod: mod.weight.detach().clone() for _, _, mod in chunk}
         if kron:
-            ls = sorted({layer_of(n) for _, n, _ in chunk})
-            for l0 in range(0, len(ls), 3):   # 3 layers per call: full batches, fp32 weight copies of 3 layers only
-                sub = set(ls[l0:l0 + 3])
-                quantize_many([(idx, name, mod, mod.weight.detach().float(), hess.pop(name))
-                               for idx, name, mod in chunk if layer_of(name) in sub])
+            print(f"  layers {c}-{c + chunk_layers - 1}: Hessians done, {torch.cuda.memory_allocated() / 2**30:.1f} GiB "
+                  f"allocated", flush=True)
+            dense = [t for t in chunk if not isinstance(t[2], _View)]
+            ls = sorted({layer_of(n) for _, n, _ in dense})
+            # coder calls: 3 layers of linears, or 32 expert matrices; full batches, bounded fp32 copies
+            parts = [[t for t in dense if layer_of(t[1]) in set(ls[l0:l0 + 3])] for l0 in range(0, len(ls), 3)]
+            ex_items = [t for t in chunk if isinstance(t[2], _View)]
+            parts += [ex_items[i:i + 32] for i in range(0, len(ex_items), 32)]
+            for part in parts:
+                quantize_many([(idx, name, mod, mod.weight.detach().float(), hess.pop(name)) for idx, name, mod in part])
         for idx, name, mod in chunk if not kron else []:
             quantize_linear(idx, name, mod, mod.weight.detach().float(), hess.pop(name))
         for mod, w in bf16.items():
