@@ -150,7 +150,12 @@ def expert_hessians(x: torch.Tensor, idx: torch.Tensor, e: int, w_gu: torch.Tens
     return (s_in + t * h_all) / (m + t), (s_dn + t * hd_all) / (m + t), n
 
 
+def k_label(k) -> str:
+    return f"MS_C{k}" if isinstance(k, int) else "MS mix " + "/".join(f"C{w}:{k.count(w)}" for w in sorted(set(k)))
+
+
 def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0.0) -> dict:
+    """k: one width for the layer, or a list with one width per expert (a mixed layer)."""
     ex = moe.experts
     h_all = x_ref = None
     if tau > 0:   # the layer-wide statistics the shrinkage pulls toward: all tokens, and a fixed sample of them
@@ -167,10 +172,18 @@ def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0
             es = list(range(e0, min(e0 + eb, n_exp)))
             hs = [expert_hessians(x, idx, e, ex.gate_up_proj[e].float(), wts, tau, h_all, x_ref) for e in es]
             zero += sum(1 for h in hs if h[2] == 0)
-            gu = code(ex.gate_up_proj[es].float(), torch.stack([h[0] for h in hs]), k, lut, [l * 4096 + 2 * e + 1 for e in es])
-            dn = code(ex.down_proj[es].float(), torch.stack([h[1] for h in hs]), k, lut, [l * 4096 + 2 * e + 2 for e in es])
-            rb_gu = ms_row_bytes(n_embd, k) * n_ff
-            for (rows, signs, _), (rows_d, signs_d, _) in zip(gu, dn):
+            ks = [k] * len(es) if isinstance(k, int) else [k[e] for e in es]
+            got = {}
+            for kk in sorted(set(ks)):   # one coder call a width
+                sub = [i for i, ki in enumerate(ks) if ki == kk]
+                ids = [es[i] for i in sub]
+                gu = code(ex.gate_up_proj[ids].float(), torch.stack([hs[i][0] for i in sub]), kk, lut, [l * 4096 + 2 * e + 1 for e in ids])
+                dn = code(ex.down_proj[ids].float(), torch.stack([hs[i][1] for i in sub]), kk, lut, [l * 4096 + 2 * e + 2 for e in ids])
+                for e, a, b in zip(ids, gu, dn):
+                    got[e] = (kk, a, b)
+            for e in es:   # in expert order
+                kk, (rows, signs, _), (rows_d, signs_d, _) = got[e]
+                rb_gu = ms_row_bytes(n_embd, kk) * n_ff
                 files["gate"].write(rows[:rb_gu] + signs.tobytes())
                 files["up"].write(rows[rb_gu:] + signs.tobytes())
                 files["down"].write(rows_d + signs_d.tobytes())
@@ -503,7 +516,9 @@ def main() -> None:
     cfg = Qwen4ExpTextConfig(**tc)
     nl = cfg.num_hidden_layers
     plan = json.loads(args.plan.read_text())["experts_k"]
-    assert len(plan) == nl and all(k in MS_BITS for k in plan), plan
+    # a layer's entry: one width, or a list of one width per routed expert
+    assert len(plan) == nl and all(k in MS_BITS if isinstance(k, int) else len(k) == cfg.num_experts and set(k) <= set(MS_BITS)
+                                   for k in plan), "bad plan"
     wmap = json.loads((args.hf_dir / "model.safetensors.index.json").read_text())["weight_map"]
     calib = torch.load(args.calib, map_location="cpu", weights_only=True)
     cal_ids, _ = split_calib(calib, args.calib_seqs, 0)
@@ -578,7 +593,7 @@ def main() -> None:
             del layer, mods, x
             torch.cuda.empty_cache()
             torch.save({"next_layer": l + 1, "h": h, "hq": hq}, state)
-            print(f"layer {l:2d} {cfg.layer_types[l]:>17}: experts MS_C{plan[l]} (zero-token {rec['zero_token_experts']}) | "
+            print(f"layer {l:2d} {cfg.layer_types[l]:>17}: experts {k_label(plan[l])} (zero-token {rec['zero_token_experts']}) | "
                   + " ".join(f"{k} {v:.0f}s" for k, v in rec["times"].items()) + f" total {time.time() - t0:.0f}s", flush=True)
             continue
         hess, counts = {}, {}
@@ -616,7 +631,7 @@ def main() -> None:
         del layer, moe, x, idx, wts
         torch.cuda.empty_cache()
         torch.save({"next_layer": l + 1, "h": h}, state)
-        print(f"layer {l:2d} {cfg.layer_types[l]:>17}: experts MS_C{plan[l]} (zero-token {rec['zero_token_experts']}) | "
+        print(f"layer {l:2d} {cfg.layer_types[l]:>17}: experts {k_label(plan[l])} (zero-token {rec['zero_token_experts']}) | "
               f"fwd {t_fwd:.0f}s spine {t_spine:.0f}s experts {time.time() - t0 - t_fwd - t_spine:.0f}s "
               f"total {time.time() - t0:.0f}s", flush=True)
 

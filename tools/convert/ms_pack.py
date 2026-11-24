@@ -17,7 +17,10 @@ The tensor type id is 120 + K (MS_C2 = 122 .. MS_C6 = 126).  The rows must alrea
 
 With `<ms-dir>/experts/blk.<l>.experts.json` for every layer (ms_flashnext_convert.py), the `experts` section and
 `experts.layout` are rebuilt too.  An expert blob is three such payloads back to back, [gate | up | down], one K per
-layer; the layout is `# experts v8` with type 120 + K for gate, up and down.
+layer; the layout is `# experts v8` with type 120 + K for gate, up and down.  A record whose k is a list (one K per
+expert) makes a mixed layer: layout v9, type 127, the K list as the line's last column, each blob a 16-byte head
+(byte 0 = K) then the payloads at that K, blobs at their own sizes; blob_bytes is the widest, and the section ends in
+one slot of zeros.
 
 With `<ms-dir>/mtp/` (ms_flashnext_convert.py's drafter: mtp.dense, mtp.dense.index and one layer of expert records)
 the `mtp/dense`, `mtp/dense.index` and `mtp/experts` sections are replaced: the index names the same tensors as the
@@ -98,8 +101,13 @@ def read_records(ms_dir: Path, tensors: dict) -> dict:
     return out
 
 
+MS_MIX = 127      # a layer whose experts carry their own K (layout v9)
+MIX_HEAD = 16     # a mixed layer's blob: byte 0 = K, zero pad, then gate | up | down at that K
+
+
 class Experts:
-    """The routed experts of `<ms-dir>/experts`, one record per layer, checked before anything is written."""
+    """The routed experts of `<ms-dir>/experts`, one record per layer, checked before anything is written.
+    A record's k is one width, or a list of one width per expert (a mixed layer: blobs at their own sizes)."""
 
     def __init__(self, exp_dir: Path, n_layers: int):
         self.layers = []
@@ -108,8 +116,10 @@ class Experts:
             if not p.exists():
                 raise PackError(f"{p}: missing (every layer needs its experts)")
             rec = json.loads(p.read_text(encoding="utf-8"))
-            k, n = int(rec["k"]), int(rec["n_expert"])
-            if k not in MS_BITS:
+            n = int(rec["n_expert"])
+            k = rec["k"] if isinstance(rec["k"], int) else [int(v) for v in rec["k"]]
+            ks = [k] * n if isinstance(k, int) else k
+            if len(ks) != n or not set(ks) <= set(MS_BITS):
                 raise PackError(f"{p.name}: K {k}")
             files, sizes = [], []
             for role in ROLES:
@@ -117,45 +127,77 @@ class Experts:
                 n_in, n_out = (int(d) for d in t["shape"])
                 if n_in % 32:
                     raise PackError(f"{p.name}: {role} n_in {n_in} is not a multiple of 32")
-                per = payload_bytes(n_in, n_out, k)
+                per = [payload_bytes(n_in, n_out, ke) for ke in ks]
                 f = exp_dir / t["file"]
-                if f.stat().st_size != per * n:
-                    raise PackError(f"{f.name}: {f.stat().st_size} B, expected {n} x {per}")
+                if f.stat().st_size != sum(per):
+                    raise PackError(f"{f.name}: {f.stat().st_size} B, expected {sum(per)}")
                 files.append(f)
                 sizes.append(per)
             if self.layers and n != self.layers[0][1]:
                 raise PackError(f"{p.name}: {n} experts, layer 0 has {self.layers[0][1]}")
             self.layers.append((k, n, files, sizes))
         self.n_expert = self.layers[0][1]
+        self.mixed = any(not isinstance(k, int) for k, *_ in self.layers)
+
+    def expert_bytes(self, l: int, e: int) -> int:
+        k, _, _, sizes = self.layers[l]
+        return (0 if isinstance(k, int) else MIX_HEAD) + sum(s[e] for s in sizes)
 
     def blob_bytes(self, l: int) -> int:
-        return sum(self.layers[l][3])
+        """The layer's slot: its widest blob."""
+        return max(self.expert_bytes(l, e) for e in range(self.n_expert))
+
+    def layer_bytes(self, l: int) -> int:
+        return sum(self.expert_bytes(l, e) for e in range(self.n_expert))
+
+    def pad_bytes(self) -> int:
+        """Zeros after the last layer: a slot-sized copy of a mixed layer's last expert stays in the section."""
+        return max(self.blob_bytes(l) for l in range(len(self.layers))) if self.mixed else 0
 
     def total_bytes(self) -> int:
-        return sum(self.blob_bytes(l) * self.n_expert for l in range(len(self.layers)))
+        return sum(self.layer_bytes(l) for l in range(len(self.layers))) + self.pad_bytes()
 
     def chunks(self, group: int = 16):
         for k, n, files, sizes in self.layers:
             fs = [open(f, "rb") for f in files]
             try:
                 for s in range(0, n, group):
-                    m = min(group, n - s)
-                    parts = [f.read(per * m) for f, per in zip(fs, sizes)]
-                    yield b"".join(p[e * per:(e + 1) * per] for e in range(m) for p, per in zip(parts, sizes))
+                    es = range(s, min(s + group, n))
+                    parts = [f.read(sum(sz[e] for e in es)) for f, sz in zip(fs, sizes)]
+                    at = [0, 0, 0]
+                    out = []
+                    for e in es:
+                        if not isinstance(k, int):
+                            out.append(bytes([k[e]]) + bytes(MIX_HEAD - 1))
+                        for r, (part, sz) in enumerate(zip(parts, sizes)):
+                            out.append(part[at[r]:at[r] + sz[e]])
+                            at[r] += sz[e]
+                    yield b"".join(out)
             finally:
                 for f in fs:
                     f.close()
+        if self.pad_bytes():
+            yield bytes(self.pad_bytes())
 
     def layout_text(self) -> bytes:
         lines, off = [], 0
         for l, (k, n, _, _) in enumerate(self.layers):
-            t, blob = MS_TYPE_BASE + k, self.blob_bytes(l)
-            lines.append(f"{l} {t} {t} {off} {blob} {t}\n")
-            off += blob * n
-        head = (f"# experts v{LAYOUT_VERSION}: layer gu_type d_type offset blob_bytes up_type (n_expert {self.n_expert}, "
+            blob = self.blob_bytes(l)
+            if isinstance(k, int):
+                t = MS_TYPE_BASE + k
+                lines.append(f"{l} {t} {t} {off} {blob} {t}\n")
+            else:
+                lines.append(f"{l} {MS_MIX} {MS_MIX} {off} {blob} {MS_MIX} {''.join(str(v) for v in k)}\n")
+            off += self.layer_bytes(l)
+        ver = 9 if self.mixed else LAYOUT_VERSION
+        head = (f"# experts v{ver}: layer gu_type d_type offset blob_bytes up_type (n_expert {self.n_expert}, "
                 f"total {off}); MS blobs: per projection gate, up, down: rows, int8 signs[n_in]; type = "
-                f"{MS_TYPE_BASE} + K\n")
-        return (head + "".join(lines)).encode("utf-8")
+                f"{MS_TYPE_BASE} + K")
+        if self.mixed:
+            head += (f"; type {MS_MIX}: each expert its own K (the last column, one digit an expert), its blob a "
+                     f"{MIX_HEAD}-byte head (byte 0 = K) then gate, up, down at that K, blobs back to back, "
+                     f"blob_bytes the widest")
+        return (head + "\n" + "".join(lines)).encode("utf-8")
 
 
 MTP_SECTIONS = ("mtp/dense", "mtp/dense.index", "mtp/experts")
@@ -241,9 +283,10 @@ def main(argv=None) -> int:
         experts = Experts(Path(a.ms_dir) / "experts", n_layers)
         by_kx: dict = {}
         for l, (k, *_rest) in enumerate(experts.layers):
-            by_kx.setdefault(k, []).append(l)
+            by_kx.setdefault(k if isinstance(k, int) else MS_MIX, []).append(l)
         for k, ls in sorted(by_kx.items()):
-            print(f"experts MS_C{k}: {len(ls)} layers, blob {experts.blob_bytes(ls[0]):,} B", file=sys.stderr)
+            name = "mixed" if k == MS_MIX else f"MS_C{k}"
+            print(f"experts {name}: {len(ls)} layers, slot {experts.blob_bytes(ls[0]):,} B", file=sys.stderr)
         print(f"experts: {experts.total_bytes() / 2**30:.2f} GiB (base {base.section('experts')[1] / 2**30:.2f} GiB)",
               file=sys.stderr)
     mtp = None
@@ -262,7 +305,7 @@ def main(argv=None) -> int:
 
     meta["ms"] = {"dense": {f"MS_C{k}": len(v) for k, v in sorted(by_k.items())}, "type_base": MS_TYPE_BASE}
     if experts is not None:
-        meta["ms"]["experts"] = {"k": [k for k, *_ in experts.layers], "layout_version": LAYOUT_VERSION}
+        meta["ms"]["experts"] = {"k": [k for k, *_ in experts.layers], "layout_version": 9 if experts.mixed else LAYOUT_VERSION}
     if mtp is not None:   # the drafter is the checkpoint's own, coded: no tuned dense, no Q2_0 experts
         meta["mtp"] = {k: v for k, v in meta.get("mtp", {}).items() if k not in ("dense", "source_sha256")}
         meta["mtp"]["expert_format"] = "ms"
