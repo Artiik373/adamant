@@ -157,9 +157,15 @@ def quant_batch(ws, hs, k, seeds, lut):
 
 
 @torch.no_grad()
-def quantize_experts(moe, x, idx, k, lut, experts, eb: int = 8, tau: float = 0.0, l: int = 0):
+def expert_out(xs, gu, dn):
+    g, u = (xs @ gu.T).chunk(2, -1)
+    return (F.silu(g) * u) @ dn.T
+
+
+def quantize_experts(moe, x, idx, k, lut, experts, eb: int = 8, tau: float = 0.0, l: int = 0, errs=None):
     """Quantize the listed experts in place; all others keep their BF16 weights. tau > 0: the converter's shrunk
-    Hessians. Each expert's Hessians are built before its weights are overwritten."""
+    Hessians. Each expert's Hessians are built before its weights are overwritten. errs (a dict): per expert, the
+    squared output error of the coded expert on its own calibration tokens (unweighted by the router)."""
     from ms_flashnext_convert import expert_hessians
     ex = moe.experts
     dev = ex.gate_up_proj.device   # x may be in host RAM: each expert's tokens go to the GPU on their own
@@ -183,6 +189,20 @@ def quantize_experts(moe, x, idx, k, lut, experts, eb: int = 8, tau: float = 0.0
             gu_q[e] = q.to(gu_q.dtype)
         for e, q in zip(es, quant_batch(dns, hdn, k, [2 * e + 2 for e in es], lut)):
             dn_q[e] = q.to(dn_q.dtype)
+        del hgu, hdn   # the Hessians are done: free them before the error pass
+        if errs is not None:
+            for e, wgu, wdn in zip(es, gus, dns):
+                sel = (idx == e).any(-1).nonzero().squeeze(1).to(x.device)
+                err = 0.0
+                for c in range(0, sel.numel(), 8192):
+                    xs = x[sel[c : c + 8192]].to(dev).float()
+                    d = expert_out(xs, gu_q[e].float(), dn_q[e].float()) - expert_out(xs, wgu, wdn)
+                    err += (d * d).sum().item()
+                errs[e] = err
+        torch.cuda.empty_cache()   # the error pass's blocks back before the next batch's Hessians
+        if e0 % 128 == 0:
+            print(f"    k {k} experts {e0}: peak alloc {torch.cuda.max_memory_allocated() / 2**30:.1f} "
+                  f"reserved {torch.cuda.max_memory_reserved() / 2**30:.1f} GiB", flush=True)
     return gu_q, dn_q
 
 
@@ -236,6 +256,10 @@ def main() -> None:
                    help="comma-separated trellis widths K to scan, e.g. 2,3,4,5,6")
     p.add_argument("--hess-tau", type=float, default=0.0, help="the converter's Hessian shrinkage (0: plain sums)")
     p.add_argument("--stop-after", type=int, default=None, help="last layer to scan in this run")
+    p.add_argument("--expert-batch", type=int, default=8, help="experts coded per Viterbi call (fewer: less GPU memory)")
+    p.add_argument("--per-expert", action="store_true",
+                   help="also: each expert's own output error at every width (experts_<layer>.json), and the layer "
+                        "coded with per-expert widths at the bytes of each uniform width")
     args = p.parse_args()
     assert args.widths and all(k in MS_BITS for k in args.widths), args.widths
 
@@ -301,29 +325,48 @@ def main() -> None:
         sample = order[:: max(1, len(order) // args.experts)][: args.experts]
         t_fwd = time.time() - t0 - t_load
         gu_ref, dn_ref = moe.experts.gate_up_proj.data.cpu(), moe.experts.down_proj.data.cpu()   # originals in RAM
-        for k in args.widths:
+
+        def measure(plan, name):
+            """Code each width's experts, measure on the held-out tokens, put the BF16 weights back."""
             tq = time.time()
-            gu_q, dn_q = quantize_experts(moe, x, idx, k, lut, sample, tau=args.hess_tau, l=l)
+            for k, es in plan.items():
+                quantize_experts(moe, x, idx, k, lut, es, eb=args.expert_batch, tau=args.hess_tau, l=l,
+                                 errs=errs.setdefault(k, {}) if name[0] == "C" and args.per_expert else None)
             y_q = []
             h_q = run_layer(layer, h_ev, kw_ev, bs, grab_out=y_q)
             y_q = torch.cat(y_q)
             moe.experts.gate_up_proj.data.copy_(gu_ref)
             moe.experts.down_proj.data.copy_(dn_ref)
-            del gu_q, dn_q
-            rec[f"C{k}"] = {
+            rec[name] = {
                 "routed_rel": ((y_q - y_ref).norm() / routed_ref.norm()).item(),
                 "moe_rel": rel(y_q, y_ref),
                 "out_rel": rel(h_q.float(), h_ref.float()),
                 "seconds": round(time.time() - tq, 1),
             }
+            print(f"  {name}: {rec[name]['seconds']}s, peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
+
+        errs: dict = {}
+        print(f"layer {l}: forward done, peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
+        for k in args.widths:
+            measure({k: sample}, f"C{k}")
+        if args.per_expert:
+            from ms_plan_solver import layer_bytes, solve
+            size = lambda k: layer_bytes(k, n_exp=1)
+            (args.out_dir / f"experts_{l}.json").write_text(json.dumps({"counts": counts.tolist(), "errs": errs}))
+            for k0 in args.widths[1:-1]:   # a mix needs a narrower and a wider width than its budget
+                pick = solve({e: {k: errs[k][e] for k in args.widths} for e in sample}, len(sample) * size(k0), size)
+                plan = {k: [e for e in sample if pick[e] == k] for k in args.widths}
+                measure({k: es for k, es in plan.items() if es}, f"mix{k0}")
+                rec[f"mix{k0}"]["experts_per_k"] = {k: len(es) for k, es in plan.items()}
         h_ev = h_ref
         del layer, moe, x, idx, gu_ref, dn_ref
         torch.cuda.empty_cache()
         with open(args.out_dir / "scan.jsonl", "a") as f:
             f.write(json.dumps(rec) + "\n")
         torch.save({"next_layer": l + 1, "h_cal": h_cal, "h_ev": h_ev}, state)
-        widths = " | ".join(f"C{k} out {rec[f'C{k}']['out_rel']:.5f} moe {rec[f'C{k}']['moe_rel']:.4f}" for k in args.widths)
-        quant = sum(rec[f"C{k}"]["seconds"] for k in args.widths)
+        names = [n for n in rec if n[0] in "Cm" and isinstance(rec[n], dict)]
+        widths = " | ".join(f"{n} out {rec[n]['out_rel']:.5f} moe {rec[n]['moe_rel']:.4f}" for n in names)
+        quant = sum(rec[n]["seconds"] for n in names)
         print(f"layer {l:2d} {rec['type']:>17}: {widths} | zero-token experts "
               f"{rec['zero_token_experts']} | load {t_load:.0f}s fwd {t_fwd:.0f}s quant {quant:.0f}s total {time.time() - t0:.0f}s", flush=True)
 
