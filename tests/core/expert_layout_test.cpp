@@ -95,7 +95,7 @@ void refusals() {
     check(load(layout(5, blob, ""), 2, 512, err), "a v5 layout loads" + (err.empty() ? "" : ": " + err));
     check(load(layout(3, blob, " 100 200 300 shard.gguf"), 2, 512, err),
           "columns past the fifth are ignored" + (err.empty() ? "" : ": " + err));
-    check(!load(layout(9, blob, ""), 2, 512, err) && err.find("v9") != std::string::npos, "v9 is refused");
+    check(!load(layout(10, blob, ""), 2, 512, err) && err.find("v10") != std::string::npos, "v10 is refused");
     // NVFP4: the blob carries a 16-byte FP32 scale tail after down, counted in the blob size
     basalt::kernels::cpu::NativeFmt nv;
     check(basalt::kernels::cpu::native_fmt(40, 40, 2560, 640, nv, err) && nv.tail == 16 &&
