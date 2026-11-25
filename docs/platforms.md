@@ -1,6 +1,6 @@
 # Platforms
 
-Adamant runs natively on Linux x64 and Windows x64, on NVIDIA Ampere (sm_86); Ada Lovelace (sm_89) still builds. CI
+Amperite runs natively on Linux x64 and Windows x64, on NVIDIA Ampere (sm_86) only. CI
 builds both platforms and runs the CPU tests on each. The GPU tests and the quality gate run on a machine with a card.
 
 ## Requirements
@@ -10,7 +10,7 @@ builds both platforms and runs the CPU tests on each. The GPU tests and the qual
 | OS | x86-64, AVX2 (AVX-512 used when present) | Windows 10 1903+ x64 |
 | Compiler, build | GCC 13+, CMake 3.24+ | MSVC 19.44 (VS 2022), CMake 3.24+, Ninja |
 | CUDA, Python | 13, 3.10+ | 13, 3.10+ |
-| GPU | NVIDIA Ampere (sm_86), or Ada Lovelace (sm_89); optional second GPU as a peer expert tier (`gpu 0,1`) | NVIDIA Ampere (sm_86), or Ada Lovelace (sm_89); optional second GPU as a peer expert tier (`gpu 0,1`) |
+| GPU | NVIDIA Ampere (sm_86); optional second GPU as a peer expert tier (`gpu 0,1`) | NVIDIA Ampere (sm_86); optional second GPU as a peer expert tier (`gpu 0,1`) |
 
 ## Release archives
 

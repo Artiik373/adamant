@@ -1,6 +1,6 @@
 #pragma once
 
-// Unified MS (Mad Shift) quant type IDs and CPU/CUDA dispatch helpers for Adamant (.basalt).
+// Unified MS (Mad Shift) quant type IDs and CPU/CUDA dispatch helpers for Amperite (.basalt).
 // Type IDs 43..48 match ms-llama.cpp's ggml type IDs (MS_C1..MS_C6) to avoid collisions.
 
 #include "kernels/ms_1mad_avx2.h"

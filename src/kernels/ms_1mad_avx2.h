@@ -1,6 +1,6 @@
 #pragma once
 
-// Peak-throughput AVX2 1MAD bitshift-trellis GEMV & block FWHT kernels for Adamant.
+// Peak-throughput AVX2 1MAD bitshift-trellis GEMV & block FWHT kernels for Amperite.
 // Key optimizations:
 //   - Pure-vector 14-bit state extraction via _mm256_srlv_epi32 (zero scalar->YMM _mm256_setr_epi32 stalls)
 //   - 2-instruction byte-sum via VPMADDUBSW + VPMADDWD

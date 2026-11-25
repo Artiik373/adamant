@@ -5,7 +5,7 @@ Designed for 1x RTX 3090 (24 GB VRAM) + 64 GB DDR5:
   onto GPU (~5.2 GB BF16 per layer), freeing them before layer `l + 1`.
 - Accumulates per-expert Hessians (512 experts) in host DDR5 (pinned/paged float32)
   and processes experts in GPU micro-batches (default 32 experts at a time).
-- Writes per-layer packed MS binary blobs + JSON manifest for Adamant (.basalt) packing.
+- Writes per-layer packed MS binary blobs + JSON manifest for Amperite (.basalt) packing.
 """
 
 from __future__ import annotations

@@ -2,7 +2,7 @@
 
 Where Inkling 2 Mini rounds and how its output compares. Method: [quality](quality.md). Guide: [Inkling 2 Mini](../models/inkling2.md).
 
-The measurements on this page are upstream's (Blackwell). Adamant's sm_86 prompt path rounds differently (the stage
+The measurements on this page are upstream's (Blackwell). Amperite's sm_86 prompt path rounds differently (the stage
 table marks it); its paths and open measurements are in [ampere.md](ampere.md#inkling-2-mini).
 
 ## Summary

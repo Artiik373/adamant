@@ -1,10 +1,10 @@
 # Community runs
 
-Benchmark runs submitted by users, all taken with the same preset so the rows compare, live in `docs/community/benchmarks.json`. The rows currently in that file are Basalt's Blackwell runs, inherited with the fork; Adamant has no published page of its own yet.
+Benchmark runs submitted by users, all taken with the same preset so the rows compare, live in `docs/community/benchmarks.json`. The rows currently in that file are Basalt's Blackwell runs, inherited with the fork; Amperite has no published page of its own yet.
 
 ## Add your run
 
-1. Stop any running Basalt server (the GPUs must be free), then run `basalt-bench --community --model PACK`. It starts its own engine (three times, once per measurement), shows the load progress on stderr while each one starts, adds its row to `docs/community/benchmarks.json` and prints it. It uses every visible Ampere or Ada GPU: a second card becomes the peer, and `CUDA_VISIBLE_DEVICES=0` gives a single-card row.
+1. Stop any running Basalt server (the GPUs must be free), then run `basalt-bench --community --model PACK`. It starts its own engine (three times, once per measurement), shows the load progress on stderr while each one starts, adds its row to `docs/community/benchmarks.json` and prints it. It uses every visible Ampere GPU: a second card becomes the peer, and `CUDA_VISIBLE_DEVICES=0` gives a single-card row.
 2. `--submitter NAME` is required: the name you want shown (one name with no spaces, up to 40 characters; it is not verified). `notes` (up to 200 characters) is optional and added by hand.
 3. Review the row in `docs/community/benchmarks.json`, commit it and open a pull request. If the file already has a row of your setup (see below), the bench replaces that row in place, keeps its `notes` and says so; check the notes still apply. If the bench could not write the file, it prints the row and says where to paste it.
 

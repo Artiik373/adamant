@@ -122,19 +122,25 @@ def load_ms_layer(layer, l: int, ms_dir: Path, lut, dev, names=None, experts: bo
         return
     ex = layer.mlp.experts
     rec = json.loads((ms_dir / "experts" / f"blk.{l}.experts.json").read_text())
-    k = rec["k"]
+    raw_k = rec["k"]
     n_embd, n_ff = ex.hidden_dim, ex.intermediate_dim
-    for name, n_in, n_out in (("gate", n_embd, n_ff), ("up", n_embd, n_ff), ("down", n_ff, n_embd)):
+    for r_idx, (name, n_in, n_out) in enumerate((("gate", n_embd, n_ff), ("up", n_embd, n_ff), ("down", n_ff, n_embd))):
         if name not in roles:
             continue
-        per = n_out * ms_row_bytes(n_in, k) + n_in
+        if isinstance(raw_k, int):
+            ks = [raw_k] * ex.num_experts
+        elif isinstance(raw_k[0], int):
+            ks = [int(v) for v in raw_k]
+        else:
+            ks = [int(v[r_idx]) for v in raw_k]
+        pers = [n_out * ms_row_bytes(n_in, ke) + n_in for ke in ks]
         path = ms_dir / "experts" / f"blk.{l}.ffn_{name}_exps.ms"
-        for e0 in range(0, ex.num_experts, 64):
-            blob = read_payload(path, e0 * per, 64 * per, dev)
-            for e in range(64):
-                w = decode_rows(blob[e * per : (e + 1) * per], n_out, n_in, k, lut)
-                dst = (ex.gate_up_proj.data[e0 + e, :n_ff] if name == "gate" else
-                       ex.gate_up_proj.data[e0 + e, n_ff:] if name == "up" else ex.down_proj.data[e0 + e])
+        with open(path, "rb") as f:
+            for e in range(ex.num_experts):
+                blob = torch.frombuffer(bytearray(f.read(pers[e])), dtype=torch.uint8).to(dev)
+                w = decode_rows(blob, n_out, n_in, ks[e], lut)
+                dst = (ex.gate_up_proj.data[e, :n_ff] if name == "gate" else
+                       ex.gate_up_proj.data[e, n_ff:] if name == "up" else ex.down_proj.data[e])
                 if scale != 1.0:
                     w = dst.float() + scale * (w - dst.float())
                 dst.copy_(w.to(dst.dtype))

@@ -1,8 +1,8 @@
-# Adamant
+# Amperite
 
-Adamant is a fork of [Basalt](https://github.com/jesdga95/basalt), itself based on Strata: a local inference engine for
-large mixture-of-experts models (**Hy4-flash**, **Qwen3.8-Flash-Next**) on NVIDIA **Ampere** (RTX 30-series, sm_86) GPUs.
-Ada Lovelace (sm_89) still builds and runs, but Ampere is the target every change is measured on.
+Amperite is a fork of [Adamant](https://github.com/nixcat-dev/adamant) (sm_89), which forks [Basalt](https://github.com/jesdga95/basalt)
+(sm_120), itself based on Strata: a local inference engine for large mixture-of-experts models (**Hy4-flash**,
+**Qwen3.8-Flash-Next**) built for NVIDIA **Ampere** (RTX 30-series, sm_86) GPUs only.
 
 > **Status: early development.** Expect breakage; flags, defaults and the pack layout can still change. The numbers below
 > are development runs on one card, not the maintainer's headline numbers. Open validation work is listed in
@@ -24,13 +24,13 @@ A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compa
 ## Requirements
 
 - Linux x86-64 with AVX2 (AVX-512 is used when present), or Windows 10 1903+ x64 ([platforms](docs/platforms.md)).
-- An NVIDIA Ampere (compute capability 8.6) GPU with CUDA 13; Ada Lovelace (8.9) also builds.
+- An NVIDIA Ampere (compute capability 8.6) GPU with CUDA 13.
 - CMake 3.24 or newer, GCC 13 or newer (Linux), Python 3.10 or newer, and enough system RAM for the experts that do not fit in VRAM.
 
 ## Quick start
 
 ```sh
-git clone <adamant remote> && cd adamant
+git clone https://github.com/Artiik373/amperite && cd amperite
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j                  # bin/basalt, bin/basalt-bench, bin/basalt-probe, bin/basalt-vision
                                         # Windows: add -G Ninja to the first line, from an x64 VS 2022 prompt ([platforms](docs/platforms.md#building-on-windows))
@@ -39,13 +39,12 @@ pip install -r requirements.txt
 hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt --local-dir models
 ```
 
-The build targets sm_86 by default; `-DCMAKE_CUDA_ARCHITECTURES` accepts `86`, `89` or `86;89`, and anything else is
-refused. What the port changes against upstream and what is still open is in
+The build targets sm_86; `-DCMAKE_CUDA_ARCHITECTURES` accepts only `86`. What the port changes against upstream and what is still open is in
 [Ampere execution and validation](docs/precision/ampere.md).
 
 The binary and file-format names stay `basalt` and `.basalt`: the packs are the
 same files Basalt reads, so a fork that renamed them would break every existing
-model. Adamant is the project name, not a new format.
+model. Amperite is the project name, not a new format.
 
 Put your settings in `basalt_config.json`: the `models` list names the packs, and each entry's own `gpu` and `kv` win over the
 top-level `engine` block ([models and the router](docs/configuration/models.md)):
@@ -77,8 +76,8 @@ Development measurements, not the maintainer's headline runs: one RTX 3090 (24 G
 
 Draft acceptance 70%, 99.9% and 58%: the spread is drafting acceptance per content, not engine speed.
 
-On Ada (RTX 4090 at 450 W, the GSQ-RCO IQ3_S Qwen3.8-Flash-Next pack, int8 KV), MTP drafter off → on: conv 115 → 190,
-struct 116 → 372, prose 116 → 169 tok/s. An Adamant-versus-Strata comparison from those runs is in
+Upstream Adamant measured on an RTX 4090 (sm_89) at 450 W, with the GSQ-RCO IQ3_S Qwen3.8-Flash-Next pack and int8 KV, MTP drafter off → on: conv 115 → 190,
+struct 116 → 372, prose 116 → 169 tok/s. Its Adamant-versus-Strata comparison from those runs is in
 [the comparison report](docs/benchmarks/strata-comparison.md).
 
 ## Models
@@ -118,8 +117,8 @@ formats use the same kernels as upstream. A pack can be built locally from a GGU
 
 ## Credits
 
-- [Adamant](https://github.com/nixcat-dev/adamant): the OG Adamant (MIT).
-- [Basalt](https://github.com/jesdga95/basalt): the project Adamant forks (MIT).
+- [Adamant](https://github.com/nixcat-dev/adamant): the project Amperite forks (MIT).
+- [Basalt](https://github.com/jesdga95/basalt): the project upstream Adamant forks (MIT).
 - [Strata](https://github.com/Niko1221/Strata): the project Basalt forks (MIT).
 - [Qwen](https://huggingface.co/Qwen/Qwen3.8-Flash-Next): the model. The packs are under the [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE), not Basalt's MIT license.
 - [unsloth](https://huggingface.co/unsloth): the UD and Q8_0 GGUFs the packs are built from.

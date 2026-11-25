@@ -1,4 +1,4 @@
-# Optional CMake module for Adamant MS (Mad Shift) 1MAD trellis tests.
+# Optional CMake module for Amperite MS (Mad Shift) 1MAD trellis tests.
 # Add `include(cmake/ms_trellis.cmake)` to CMakeLists.txt when BUILD_TESTING is enabled.
 
 if(BUILD_TESTING)

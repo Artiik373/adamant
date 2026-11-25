@@ -1,4 +1,4 @@
-# MS (Mad Shift) Trellis Quantization for Qwen3.8-Flash-Next in Adamant
+# MS (Mad Shift) Trellis Quantization for Qwen3.8-Flash-Next in Amperite
 
 This branch (`feat/ms-trellis-qwen4exp`) adds a per-row 14-bit `1MAD` bitshift-trellis quantization pipeline and AVX2 + Ampere (`sm_86`) inference kernels tailored to **Qwen3.8-Flash-Next** (`qwen4_exp`) on single-GPU + DDR5 workstations (e.g., RTX 3090 24 GB + i5-13600KF + 64 GB DDR5).
 
@@ -16,7 +16,7 @@ This branch (`feat/ms-trellis-qwen4exp`) adds a per-row 14-bit `1MAD` bitshift-t
 
 ## Per-Row `.basalt` Binary Layout
 
-Unlike `ms-llama.cpp`'s 512-weight block layout (which cannot natively code `moe_intermediate_size = 640`), Adamant stores one continuous 14-bit trellis stream per row:
+Unlike `ms-llama.cpp`'s 512-weight block layout (which cannot natively code `moe_intermediate_size = 640`), Amperite stores one continuous 14-bit trellis stream per row:
 
 ```text
 fp16   d        (2 bytes, IEEE 754 binary16 row scale)

@@ -1,13 +1,13 @@
 # Ampere execution and validation
 
-Adamant targets Ampere (sm_86); Ada (sm_89) still builds. The paths below replace upstream's Hopper and Blackwell
+Amperite targets Ampere (sm_86) only. The paths below replace upstream's Hopper and Blackwell
 instructions with what sm_86 has. Upstream measurements in [qwen38-flash-next.md](qwen38-flash-next.md) and the pages
-beside it are not Adamant results.
+beside it are not Amperite results.
 
 ## Targets
 
-`include/basalt/cuda_target.hpp` accepts compute capability 8.6 and 8.9; `CMAKE_CUDA_ARCHITECTURES` takes `86`, `89` or
-`86;89` (default `86`), anything else is a configure error. `gpu "auto"` selects every visible card of those; an explicit
+`include/basalt/cuda_target.hpp` accepts compute capability 8.6 only; `CMAKE_CUDA_ARCHITECTURES` takes `86`, anything
+else is a configure error. `gpu "auto"` selects every visible sm_86 card; an explicit
 card of another capability stops the start. No kernel uses FP8 or FP4 tensor instructions (NVFP4 runs as integer MMQ),
 so no weight pack or KV format is excluded on 8.6 by design.
 
@@ -18,11 +18,11 @@ Hy4-flash runs on an RTX 3090 (the README's measurements). Still open on Ampere:
 - Memcheck of the `cp.async` copy paths.
 - Fast paths gated on SM count and their fallback on smaller cards.
 
-Measurements in the table below that name a 450 W power limit were taken on an RTX 4090 (Ada).
+Measurements in the table below that name a 450 W power limit were taken by upstream Adamant on an RTX 4090 (sm_89); they are not rerun on sm_86.
 
 ## Execution changes
 
-| Operation | Adamant implementation | Numerical consequence requiring validation |
+| Operation | Amperite implementation | Numerical consequence requiring validation |
 |---|---|---|
 | MMQ prompt experts | Existing integer MMA tiles, without programmatic dependent launch; all configured formats retained | No arithmetic or tile-selection changes intended. Cross-device equality is not assumed. |
 | NVFP4 prompt experts | Integer MMQ at all prompt sizes, not native FP4 tensor instructions | Activations use MMQ's q8_1 rounding instead of E2M1/UE4M3 rounding for long prompts. This changes numerics relative to upstream's native FP4 path. Weight bytes remain in the same format. |
@@ -44,18 +44,18 @@ Measurements in the table below that name a 450 W power limit were taken on an R
 - **Mixed gate/up layers** (`experts.layout` v7: UD-IQ1_S layer 18 is IQ2_S gate with IQ2_XXS up). Each half is decoded in its
   own format by the same row code; the decode glue and the persistent peer kernel have mixed builds, the MMQ prompt slot is
   padded to whole blocks of both types, and the CPU tier runs each half through its type's row kernel. Intended bitwise-equal
-  to the uniform kernels; `mixed_gu_parity` passes bitwise on sm_89.
+  to the uniform kernels; `mixed_gu_parity` passed bitwise on sm_89 in upstream Adamant.
 - **Peer prompt share** (`prefill::PeerShare`). The second card computes its experts' prompt rows from staged group buffers
   with the same MMQ formats and the same q8_1 activations the main card writes, then returns the rows. Intended bitwise-equal
   to the main card's rows; upstream's `peer_share_parity` checks the gathered bytes. `peer_share_parity` and
   `peer_experts_parity` need two GPUs and skip on one; not measured on Ampere. The FP4 streamed-chunk fallback is not
   carried, so chunks at or above `stream_all_min()` stay on the primary.
 - **Glue-path formats** (Q5_K/Q6_K gate/up rows, IQ4_XS gate/up rows, (IQ3_S|IQ4_XS)/Q8_0 pairs). Same row dots and
-  accumulation order, fused launches only; `dec_moe_parity --kq` and `native_grouped_parity --glue` pass bitwise on sm_89.
+  accumulation order, fused launches only; `dec_moe_parity --kq` and `native_grouped_parity --glue` passed bitwise on sm_89 in upstream Adamant.
 - **Batch K/V streaming** (`kv_stream`'s segment resolve, `--kv-resident` with `--batch`). Same rows through a segment
-  cursor; `kv_stream_parity` passes on sm_89.
+  cursor; `kv_stream_parity` passed on sm_89 in upstream Adamant.
 
-On the deployed IQ4_XS pack, 64 greedy tokens (prose ids, int8 KV, expert cache 700, swaps 0, one RTX 4090 at 450 W) are
+On the deployed IQ4_XS pack, 64 greedy tokens (prose ids, int8 KV, expert cache 700, swaps 0, one RTX 4090 at 450 W, upstream Adamant) were
 identical between the pre-merge build and this one.
 
 ## Prompt memory and peer execution
@@ -93,7 +93,7 @@ configuration, and enforced GPU power limit with results. Do not treat the
 short quality fixture as coverage of every prompt path.
 
 The gate is not complete. Kernel parity and memory, race, initialization and
-synchronization checks pass on sm_89; end-to-end quality results and performance
+synchronization checks passed on sm_89 in upstream Adamant; end-to-end quality results and performance
 claims have not been established. The development measurements taken so far, with
 their power limit and configuration, are in the [README](../../README.md#measured-on-ampere).
 
@@ -101,7 +101,7 @@ their power limit and configuration, are in the [README](../../README.md#measure
 
 Upstream's Inkling 2 line, ported to sm_86:
 
-| Operation | Adamant implementation | Numerical consequence |
+| Operation | Amperite implementation | Numerical consequence |
 |---|---|---|
 | Decode window attention | Preparation, slices and merge as three kernels (no thread-block clusters) | None: upstream's fused kernel computes the same arithmetic in the same order; `inkling2_kernels_parity` checks every window bitwise |
 | Prompt Q8_0 projections (`prefill::q8`) | Swizzled `cp.async` tiles with zero fill and `mbarrier.test_wait` replace TMA | None intended: the int8 MMA and its K order are unchanged; `inkling2_prompt_parity` passes |

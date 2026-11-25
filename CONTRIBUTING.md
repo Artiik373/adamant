@@ -1,10 +1,10 @@
-# Contributing to Adamant
+# Contributing to Amperite
 
-Adamant targets large mixture-of-experts models (Hy4-flash, Qwen3.8-Flash-Next) on NVIDIA Ampere GPUs (sm_86). Ada (sm_89) still builds, but changes are measured on Ampere. The inherited Blackwell implementation is not evidence of correctness or performance on Ampere. The [parity, quality and benchmark rules](#what-every-change-must-include) below define what a change needs, and [Ampere execution and validation](docs/precision/ampere.md) records the paths still to be measured.
+Amperite targets large mixture-of-experts models (Hy4-flash, Qwen3.8-Flash-Next) on NVIDIA Ampere GPUs (sm_86) only. The inherited Blackwell implementation is not evidence of correctness or performance on Ampere. The [parity, quality and benchmark rules](#what-every-change-must-include) below define what a change needs, and [Ampere execution and validation](docs/precision/ampere.md) records the paths still to be measured.
 
 ## Scope
 
-- **CUDA on Ampere (sm_86) first; Ada (sm_89) keeps building.** No ROCm/HIP, AMD, Intel/SYCL/oneAPI, Apple/Metal, or CPU-only main path (CPU experts held in RAM and `--vision cpu` remain supported). Other NVIDIA architectures are out of scope. An upstream path that needs Hopper or Blackwell instructions is ported to what sm_86 has, not hidden behind launchable empty kernels or trap stubs. Preserve model-format coverage unless a scope change is explicitly approved.
+- **CUDA on Ampere (sm_86) only.** No ROCm/HIP, AMD, Intel/SYCL/oneAPI, Apple/Metal, or CPU-only main path (CPU experts held in RAM and `--vision cpu` remain supported). Other NVIDIA architectures are out of scope. An upstream path that needs Hopper or Blackwell instructions is ported to what sm_86 has, not hidden behind launchable empty kernels or trap stubs. Preserve model-format coverage unless a scope change is explicitly approved.
 - **Linux and Windows x64 are both supported; Linux is where we test.** CI compiles and CPU-tests Windows on every pull request. Windows runs with the same GPU roles as Linux (main card plus expert tiers), with no performance claims, and the Windows limitations are in `docs/platforms.md`. Changes must not remove the platform seams (`src/platform/`, CMake `if(WIN32)`). Windows-only issues get a `windows` label. Headline benchmark numbers stay with the maintainer's Linux runs.
 - **Engine code is platform-neutral.** Outside `src/platform/` and `include/basalt/platform/` there is no `_WIN32`, `_MSC_VER`, `__linux__`, `<windows.h>`, `<sys/mman.h>`, `<unistd.h>` or raw OS call (mmap, madvise, pread, pthread/affinity, fork/exec/pipe, dlopen, /proc or /sys reads). Call the platform layer; when a seam is missing, add it there with a Linux body and a Windows body, the Linux body being the code you would have written anyway, and a test in `tests/platform/` that runs on both. Paths are UTF-8 and go through the platform file calls. `tools/check_platform_boundary.sh` enforces this.
 - **Engine log lines carry their level.** A line to stderr goes through `include/basalt/log.hpp` (`basalt::log::info`, `warn` or `error`), which writes `basalt <area>: [warning: |error: ]<text>`; the server and the terminal read the level from that marker and never from the words. A warning is a fallback or a lost function, an error is a failure or a refusal, everything else is info. `tools/check_stderr_logging.sh` fails when engine code names stderr anywhere else.
@@ -51,7 +51,7 @@ Adamant targets large mixture-of-experts models (Hy4-flash, Qwen3.8-Flash-Next) 
 - Ported or adapted work keeps its original authors as `Co-Authored-By` lines.
 - Never amend or force-push shared branches; add new commits.
 - No notes, scratch files or generated reports in the repo.
-- Docs: no file over 300 lines; split a longer topic into a folder of files; keep docs short, stateless and free of duplication. Web UI text uses proper casing ("Adamant") and no em dashes.
+- Docs: no file over 300 lines; split a longer topic into a folder of files; keep docs short, stateless and free of duplication. Web UI text uses proper casing ("Amperite") and no em dashes.
 - A PR description lists: what changed, the parity results, the microbench and `basalt-bench` before/after (with the power limit), and the quality-check result.
 
 ## Other ways to help

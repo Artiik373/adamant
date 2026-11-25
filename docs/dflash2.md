@@ -22,7 +22,7 @@ Conversion needs NumPy. The runtime pack contains Q8_0 projection matrices,
 F32 normalization/convolution vectors and BF16 selector codebooks. It shares the
 complete target embedding and output head. With an EXL3 head, which has no rows of its own, it ranks the model's
 draft vocabulary (`mtp/draft_vocab`) on a Q8_0 copy of those rows instead; other heads keep the full vocabulary.
-The runtime understands Adamant's planar Q8_0 output-head layout.
+The runtime understands Amperite's planar Q8_0 output-head layout.
 
 ## Execution
 

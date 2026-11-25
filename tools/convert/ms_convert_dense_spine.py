@@ -1,6 +1,6 @@
 """Dense-spine + lm_head MS_C6 streaming converter for Qwen3.8-Flash-Next (qwen4_exp).
 
-Designed to pair directly with Adamant's dense-spine + lm_head .basalt decode path:
+Designed to pair directly with Amperite's dense-spine + lm_head .basalt decode path:
 - Quantizes all VRAM-resident dense projections (QSA, GDN, shared expert) and lm_head to MS_C6.
 - Applies GDN-2 (l % 4 == 2) Early+Late Minimax positional weighting (0.40/0.10/0.10/0.40).
 - Supports optional ridge least-squares residual refitting for attn_output / shared_expert.down_proj.

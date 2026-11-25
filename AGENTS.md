@@ -1,10 +1,10 @@
 # AGENTS.md
 
-Adamant is a local inference engine for large mixture-of-experts models (Hy4-flash, Qwen3.8-Flash-Next), built for NVIDIA Ampere (sm_86) on Linux and Windows x64; Ada (sm_89) still builds. It runs on one GPU, optionally with a second GPU as a peer expert tier, and system RAM holding the rest. It is a fork of Basalt (MIT), which is a fork of Strata (MIT): the C++/CUDA engine is in `src/` and `include/`, each model's own code under `src/models/<model>`, and the Python server with an OpenAI- and Anthropic-compatible API is in `serve/`.
+Amperite is a local inference engine for large mixture-of-experts models (Hy4-flash, Qwen3.8-Flash-Next), built for NVIDIA Ampere (sm_86) only, on Linux and Windows x64. It runs on one GPU, optionally with a second GPU as a peer expert tier, and system RAM holding the rest. It is a fork of Adamant (MIT, sm_89), which forks Basalt (MIT), which forks Strata (MIT): the C++/CUDA engine is in `src/` and `include/`, each model's own code under `src/models/<model>`, and the Python server with an OpenAI- and Anthropic-compatible API is in `serve/`.
 
 ## Working rules
 
-`CONTRIBUTING.md` sets the project scope (CUDA on Ampere, Ada still building) and what every change must include (parity test, profile, quality check). It applies to agents too.
+`CONTRIBUTING.md` sets the project scope (CUDA on Ampere) and what every change must include (parity test, profile, quality check). It applies to agents too.
 
 - **Commits:** small and logical, message style `area: what it does`. Never amend and never force-push; always make new commits.
 - **Platform code:** engine code never names an OS or a compiler. No `_WIN32`, `_MSC_VER`, `__linux__`, `<windows.h>`, `<sys/mman.h>`, `<unistd.h>` or raw OS calls (mmap, pread, pthread, fork/exec, dlopen, /proc, /sys) outside `src/platform/` and `include/basalt/platform/`. A missing seam is added there with a Linux and a Windows body; the Linux body is the code you would have written anyway. `tools/check_platform_boundary.sh` enforces it.
@@ -20,5 +20,5 @@ Adamant is a local inference engine for large mixture-of-experts models (Hy4-fla
 - **Docs:** no file over 300 lines; split a longer topic into a folder of files; keep docs short, stateless and free of duplication.
 - **Docs are English only.** There is no translated mirror to keep.
 - **The engine's own kernels are the reference.** Parity tests compare a changed kernel against the current one and against a plain CPU reference; Strata's original kernels are not kept as oracles. Every new kernel gets a parity test (random inputs + real geometry) and a microbench line.
-- **Ampere target:** `include/basalt/cuda_target.hpp` is the only place the compute capability is decided (sm_86, and sm_89 which still builds). Hopper and Blackwell paths (thread-block clusters, distributed shared memory, tensor maps, programmatic dependent launch, native FP4/FP8 block-scaled MMA) are not carried; an upstream merge ports them to sm_86 or leaves them out. See `docs/precision/ampere.md`.
+- **Ampere target:** `include/basalt/cuda_target.hpp` is the only place the compute capability is decided (sm_86 only). Hopper and Blackwell paths (thread-block clusters, distributed shared memory, tensor maps, programmatic dependent launch, native FP4/FP8 block-scaled MMA) are not carried; an upstream merge ports them to sm_86 or leaves them out. See `docs/precision/ampere.md`.
 - **Upstream merges:** Basalt is merged in as a whole line (`merge: upstream basalt X line ...`); models and paths that cannot run on sm_86 (deepseek41, qwen35, the sm_120a targets) stay out.
