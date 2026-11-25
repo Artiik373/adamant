@@ -132,7 +132,6 @@ struct Prefill::Run::Chunk {
     const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
     // the peer takes the rows of a routed-only chunk up to its buffers' size
     PeerPrefill* const ppc = m.pp && m.peer_share && T <= m.pp->T_max ? m.pp.get() : nullptr;
-    struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; const uint8_t* pdev; };
     std::vector<StreamEntry> seq;
     std::vector<size_t> seq_start;
     size_t consumed = 0;
