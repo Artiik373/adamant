@@ -154,8 +154,9 @@ Models and methods:
 - [NVIDIA](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4): the NVFP4 experts.
 - [QTIP](https://arxiv.org/abs/2406.11235) and [exllamav3](https://github.com/turboderp-org/exllamav3): the trellis
   quantization that the EXL3 tensors use, and the qbench prompts and harness that the quality gate matches.
-- MS (Mad Shift) trellis quants from [ms-llama.cpp](https://github.com/devvexus/ms-llama.cpp) and its mad-shift-converter
-  (Apache-2.0): the QTIP bitshift trellis with 1MAD decoding that the MS_C2 to MS_C6 tensors use.
+- [MS (Mad Shift)](https://doi.org/10.5281/zenodo.24145285) (Priester, "MS (Mad Shift): Trellis-Coded GGUF Quantization
+  for llama.cpp", 2026) and [ms-llama.cpp](https://github.com/devvexus/ms-llama.cpp): the format the MS_C2 to MS_C6
+  tensors use.
 - [LoopCD](https://arxiv.org/abs/2610.02185) (Liu et al., "Decoding Looped Transformers Better for (Almost) Free"): the
   method behind `--loopcd`.
 
