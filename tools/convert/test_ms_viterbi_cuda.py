@@ -281,6 +281,33 @@ class ConverterPayload(unittest.TestCase):
         for p in ("gate", "up", "down"):
             self.assertTrue(all(v > 0.0 for v in errs_proj[p].values()))
 
+    def test_sensitivity_scan_proxy_multi_parity(self):
+        from types import SimpleNamespace
+        from ms_sensitivity_scan import quantize_experts, quantize_experts_proxy_multi
+
+        dev = torch.device("cuda")
+        lut = ms.build_1mad_lut(dev)
+        g = torch.Generator(device=dev).manual_seed(67)
+        n_exp, n_ff, n_embd = 3, 128, 128
+        gu0 = torch.randn(n_exp, 2 * n_ff, n_embd, device=dev, dtype=torch.bfloat16, generator=g)
+        dn0 = torch.randn(n_exp, n_embd, n_ff, device=dev, dtype=torch.bfloat16, generator=g)
+        moe = SimpleNamespace(
+            experts=SimpleNamespace(gate_up_proj=gu0.clone(), down_proj=dn0.clone())
+        )
+        x = torch.randn(24, n_embd, device=dev, dtype=torch.bfloat16, generator=g)
+        idx = torch.randint(0, n_exp, (24, 2), device=dev, generator=g)
+        errs_m, ep_m = quantize_experts_proxy_multi(moe, x, idx, [2, 3, 4], [0, 1, 2], eb=2, tau=16.0, l=0)
+        for k in (2, 3, 4):
+            moe.experts.gate_up_proj.copy_(gu0)
+            moe.experts.down_proj.copy_(dn0)
+            errs_s, ep_s = {}, {"gate": {}, "up": {}, "down": {}}
+            quantize_experts(moe, x, idx, k, lut, [0, 1, 2], eb=2, tau=16.0, l=0,
+                             errs=errs_s, mode="ldlq", errs_proj=ep_s)
+            for e in (0, 1, 2):
+                self.assertLess(abs(errs_m[k][e] - errs_s[e]) / max(1.0, errs_s[e]), 1e-5)
+                for p in ("gate", "up", "down"):
+                    self.assertLess(abs(ep_m[p][k][e] - ep_s[p][e]) / max(1.0, ep_s[p][e]), 1e-5)
+
 
 if __name__ == "__main__":
     unittest.main()

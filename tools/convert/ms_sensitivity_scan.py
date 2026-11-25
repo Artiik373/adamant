@@ -194,11 +194,8 @@ def gptq_nvfp4(w, hu):
 
 
 @torch.no_grad()
-def fast_ldlq_batch(ws, hs, k, seeds, blk_sz: int = 64):
-    """Fast non-Viterbi proxy: Hadamard rotate + clipped uniform K-bit block-LDLQ (no 2^14 trellis search)."""
-    blk = 512 if ws[0].shape[1] % 512 == 0 else 128
-    rot = [ms.rotate_weight_and_hessian(w, h, block_size=blk, seed=sd) for w, h, sd in zip(ws, hs, seeds)]
-    hu = torch.stack([ms.cholesky_inv_upper(r[1]) for r in rot])
+def _ldlq_from_rot(rot, hu, k: int, blk_sz: int = 64):
+    blk = 512 if rot[0][0].shape[1] % 512 == 0 else 128
     w_work = torch.stack([r[0] for r in rot]).float().clone()
     std = w_work.std(dim=2, keepdim=True).clamp(min=1e-8)
     clip = (1.5 + 0.45 * k) * std
@@ -213,7 +210,16 @@ def fast_ldlq_batch(ws, hs, k, seeds, blk_sz: int = 64):
         if c1 < in_f:
             err = torch.linalg.solve_triangular(hu[:, c0:c1, c0:c1], w_work[:, :, c0:c1] - qc, upper=True, left=False)
             w_work[:, :, c1:] -= torch.bmm(err, hu[:, c0:c1, c1:])
-    return [ms.fwht_blocks(q[i], block_size=blk) * rot[i][2].unsqueeze(0) for i in range(len(ws))]
+    return [ms.fwht_blocks(q[i], block_size=blk) * rot[i][2].unsqueeze(0) for i in range(len(rot))]
+
+
+@torch.no_grad()
+def fast_ldlq_batch(ws, hs, k, seeds, blk_sz: int = 64):
+    """Fast non-Viterbi proxy: Hadamard rotate + clipped uniform K-bit block-LDLQ (no 2^14 trellis search)."""
+    blk = 512 if ws[0].shape[1] % 512 == 0 else 128
+    rot = [ms.rotate_weight_and_hessian(w, h, block_size=blk, seed=sd) for w, h, sd in zip(ws, hs, seeds)]
+    hu = torch.stack([ms.cholesky_inv_upper(r[1]) for r in rot])
+    return _ldlq_from_rot(rot, hu, k, blk_sz)
 
 
 def quant_batch(ws, hs, k, seeds, lut, mode="ms", viterbi=(32, 8)):
@@ -307,6 +313,86 @@ def quantize_experts(moe, x, idx, k, lut, experts, eb: int = 8, tau: float = 0.0
     return gu_q, dn_q
 
 
+@torch.no_grad()
+def quantize_experts_proxy_multi(moe, x, idx, widths, experts, eb: int = 8, tau: float = 0.0, l: int = 0,
+                                 write_k: int | None = None):
+    """Multi-width --proxy scan sharing Hessians, rotations, Cholesky factors, and BF16 y0 across all widths.
+    write_k: if set, overwrite moe.experts weights in-place with that width's quantized weights for out_rel eval."""
+    from ms_flashnext_convert import expert_hessians
+    ex = moe.experts
+    dev = ex.gate_up_proj.device
+    gu_dtype, dn_dtype = ex.gate_up_proj.dtype, ex.down_proj.dtype
+    h_all = x_ref = None
+    if tau > 0:
+        h_all = sum((c := b.to(dev).float()).T @ c for b in x.split(65536)) / x.shape[0]
+        x_ref = x[torch.randperm(x.shape[0], generator=torch.Generator().manual_seed(l))[:2048].to(x.device)].to(dev)
+    n_ff = ex.gate_up_proj.shape[1] // 2
+    errs = {k: {} for k in widths}
+    errs_proj = {p: {k: {} for k in widths} for p in ("gate", "up", "down")}
+    for e0 in range(0, len(experts), eb):
+        es = experts[e0 : e0 + eb]
+        gus, dns, hgu, hdn = [], [], [], []
+        for e in es:
+            wgu = ex.gate_up_proj[e].float().clone()
+            gus.append(wgu)
+            dns.append(ex.down_proj[e].float().clone())
+            sel = (idx == e).any(-1).nonzero().squeeze(1)
+            h_gu, h_dn, _ = expert_hessians(x[sel.to(x.device)].to(dev), idx[sel], e, wgu, None, tau, h_all, x_ref)
+            hgu.append(h_gu)
+            hdn.append(h_dn)
+        blk_gu = 512 if gus[0].shape[1] % 512 == 0 else 128
+        blk_dn = 512 if dns[0].shape[1] % 512 == 0 else 128
+        rot_gu = [ms.rotate_weight_and_hessian(w, h, block_size=blk_gu, seed=2 * e + 1) for w, h, e in zip(gus, hgu, es)]
+        hu_gu = torch.stack([ms.cholesky_inv_upper(r[1]) for r in rot_gu])
+        rot_dn = [ms.rotate_weight_and_hessian(w, h, block_size=blk_dn, seed=2 * e + 2) for w, h, e in zip(dns, hdn, es)]
+        hu_dn = torch.stack([ms.cholesky_inv_upper(r[1]) for r in rot_dn])
+        del hgu, hdn
+        q_gus = {k: [q.to(gu_dtype).float() for q in _ldlq_from_rot(rot_gu, hu_gu, k)] for k in widths}
+        q_dns = {k: [q.to(dn_dtype).float() for q in _ldlq_from_rot(rot_dn, hu_dn, k)] for k in widths}
+        del rot_gu, hu_gu, rot_dn, hu_dn
+        for i, (e, wgu, wdn) in enumerate(zip(es, gus, dns)):
+            sel = (idx == e).any(-1).nonzero().squeeze(1).to(x.device)
+            ev_all = {k: 0.0 for k in widths}
+            ev_g = {k: 0.0 for k in widths}
+            ev_u = {k: 0.0 for k in widths}
+            if sel.numel() > 0:
+                m_dn = wdn.T @ wdn
+                g_act = torch.zeros((n_ff, n_ff), device=dev, dtype=torch.float32)
+                for c in range(0, sel.numel(), 8192):
+                    xs = x[sel[c : c + 8192]].to(dev).float()
+                    g0, u0 = (xs @ wgu.T).chunk(2, -1)
+                    silu_g0 = F.silu(g0)
+                    act0 = silu_g0 * u0
+                    y0 = act0 @ wdn.T
+                    g_act += act0.T @ act0
+                    for k in widths:
+                        g_q, u_q = (xs @ q_gus[k][i].T).chunk(2, -1)
+                        dg_act = (F.silu(g_q) - silu_g0) * u0
+                        du_act = silu_g0 * (u_q - u0)
+                        ev_g[k] += ((dg_act @ m_dn) * dg_act).sum().item()
+                        ev_u[k] += ((du_act @ m_dn) * du_act).sum().item()
+                        d = (F.silu(g_q) * u_q) @ q_dns[k][i].T - y0
+                        ev_all[k] += (d * d).sum().item()
+            for k in widths:
+                errs[k][e] = ev_all[k]
+                errs_proj["gate"][k][e] = ev_g[k]
+                errs_proj["up"][k][e] = ev_u[k]
+                if sel.numel() > 0:
+                    dw = q_dns[k][i] - wdn
+                    errs_proj["down"][k][e] = ((dw @ g_act) * dw).sum().item()
+                else:
+                    errs_proj["down"][k][e] = 0.0
+            if write_k is not None:
+                ex.gate_up_proj.data[e] = q_gus[write_k][i].to(gu_dtype)
+                ex.down_proj.data[e] = q_dns[write_k][i].to(dn_dtype)
+        del gus, dns, q_gus, q_dns
+        torch.cuda.empty_cache()
+        if e0 % 128 == 0:
+            print(f"    widths {widths} experts {e0}: peak alloc {torch.cuda.max_memory_allocated() / 2**30:.1f} "
+                  f"reserved {torch.cuda.max_memory_reserved() / 2**30:.1f} GiB", flush=True)
+    return errs, errs_proj
+
+
 def run_layer(layer, h, kws, batch, grab_in=None, grab_out=None, inplace=False):
     hooks = []
     if grab_in is not None:
@@ -330,6 +416,9 @@ def rel(a, b):
 def report(out_dir: Path) -> None:
     rows = [json.loads(s) for s in (out_dir / "scan.jsonl").read_text().splitlines() if s.strip()]
     ws = [c for c in rows[0] if c[0] == "C" and c[1:].isdigit()]
+    if not ws:
+        print(f"{len(rows)} layers scanned (per-expert proxy)")
+        return
     ws.sort(key=lambda c: int(c[1:]))
     # one width step costs the same bits on every layer, so rank by the drop in squared layer-output error
     lo, hi = ws[0], ws[1] if len(ws) > 1 else ws[0]
@@ -339,7 +428,7 @@ def report(out_dir: Path) -> None:
           + " ".join(f"{c + ' moe':>8}" for c in ws) + f" {'zero-tok':>8}")
     for r in rows:
         print(f"{r['layer']:5d} {r['type']:>17} " + " ".join(f"{r[c]['out_rel']:8.5f}" for c in ws) + " "
-              + " ".join(f"{r[c]['moe_rel']:8.4f}" for c in ws) + f" {r['zero_token_experts']:8d}")
+              + " ".join(f"{r[c].get('moe_rel', 0.0):8.4f}" for c in ws) + f" {r['zero_token_experts']:8d}")
     order = sorted(rows, key=lambda r: -r["gain"])
     print(f"layers by {lo}->{hi} gain:", [r["layer"] for r in order])
 
@@ -357,6 +446,8 @@ def main() -> None:
                    help="comma-separated trellis widths K to scan, e.g. 2,3,4,5,6")
     p.add_argument("--hess-tau", type=float, default=0.0, help="the converter's Hessian shrinkage (0: plain sums)")
     p.add_argument("--stop-after", type=int, default=None, help="last layer to scan in this run")
+    p.add_argument("--save-every", type=int, default=8,
+                   help="write state.pt resume checkpoint every N layers (0: off)")
     p.add_argument("--mix", action="store_true", help="with --per-expert: measure the per-expert mixes too")
     p.add_argument("--expert-batch", type=int, default=8, help="experts coded per Viterbi call (fewer: less GPU memory)")
     p.add_argument("--window", type=int, default=24, help="Viterbi search window for scan (default 24)")
@@ -383,19 +474,24 @@ def main() -> None:
     wmap = json.loads((args.hf_dir / "model.safetensors.index.json").read_text())["weight_map"]
     calib = torch.load(args.calib, map_location="cpu", weights_only=True)
     bs = args.batch_size
-    assert args.calib_seqs % bs == 0 and args.eval_seqs % bs == 0
+    proxy_only = args.proxy and args.per_expert and not args.fp4 and not args.mix
+    import math
+    ev_bs = math.gcd(bs, args.eval_seqs)
+    assert args.calib_seqs % bs == 0 and args.eval_seqs % ev_bs == 0
 
     cal_ids, ev_ids = split_calib(calib, args.calib_seqs, args.eval_seqs)
     host = cal_ids.numel() * cfg.hc_count * cfg.hidden_size * 2 > (4 << 30)   # as the converter: a large stream in RAM
     h_cal, kw_cal = prelude(cfg, args.hf_dir, wmap, cal_ids, dev, bs, host=host)
-    h_ev, kw_ev = prelude(cfg, args.hf_dir, wmap, ev_ids, dev, bs)
+    h_ev, kw_ev = prelude(cfg, args.hf_dir, wmap, ev_ids, dev, ev_bs)
     state = args.out_dir / "state.pt"
     start = 0
     if state.exists():
         st = torch.load(state, map_location="cpu", weights_only=True)
-        start, h_cal, h_ev = st["next_layer"], st["h_cal"].to("cpu" if host else dev), st["h_ev"].to(dev)
+        start = st["next_layer"]
+        h_cal = st["h_cal"].to("cpu" if host else dev)
+        h_ev = st["h_ev"].to(dev)
         print(f"resuming at layer {start}", flush=True)
-    lut = ms.build_1mad_lut(dev)
+    lut = None if proxy_only else ms.build_1mad_lut(dev)
     last = cfg.num_hidden_layers - 1 if args.stop_after is None else args.stop_after
 
     for l in range(start, last + 1):
@@ -403,16 +499,19 @@ def main() -> None:
         layer = load_layer(cfg, args.hf_dir, wmap, l, dev)
         t_load = time.time() - t0
         # the MoE inputs go straight into one buffer (in host RAM for a large set): a list plus torch.cat holds them twice
-        x = torch.empty(cal_ids.numel(), cfg.hidden_size, dtype=torch.bfloat16, device="cpu" if host else dev)
+        x = torch.empty(cal_ids.numel(), cfg.hidden_size, dtype=torch.bfloat16, device="cpu" if host else dev,
+                        pin_memory=host)
         fill = [0]
 
         def grab(_m, a):
             t = a[0].reshape(-1, a[0].shape[-1])
-            x[fill[0] : fill[0] + t.shape[0]] = t
+            x[fill[0] : fill[0] + t.shape[0]].copy_(t, non_blocking=host)
             fill[0] += t.shape[0]
         hk = layer.mlp.register_forward_pre_hook(grab)
         h_cal = run_layer(layer, h_cal, kw_cal, bs, inplace=host)
         hk.remove()
+        if host:
+            torch.cuda.synchronize()
         assert fill[0] == x.shape[0], (fill[0], x.shape)
         torch.cuda.empty_cache()
         if x.device != dev:
@@ -423,14 +522,6 @@ def main() -> None:
         with torch.no_grad():   # in chunks, as the converter: only the top-k ids stay
             idx = torch.cat([moe.gate(c.to(dev))[2] for c in x.split(65536)])
         counts = torch.bincount(idx.flatten(), minlength=moe.experts.num_experts)
-        y_ref, xe_ev = [], []
-        h_ref = run_layer(layer, h_ev, kw_ev, bs, grab_in=xe_ev, grab_out=y_ref)
-        y_ref = torch.cat(y_ref)
-        xe_ev = torch.cat(xe_ev)
-        with torch.no_grad():
-            shared = (torch.sigmoid(moe.shared_expert_gate(xe_ev)) * moe.shared_expert(xe_ev)).float()
-        routed_ref = y_ref - shared
-        torch.cuda.empty_cache()   # the forward's cached blocks back to the driver before the coder
         rec = {
             "layer": l,
             "type": cfg.layer_types[l],
@@ -442,6 +533,43 @@ def main() -> None:
         order = torch.argsort(counts).tolist()
         sample = order[:: max(1, len(order) // args.experts)][: args.experts]
         t_fwd = time.time() - t0 - t_load
+        print(f"layer {l}: forward done, peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
+        if proxy_only:
+            tq = time.time()
+            ref_k = 3 if 3 in args.widths else args.widths[0]
+            h_ref = run_layer(layer, h_ev, kw_ev, ev_bs)
+            errs, errs_proj = quantize_experts_proxy_multi(
+                moe, x, idx, args.widths, sample, eb=args.expert_batch, tau=args.hess_tau, l=l, write_k=ref_k)
+            h_q = run_layer(layer, h_ev, kw_ev, ev_bs)
+            rec[f"C{ref_k}"] = {"out_rel": rel(h_q.float(), h_ref.float())}
+            (args.out_dir / f"experts_{l}.json").write_text(
+                json.dumps({"counts": counts.tolist(), "errs": errs, "errs_proj": errs_proj}))
+            quant = time.time() - tq
+            rec["proxy_seconds"] = round(quant, 1)
+            h_ev = h_ref
+            td0 = time.time()
+            del layer, moe, x, idx, h_q
+            torch.cuda.empty_cache()
+            t_del = time.time() - td0
+            with open(args.out_dir / "scan.jsonl", "a") as f:
+                f.write(json.dumps(rec) + "\n")
+            ts0 = time.time()
+            if args.save_every > 0 and ((l + 1) % args.save_every == 0 or (l == last and args.stop_after is not None)):
+                torch.save({"next_layer": l + 1, "h_cal": h_cal, "h_ev": h_ev}, state)
+            t_save = time.time() - ts0
+            print(f"layer {l:2d} {rec['type']:>17}: proxy {args.widths} C{ref_k} out {rec[f'C{ref_k}']['out_rel']:.5f} | "
+                  f"zero-token experts {rec['zero_token_experts']} | load {t_load:.0f}s fwd {t_fwd:.0f}s quant {quant:.0f}s "
+                  f"del {t_del:.1f}s save {t_save:.1f}s total {time.time() - t0:.0f}s", flush=True)
+            continue
+
+        y_ref, xe_ev = [], []
+        h_ref = run_layer(layer, h_ev, kw_ev, bs, grab_in=xe_ev, grab_out=y_ref)
+        y_ref = torch.cat(y_ref)
+        xe_ev = torch.cat(xe_ev)
+        with torch.no_grad():
+            shared = (torch.sigmoid(moe.shared_expert_gate(xe_ev)) * moe.shared_expert(xe_ev)).float()
+        routed_ref = y_ref - shared
+        torch.cuda.empty_cache()   # the forward's cached blocks back to the driver before the coder
         gu_ref, dn_ref = moe.experts.gate_up_proj.data.cpu(), moe.experts.down_proj.data.cpu()   # originals in RAM
 
         def measure(plan, name, mode="ms"):
@@ -500,7 +628,8 @@ def main() -> None:
         torch.cuda.empty_cache()
         with open(args.out_dir / "scan.jsonl", "a") as f:
             f.write(json.dumps(rec) + "\n")
-        torch.save({"next_layer": l + 1, "h_cal": h_cal, "h_ev": h_ev}, state)
+        if args.save_every > 0 and ((l + 1) % args.save_every == 0 or (l == last and args.stop_after is not None)):
+            torch.save({"next_layer": l + 1, "h_cal": h_cal, "h_ev": h_ev}, state)
         names = [n for n in rec if n[0] in "CmN" and isinstance(rec[n], dict)]
         widths = " | ".join(f"{n} out {rec[n]['out_rel']:.5f} moe {rec[n]['moe_rel']:.4f}" for n in names)
         quant = sum(rec[n]["seconds"] for n in names)
