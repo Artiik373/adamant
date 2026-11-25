@@ -279,6 +279,7 @@ __global__ void __launch_bounds__(kTcWarps * 32, 2) ms_gemv_tc_kernel(const uint
 // scale, round to nearest).  One launch for a whole group, so the GPU has enough rows to hide each row's latency.
 struct MsBlobs {
     const uint8_t* blob[kMsGroupMax];
+    int32_t slot[kMsGroupMax];
 };
 
 template <int K, int N_IN, int N_EACH, int P>
@@ -322,7 +323,7 @@ __global__ void __launch_bounds__(kWarps * 32) ms_q80_rows_kernel(const MsBlobs 
         __syncwarp();
         const uint8_t* p = payload(row);
         const int8_t* signs = reinterpret_cast<const int8_t*>(p + (size_t) N_EACH * kStride * 4);
-        mc::MsQ80* o = reinterpret_cast<mc::MsQ80*>(dst + (size_t) (row / kRowsExp) * dst_stride) +
+        mc::MsQ80* o = reinterpret_cast<mc::MsQ80*>(dst + (size_t) g.slot[row / kRowsExp] * dst_stride) +
                        (size_t) (row % kRowsExp) * (N_IN / 32);
         if (row + stride_all < n_rows) fetch(row + stride_all);
         const float scale = __half2float(__ushort_as_half((unsigned short) (hdr & 0xFFFFu))) * rs;
@@ -535,9 +536,9 @@ void ms_dequant_expert_f16(int ggml_type, const void* blob, int64_t n_embd, int6
     if (err != cudaSuccess) throw std::runtime_error(std::string("ms_dequant_expert_f16: ") + cudaGetErrorString(err));
 }
 
-void ms_experts_to_q8_0(int ggml_type, const uint8_t* const* blobs, int n, int64_t n_embd, int64_t n_ff,
-                        size_t up_off, size_t down_off, void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride,
-                        void* stream) {
+void ms_experts_to_q8_0_slots(int ggml_type, const uint8_t* const* blobs, const int32_t* slots, int n,
+                              int64_t n_embd, int64_t n_ff, size_t up_off, size_t down_off, void* gu_dst,
+                              size_t gu_stride, void* d_dst, size_t d_stride, void* stream) {
     if (!basalt::ms_tensor_type((uint32_t) ggml_type) || n_embd != 2560 || n_ff != 640 || n < 1 || n > kMsGroupMax ||
         blobs == nullptr || gu_dst == nullptr || d_dst == nullptr)
         throw std::invalid_argument("ms_experts_to_q8_0: unsupported type, shape, count or pointer");
@@ -545,6 +546,7 @@ void ms_experts_to_q8_0(int ggml_type, const uint8_t* const* blobs, int n, int64
     for (int i = 0; i < n; ++i) {
         if (blobs[i] == nullptr) throw std::invalid_argument("ms_experts_to_q8_0: a null blob");
         g.blob[i] = blobs[i];
+        g.slot[i] = slots ? slots[i] : i;
     }
     const auto s = static_cast<cudaStream_t>(stream);
     auto* gu = static_cast<uint8_t*>(gu_dst);
@@ -568,6 +570,13 @@ void ms_experts_to_q8_0(int ggml_type, const uint8_t* const* blobs, int n, int64
     }
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) throw std::runtime_error(std::string("ms_experts_to_q8_0: ") + cudaGetErrorString(err));
+}
+
+void ms_experts_to_q8_0(int ggml_type, const uint8_t* const* blobs, int n, int64_t n_embd, int64_t n_ff,
+                        size_t up_off, size_t down_off, void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride,
+                        void* stream) {
+    ms_experts_to_q8_0_slots(ggml_type, blobs, nullptr, n, n_embd, n_ff, up_off, down_off, gu_dst, gu_stride, d_dst,
+                             d_stride, stream);
 }
 
 void ms_expert_to_q8_0(int ggml_type, const void* blob, int64_t n_embd, int64_t n_ff, size_t up_off, size_t down_off,

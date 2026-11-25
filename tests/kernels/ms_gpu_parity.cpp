@@ -310,6 +310,18 @@ void bench_dequant_expert() {
             std::printf(", %.1f us an expert in a group of 16 (slot 16 %s)\n", qms * 1e3 / (20 * 16),
                         same ? "bitwise equal" : "DIFF FAIL");
             if (!same) ++g_fail;
+            const uint8_t* bl2[2] = {(const uint8_t*) db, (const uint8_t*) db};
+            const int32_t sl2[2] = {15, 2};
+            CK(cudaMemsetAsync(g16, 0, bgu * 16, s));
+            gpu::ms_experts_to_q8_0_slots(type, bl2, sl2, 2, H, FF, L.up_off, L.down_off, g16, bgu, d16, bd, s);
+            CK(cudaStreamSynchronize(s));
+            std::vector<uint8_t> s2(bgu);
+            CK(cudaMemcpy(last.data(), (uint8_t*) g16 + 15 * bgu, bgu, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(s2.data(), (uint8_t*) g16 + 2 * bgu, bgu, cudaMemcpyDeviceToHost));
+            if (last != hq || s2 != hq) {
+                std::printf("  %s ms_experts_to_q8_0_slots DIFF FAIL\n", basalt::ggml_type_name(type));
+                ++g_fail;
+            }
             cudaFree(g16);
             cudaFree(d16);
         }
