@@ -161,19 +161,21 @@ def expert_hessians(x: torch.Tensor, idx: torch.Tensor, e: int, w_gu: torch.Tens
     squared, as its error reaches the layer output times the score.  tau > 0: each Hessian, as a mean, shrunk toward
     the layer's (gate/up: h_all, every token's x x^T mean; down: the expert's activations on the x_ref tokens) with
     tau tokens' weight, so a rarely routed expert keeps the layer's input statistics instead of a few tokens' or none."""
+    dev = idx.device
     hit = idx == e
     rows = hit.any(-1)
     sel = rows.nonzero().squeeze(1)
     n = sel.numel()
     if tau <= 0 and not n:
-        return torch.eye(x.shape[1], device=x.device), torch.eye(w_gu.shape[0] // 2, device=x.device), 0
-    p = (wts.float()[sel] * hit[sel]).sum(-1) ** 2 if wts is not None else torch.ones(n, device=x.device)
+        return torch.eye(x.shape[1], device=dev), torch.eye(w_gu.shape[0] // 2, device=dev), 0
+    p = (wts.float()[sel] * hit[sel]).sum(-1) ** 2 if wts is not None else torch.ones(n, device=dev)
     if tok_w is not None:   # per-token weights (Fisher): on top of the router's
         p = p * tok_w[sel]
-    s_in = torch.zeros(x.shape[1], x.shape[1], device=x.device)
-    s_dn = torch.zeros(w_gu.shape[0] // 2, w_gu.shape[0] // 2, device=x.device)
+    s_in = torch.zeros(x.shape[1], x.shape[1], device=dev)
+    s_dn = torch.zeros(w_gu.shape[0] // 2, w_gu.shape[0] // 2, device=dev)
     for c in range(0, n, 65536):   # in chunks: a busy expert's tokens in fp32 would not fit next to x
-        xe, pc = x[sel[c : c + 65536]].float(), p[c : c + 65536, None]
+        xe = x[sel[c : c + 65536].to(x.device)].to(dev).float()
+        pc = p[c : c + 65536, None]
         g, u = (xe @ w_gu.T).chunk(2, -1)
         a = torch.nn.functional.silu(g) * u
         s_in += (xe * pc).T @ xe
@@ -185,8 +187,8 @@ def expert_hessians(x: torch.Tensor, idx: torch.Tensor, e: int, w_gu: torch.Tens
     ar = torch.nn.functional.silu(gr) * ur
     hd_all = ar.T @ ar / ar.shape[0]
     # tau weighs the prior as tau tokens against the expert's effective sample size (n when all weights are equal)
-    ess = m * m / (p * p).sum() if n else torch.tensor(1.0, device=x.device)
-    t = tau * (m / ess if n else torch.tensor(1.0, device=x.device))
+    ess = m * m / (p * p).sum() if n else torch.tensor(1.0, device=dev)
+    t = tau * (m / ess if n else torch.tensor(1.0, device=dev))
     return (s_in + t * h_all) / (m + t), (s_dn + t * hd_all) / (m + t), n
 
 
@@ -210,11 +212,12 @@ def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0
                  cold_frac: float | None = None) -> dict:
     """k: one width for the layer, a list of one width per expert, or a list of [k_gate, k_up, k_down] per expert."""
     ex = moe.experts
+    dev = idx.device
     h_all = x_ref = None
     if tau > 0:   # the layer-wide statistics the shrinkage pulls toward: all tokens, and a fixed sample of them
-        h_all = sum(c.float().T @ c.float() for c in x.split(65536)) / x.shape[0]   # in chunks: no fp32 copy
+        h_all = sum((cb := c.to(dev).float()).T @ cb for c in x.split(65536)) / x.shape[0]   # in chunks: no fp32 copy
         g = torch.Generator(device="cpu").manual_seed(l)
-        x_ref = x[torch.randperm(x.shape[0], generator=g)[:2048].to(x.device)]
+        x_ref = x[torch.randperm(x.shape[0], generator=g)[:2048].to(x.device)].to(dev)
     n_exp, two_ff, n_embd = ex.gate_up_proj.shape
     n_ff = two_ff // 2
     cf = COLD_FRAC if cold_frac is None else cold_frac
@@ -714,13 +717,14 @@ def main() -> None:
             continue
         hess, counts = {}, {}
         hooks = spine_hooks(layer, hess, counts)
-        # the MoE inputs go straight into one buffer: a list plus torch.cat would hold them twice
-        x = torch.empty(cal_ids.numel(), cfg.hidden_size, dtype=torch.bfloat16, device=dev)
+        # the MoE inputs go straight into one buffer: in host RAM when host_h is set so 2560 seqs don't overflow 24 GB VRAM
+        x = torch.empty(cal_ids.numel(), cfg.hidden_size, dtype=torch.bfloat16,
+                        device="cpu" if host_h else dev, pin_memory=host_h)
         fill = [0]
 
         def grab(_m, a):
             t = a[0].reshape(-1, a[0].shape[-1])
-            x[fill[0] : fill[0] + t.shape[0]] = t
+            x[fill[0] : fill[0] + t.shape[0]] = t.to(x.device)
             fill[0] += t.shape[0]
         hooks.append(layer.mlp.register_forward_pre_hook(grab))
         h = run_layer(layer, h, kws, bs, inplace=True)
@@ -739,7 +743,7 @@ def main() -> None:
 
         moe = layer.mlp
         with torch.no_grad():   # in chunks: only the top-k ids and scores stay, not every token's logits
-            parts = [moe.gate(c)[1:] for c in x.split(65536)]
+            parts = [moe.gate(c.to(dev))[1:] for c in x.split(65536)]
             wts, idx = torch.cat([p[0] for p in parts]), torch.cat([p[1] for p in parts])
             del parts
         rec = code_experts(moe, x, idx, plan[l], lut, l, out / "experts", wts if args.hess_affinity else None,
