@@ -71,8 +71,8 @@ def pack_rows(states: torch.Tensor, scales: torch.Tensor, k: int) -> bytes:
 VITERBI = (48, 12)   # search window, commit length; set from --window/--commit
 COLD_VITERBI = (32, 8)   # search window, commit length for cold experts
 COLD_FRAC = 0.0     # fraction of lowest-token experts per layer using COLD_VITERBI; set from --cold-frac
-SIGN_TRIALS = 8     # sign-seed trials per matrix; set from --sign-trials
-SCALE_PASSES = 2    # Viterbi scale search passes; set from --scale-passes
+SIGN_TRIALS = 1     # sign-seed trials per matrix; set from --sign-trials
+SCALE_PASSES = 1    # Viterbi scale search passes; set from --scale-passes
 
 
 def refit_scales(w: torch.Tensor, states: torch.Tensor, scales: torch.Tensor, h: torch.Tensor, lut):
@@ -231,12 +231,14 @@ def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0
     k_triples = _norm_expert_ks(k, n_exp)
     files = {n: open(out_dir / f"blk.{l}.ffn_{n}_exps.ms", "wb") for n in ("gate", "up", "down")}
     # experts per batch: the back-pointer buffer grows with the window
-    eb = EXPERT_BATCH or 8 * 32 // VITERBI[0]
+    eb = EXPERT_BATCH or 8
     zero = 0
     try:
         for e0 in range(0, n_exp, eb):
             es = list(range(e0, min(e0 + eb, n_exp)))
-            hs = [expert_hessians(x, idx, e, ex.gate_up_proj[e].float(), wts, tau, h_all, x_ref, tok_w) for e in es]
+            w_gu_b = ex.gate_up_proj[es].to(dev).float()
+            w_dn_b = ex.down_proj[es].to(dev).float()
+            hs = [expert_hessians(x, idx, e, w_gu_b[i], wts, tau, h_all, x_ref, tok_w) for i, e in enumerate(es)]
             zero += sum(1 for h in hs if h[2] == 0)
             got_g, got_u, got_d = {}, {}, {}
             for cold in (False, True):
@@ -247,7 +249,7 @@ def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0
                     sub = [i for i in range(len(es)) if is_cold[es[i]] == cold
                            and k_triples[es[i]][0] == kk and k_triples[es[i]][1] == kk]
                     ids = [es[i] for i in sub]
-                    gu = code(ex.gate_up_proj[ids].float(), torch.stack([hs[i][0] for i in sub]), kk, lut,
+                    gu = code(w_gu_b[sub], torch.stack([hs[i][0] for i in sub]), kk, lut,
                               [l * 4096 + 2 * e + 1 for e in ids], **kw)
                     rb_gu = ms_row_bytes(n_embd, kk) * n_ff
                     for e, (rows, signs, _) in zip(ids, gu):
@@ -260,7 +262,7 @@ def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0
                         sub = [i for i in range(len(es)) if is_cold[es[i]] == cold
                                and k_triples[es[i]][0] != k_triples[es[i]][1] and k_triples[es[i]][proj_idx] == kk]
                         ids = [es[i] for i in sub]
-                        res = code(ex.gate_up_proj[ids, sl_gu].float(), torch.stack([hs[i][0] for i in sub]), kk, lut,
+                        res = code(w_gu_b[sub, sl_gu], torch.stack([hs[i][0] for i in sub]), kk, lut,
                                    [l * 4096 + 2 * e + 1 + proj_idx * 2048 for e in ids], **kw)
                         for e, (rows, signs, _) in zip(ids, res):
                             got_p[e] = (rows, signs)
@@ -268,7 +270,7 @@ def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0
                 for kk in dn_ks:
                     sub = [i for i in range(len(es)) if is_cold[es[i]] == cold and k_triples[es[i]][2] == kk]
                     ids = [es[i] for i in sub]
-                    dn = code(ex.down_proj[ids].float(), torch.stack([hs[i][1] for i in sub]), kk, lut,
+                    dn = code(w_dn_b[sub], torch.stack([hs[i][1] for i in sub]), kk, lut,
                               [l * 4096 + 2 * e + 2 for e in ids], **kw)
                     for e, (rows_d, signs_d, _) in zip(ids, dn):
                         got_d[e] = (rows_d, signs_d)
@@ -588,9 +590,9 @@ def main() -> None:
                    help="only the MTP drafter: the original layers run uncoded, then the drafter is coded")
     p.add_argument("--hess-affinity", action="store_true",
                    help="weight each routed token in its expert's Hessians by its router score squared")
-    p.add_argument("--sign-trials", type=int, default=8,
+    p.add_argument("--sign-trials", type=int, default=1,
                    help="sign-seed trials per matrix minimizing rotated kurtosis * LDLQ pivot sum (1: fixed seed)")
-    p.add_argument("--scale-passes", type=int, default=2, choices=(1, 2),
+    p.add_argument("--scale-passes", type=int, default=1, choices=(1, 2),
                    help="Viterbi scale passes per matrix (2: re-search rows with refitted fp16 scale)")
     p.add_argument("--tok-w", type=Path, default=None,
                    help="optional .pt tensor of per-token Fisher/importance weights [N * seq_len]")
@@ -724,12 +726,14 @@ def main() -> None:
 
         def grab(_m, a):
             t = a[0].reshape(-1, a[0].shape[-1])
-            x[fill[0] : fill[0] + t.shape[0]] = t.to(x.device)
+            x[fill[0] : fill[0] + t.shape[0]].copy_(t, non_blocking=host_h)
             fill[0] += t.shape[0]
         hooks.append(layer.mlp.register_forward_pre_hook(grab))
         h = run_layer(layer, h, kws, bs, inplace=True)
         for hk in hooks:
             hk.remove()
+        if host_h:
+            torch.cuda.synchronize()
         assert fill[0] == x.shape[0], (fill[0], x.shape)
         t_fwd = time.time() - t0
 
@@ -746,6 +750,13 @@ def main() -> None:
             parts = [moe.gate(c.to(dev))[1:] for c in x.split(65536)]
             wts, idx = torch.cat([p[0] for p in parts]), torch.cat([p[1] for p in parts])
             del parts
+        if x.device != dev:
+            # Move 5 GiB expert weights to CPU so x (6.25 GiB) fits on GPU with >10 GiB headroom for parallel gathers
+            moe.experts.to("cpu")
+            torch.cuda.empty_cache()
+            free_b, _ = torch.cuda.mem_get_info(dev)
+            if free_b > x.numel() * x.element_size() + (4 << 30):
+                x = x.to(dev)
         rec = code_experts(moe, x, idx, plan[l], lut, l, out / "experts", wts if args.hess_affinity else None,
                            args.hess_tau, tok_w)
         del layer, moe, x, idx, wts

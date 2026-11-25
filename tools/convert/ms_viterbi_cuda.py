@@ -21,14 +21,28 @@ _EXT: dict = {}
 def get_viterbi_ext(fp4_c: Optional[float] = None):
     """fp4_c: a probe build whose decode snaps each value to the E2M1 grid times fp4_c."""
     if fp4_c not in _EXT:
+        import importlib.util
+        import sysconfig
+        from torch.utils.cpp_extension import _get_build_directory
+
         cu_path = Path(__file__).resolve().parent / "ms_viterbi_cuda.cu"
+        name = "ms_viterbi_cuda_ext"
+        if fp4_c is not None:
+            name += "_fp4_" + f"{fp4_c!r}".replace(".", "p")
+        build_dir = Path(_get_build_directory(name, verbose=False))
+        lib_path = build_dir / f"{name}{'.pyd' if os.name == 'nt' else '.so'}"
+        if lib_path.exists() and lib_path.stat().st_mtime >= cu_path.stat().st_mtime:
+            spec = importlib.util.spec_from_file_location(name, str(lib_path))
+            if spec is not None and spec.loader is not None:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                _EXT[fp4_c] = mod
+                return mod
         cuda_flags = ["-O3", "--use_fast_math"]
         if os.name == "nt":
             cuda_flags += ["-Xcompiler", "/Zc:preprocessor"]
-        name = "ms_viterbi_cuda_ext"
         if fp4_c is not None:
             cuda_flags.append(f"-DMS_FP4_C={fp4_c!r}f")
-            name += "_fp4_" + f"{fp4_c!r}".replace(".", "p")
         _EXT[fp4_c] = load(name=name, sources=[str(cu_path)], extra_cuda_cflags=cuda_flags, verbose=False)
     return _EXT[fp4_c]
 

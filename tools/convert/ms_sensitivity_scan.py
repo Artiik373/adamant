@@ -408,6 +408,11 @@ def main() -> None:
         h_cal = run_layer(layer, h_cal, kw_cal, bs, inplace=host)
         hk.remove()
         assert fill[0] == x.shape[0], (fill[0], x.shape)
+        torch.cuda.empty_cache()
+        if x.device != dev:
+            free_b, _ = torch.cuda.mem_get_info(dev)
+            if free_b > x.numel() * x.element_size() + (3 << 30):
+                x = x.to(dev)
         moe = layer.mlp
         with torch.no_grad():   # in chunks, as the converter: only the top-k ids stay
             idx = torch.cat([moe.gate(c.to(dev))[2] for c in x.split(65536)])
