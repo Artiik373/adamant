@@ -28,7 +28,8 @@ and is refused as cut short otherwise; the shards of a split model are still che
 ## Packs
 
 - `dense`: F32 and BF16 tensors. `gguf`: quantized non-expert tensors. `experts`: routed experts per layer.
-- `engram`: the Engram table alone (IQ4_NL rows of 144 bytes, or MXFP4 rows of 136 in the NVFP4 pack), 2 MiB aligned.
+- `engram`: the Engram table alone (IQ4_NL rows of 144 bytes, Q5_K rows of 176, or MXFP4 rows of 136 in the NVFP4 pack),
+  2 MiB aligned.
 - `vision/mmproj`: present only when built with `--mmproj`; the engine and `basalt-vision --model FILE.basalt` read it in place.
 
 ## DeepSeek NVFP4 pack

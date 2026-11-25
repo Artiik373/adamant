@@ -38,6 +38,19 @@ build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 
 | KV cache | fp16 (default), int8 (fp16 scale per 64), q4_0, k8v4 | K/V dequantized to fp32; scores and softmax fp32 |
 | GDN state and conv history | fp32 | fp32 |
 
+`q4_0` fuses K/V post-processing (norm, RoPE, the Hadamard rotation and the Q4_0 pack) and uses the same decode
+attention launches as `int8`. Attention copies packed rows directly into shared memory, then unpacks in registers
+for the FP32 dot products and value accumulation. It reads 576 bytes per selected cell across both KV heads,
+compared with 1,056 for `int8`. A streamed cache (`--kv-resident`) uses the per-token path and also writes the host copy.
+
+On an RTX 5090 at 475 W, `q4_attn_bench` at 2,048 selected cells measured 9.2 → 8.2 µs per Q4_0 attention call
+(129 → 144 GB/s effective pool bandwidth). Int8 measured 8.8 µs. Random Q4_0 attention outputs matched the GPU
+reference bit for bit, with a maximum absolute error of 1.8e-8 against the double-precision CPU reference.
+
+The fused Q4_0 prelude uses warp shuffles to rotate Q, K and V and exchanges K and V together across warps. In
+`qsa_dec_fused_parity` on the same GPU at 475 W, the fused stages averaged 4.92 → 4.15 µs for one token and
+7.33 → 6.98 µs for eight. Rotated Q/K and the packed K/V blocks matched the separate kernels bit for bit.
+
 Decode activations are int8 (q8_1) into every quantized matmul. The hc read stays fp32 (llama.cpp quantizes it to Q8_0).
 
 The n-gram table the gather reads is the IQ4_NL table the download ships, unless `--ple-gguf` names another GGUF: a separate Q8_0
@@ -95,44 +108,7 @@ further from the BF16 model. On one RTX 5090 decode is the same (355 against 357
 
 ## MS pack
 
-The MS pack (`Qwen3.8-FN-MS-60.basalt`, [format](../ms-trellis-qwen4exp.md)) codes the routed experts MS_C4 on 36 layers and
-MS_C3 on 12, the dense spine and the head MS_C6; the n-gram table and the hyper-connections are the IQ4_XS pack's. Gate:
-100 chunks, T 3, int8 KV, one RTX 3090 at 290 W, against a local BF16 base (the BF16 checkpoint layer by layer,
-`ms_flashnext_eval.py --write-base`; wikitext-2 base PPL 3.2756, gsm8k 1.4628, chat 2.9924 over 64 windows of 512 tokens
-from `eval_chat.pt`).
-
-| Pack | experts | wiki2 KLD | wiki2 top-1 | gsm8k KLD | gsm8k top-1 | chat KLD | chat top-1 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| MS v3 (60 GB plan, chat calibration) | 53.2 GiB | 0.0614 | 92.04% | 0.0323 | 96.81% | 0.0723 | 95.38% |
-| MS (60 GB plan, web calibration) | 53.2 GiB | 0.0741 | 91.13% | 0.0356 | 96.55% | | |
-| UD-IQ4_XS | 56.2 GiB | 0.0835 | 90.69% | 0.0402 | 96.39% | 0.1087 | 93.14% |
-| EXL3 3.68 bpw (experts 3.5 / 4 bits, dense 7, head 6) | 50.8 GiB | 0.0682 | 91.50% | 0.0352 | 96.50% | 0.1000 | 94.09% |
-| WV-v5 3.5 bpw | | 0.2400 | 84.15% | 0.1144 | 93.33% | | |
-
-qbench (22 conversations of exllamav3's `qbench_prompts.json`, 45,588 response tokens with thinking and tool calls;
-[quality](quality.md#the-bf16-reference)), same gate settings. The EXL3 3.68 bpw pack reads 0.0090 here against 0.0087
-published for it, so the gate matches the exllamav3 harness. Paired over conversations, EXL3 3.68 minus MS v3: dKLD
-+0.0009 [+0.0005, +0.0018] (MS v3 lower in 19 of 22); IQ4_XS minus MS v3: +0.0052 [+0.0037, +0.0072] (21 of 22).
-
-| Pack | KLD mean | median | p99 | top-1 | PPL (BF16 1.3850) |
-| --- | --- | --- | --- | --- | --- |
-| MS v3 | 0.00811 | 0.00042 | 0.0884 | 97.20% | 1.3922 |
-| EXL3 3.68 bpw | 0.00903 | 0.00048 | 0.0932 | 97.17% | 1.3957 |
-| UD-IQ4_XS | 0.01332 | 0.00077 | 0.1432 | 96.44% | 1.4036 |
-
-MS v3 (`Qwen3.8-FN-MS-60-v3.basalt`) changes only the converter's inputs and search: 2560 x 512 calibration tokens
-(on-policy Flash-Next chat with thinking 60%, agent and chat traces 20%, web 20%; `build_calib_pool.py --dspine`) instead
-of 256 web sequences, each expert's Hessian shrunk toward the layer's (`--hess-tau 256`), and Viterbi window 64 / commit
-8 (`--window 64`). Conversion: 7.5 h. Same format, plan and size as MS.
-
-The dense MS GEMV of the decode windows runs on the tensor cores (`ms_mmvq.cu`): the 1MAD codes are exact in fp16, the
-rotated input columns are staged as fp16 (each divided by its largest magnitude), the sums are fp32. Against the fp32
-GEMV before it, paired on wikitext (100 chunks): dKLD +0.0005 [-0.0006, +0.0016], same top-1 -0.26 points [-0.51, -0.02];
-decode +7 to +10% on short prompts (one RTX 3090 at 290 W). An exact variant (fp16 hi + lo pairs, two products) gave
-about half of that gain.
-
-The CPU tier's fp32 activations and the prompt path's Q8_0 experts against the fp16 / fp16-GEMM build before them, paired on
-wikitext: dKLD +0.0006 [-0.0009, +0.0021].
+The MS (1MAD trellis) pack and its measurements: [MS pack](ms-pack.md).
 
 ## Measured costs
 
@@ -178,6 +154,10 @@ expert moves. On WV-v5: KLD 0.2776 against 0.2783, PPL 2.5922 against 2.5972 (20
 The Q5_0 rows: KLD 0.0943 against 0.0948 on UD-Q3_K_XL, 0.1520 against 0.1517 on UD-Q2_K_XL, tiers auto-sized. The
 device-planned tail runs only when every layer's expert formats are in it, so on these packs the decode rounding moves as well as
 the prompt's.
+
+IQ2_S, IQ3_XXS and IQ3_S gate/up with Q5_1 down can use the device-planned tail. On the mixed IQ3_S-Q4 pack, enabling
+these pairs changes the decode path. With tiers pinned, the BF16 gate (100 chunks, T 3, INT8 KV) measured PPL 3.23857 to
+3.24341, mean KLD 0.0954673 to 0.0954654, and top-1 agreement 89.8314% to 89.8471%.
 
 ## 6-bit dense projections
 
@@ -259,6 +239,13 @@ The verify window reads all 248,320 rows of the head for every column. Two stage
 Costs: the Q6_K head adds KLD 0.0022 [0.0018, 0.0025] (1.5%) and PPL 0.25% (IQ3_S, 100 chunks, 400 W + 180 W), with no argmax change on
 25,500 rows. The Q8_0 two-stage head is 350 us per window against 439 us for the Q8_0 head (NVFP4, cold prose, 400 W + 180 W).
 Greedy output with the tiers pinned matches the exact head token for token.
+
+## Several cards
+
+`gpu-mode peer` on two cards against one card (BF16 KLD through the decode path, 100 chunks, `--kv int8`, window 3): 0.06174 against
+0.06221 (paired difference -0.0005 [-0.0013, +0.0004]), top-1 91.84% against 91.80%. A peer's prompt stages run each card's own
+cuBLAS algorithms; `--diag-main-card-bits` gives them the main card's and the stages are then bitwise
+([diagnostics](../configuration/diagnostics.md)). `gpu-mode split` against `--diag-gpu-same` is bitwise under the same flag, tokens and logits.
 
 ## GDN split across two cards
 

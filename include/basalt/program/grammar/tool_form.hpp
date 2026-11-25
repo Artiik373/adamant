@@ -1,7 +1,6 @@
 // basalt/program/grammar/tool_form.hpp - how a model writes a tool call, for the tool-call grammar.
 #pragma once
 
-#include <cstddef>
 #include <string>
 
 namespace basalt::program::grammar {
@@ -16,7 +15,6 @@ struct ToolForm {
     /// A regex in place of `trigger`, for a call whose start is told apart only by what follows a shared opening; the
     /// grammar then runs from where the match starts.
     std::string trigger_pattern;
-    size_t trigger_reach = 0;                         ///< the most bytes a trigger_pattern match spans (0: unbounded)
     /// The arguments as one JSON object of the tool's parameter schema (the param_* fields unused): fn_open NAME fn_mid
     /// ARGUMENTS fn_close, "{name}" in fn_mid standing for the name as a JSON string.
     bool json_args = false;

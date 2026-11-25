@@ -104,7 +104,8 @@ Upstream's Inkling 2 line, ported to sm_86:
 | Operation | Amperite implementation | Numerical consequence |
 |---|---|---|
 | Decode window attention | Preparation, slices and merge as three kernels (no thread-block clusters) | None: upstream's fused kernel computes the same arithmetic in the same order; `inkling2_kernels_parity` checks every window bitwise |
-| Prompt Q8_0 projections (`prefill::q8`) | Swizzled `cp.async` tiles with zero fill and `mbarrier.test_wait` replace TMA | None intended: the int8 MMA and its K order are unchanged; `inkling2_prompt_parity` passes |
+| Decode attention kernels | Upstream's split, shared-KV MMA and INT8-cache kernels as they are; E4M3 codes through `cuda_fp8.h` (software conversion below compute capability 8.9) | None: the conversion is exact; the kernels replace Amperite's own window grouping and its tensor-core switch at 4,096 keys |
+| Prompt Q8_0 projections (`prefill::q8`) | 64x64 swizzled `cp.async` tiles with zero fill and `mbarrier.test_wait` replace TMA; upstream's 128x128 TMA tile is left out | None intended: the int8 MMA and its K order are unchanged; `inkling2_prompt_parity` passes |
 | Prompt NVFP4 experts | MMQ (q8_1 activations) instead of two FP4 terms on FP4 tensor cores | Changes prompt numerics; upstream measured MMQ at 0.00252 KLD against 0.00264 for its FP4 path (20 chunks) |
 | Prompt MXFP8 experts | Each k32 block's E4M3 codes as f16 (exact) through two m16n8k16 f16 products, fp32 sums times the UE8M0 scales | Changes prompt numerics (the scales apply after each block's fp32 sum); `moe_mxfp8_test` passes against a double CPU reference |
 | DSpark window products (`window_gemm`) | E4M3/E2M1 codes decoded in integer arithmetic, `mul.bf16x2` as `fma.bf16x2` with a -0 addend | None: the same bf16 bits; `narrow_bf16_parity` checks every input against the host values |
@@ -120,6 +121,10 @@ Development checks, one RTX 3090 at its 294 W power limit, the `NVFP4-MX8` pack,
   `narrow_bf16_parity`: 0 failures.
 - Greedy decoding with drafting equals `--spec 1` on the prose and struct fixtures (200 tokens each).
 - The 15,806-token `prefill.ids` prompt reads in 4.06 s (about 3,900 tokens/s); its answer is coherent.
+
+After the Basalt 0.5.7 merge (INT8 caches, shared-KV MMA attention, peer and split modes, staging changes) none of the checks
+above has run again: the merge was built and tested on no machine yet. They, the frozen hashes in `inkling2_kernels_parity`
+and `inkling2_kv_int8_parity`, and LoopCD on the new decode path are open.
 
 Open: decode-path PPL/KLD against the BF16 reference (`basalt-bench --quality`; no Inkling 2 base is built locally), the
 `NVFP4-DQ8` pack, experts in RAM, and two cards.

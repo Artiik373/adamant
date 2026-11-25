@@ -49,7 +49,7 @@ top-level `engine` block ([models and the router](docs/configuration/models.md))
 ```json
 {
   "version": 2,
-  "models": [{ "model": "models/Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt", "gpu": "0,1", "kv": "int8" }],
+  "models": [{ "model": "models/Qwen3.8-FN-GSQ-RCO-IQ3_S.basalt", "gpu": "0,1", "gpu-mode": "peer", "kv": "int8" }],
   "engine": { "expert-cache": "auto", "prefill": "auto", "resident-experts": true },
   "server": { "port": 8080 }
 }

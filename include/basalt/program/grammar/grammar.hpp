@@ -102,10 +102,6 @@ struct Triggers {
     /// ECMAScript regexes over the output so far; the grammar starts at the first non-empty capture group, else at the
     /// match. A pattern wrapped in ^...$ is first matched against the whole output.
     std::vector<std::string> patterns;
-    /// The most bytes a match of any pattern spans (0: unbounded). With it, and no pattern wrapped in ^...$, each token
-    /// searches only where a new match can end and only that many bytes of the output are kept, so a long text before
-    /// the trigger costs the same per token as a short one.
-    size_t pattern_reach = 0;
     bool lazy() const { return !words.empty() || !tokens.empty() || !patterns.empty(); }
     /// False, with `err` set, if a pattern is not a valid regex.
     bool valid(std::string& err) const;
@@ -155,6 +151,7 @@ private:
     };
     bool feed(const std::string_view& bytes, std::vector<uint32_t>& stacks, Utf8& u) const;
     bool advance(std::vector<uint32_t>& stacks, Utf8& u, std::string_view bytes, int32_t token_id) const;
+    std::vector<uint32_t> root_stacks() const;
     bool fire(size_t from, bool by_token, int32_t token_id, std::string_view bytes);
     void walk(const Vocab& v, uint32_t node, const std::vector<uint32_t>& stacks, const Utf8& u,
               std::vector<uint8_t>& out) const;
@@ -173,7 +170,6 @@ private:
     };
     std::vector<Piece> pieces_;      ///< inactive with patterns: the tokens that made tail_
     size_t tail_keep_ = 0;
-    size_t reach_ = 0;               ///< triggers_.pattern_reach when no pattern is anchored, else 0
 };
 
 }  // namespace basalt::program::grammar

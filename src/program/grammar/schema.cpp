@@ -489,10 +489,7 @@ RequestGrammar grammar_from_request(const std::string& grammar_json, std::string
             }
         }
         gbnf = tool_call_gbnf(list.dump(), ToolGrammarOptions{}, err);
-        if (!tool_form().trigger_pattern.empty()) {
-            out.triggers.patterns = {tool_form().trigger_pattern};
-            out.triggers.pattern_reach = tool_form().trigger_reach;
-        }
+        if (!tool_form().trigger_pattern.empty()) out.triggers.patterns = {tool_form().trigger_pattern};
         else out.triggers.words = {tool_form().trigger};
     } else {
         err = "grammar: unknown kind '" + kind->s + "'";

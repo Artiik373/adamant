@@ -4,6 +4,13 @@ Releases, newest first. Entries up to the fork point are Basalt's; upstream Adam
 
 | Release | Date | Summary |
 | --- | --- | --- |
+| [0.5.7](0.5.7.md) | 2026-11-23 | Breaking: `gpu`, `gpu-mode` and `gpu-share` replace every model's own multi-GPU logic (`gpu: auto` is gone, a list of cards needs a mode); peer and split on the 27B and Inkling 2 Mini, one shared layer and a conformance check for every model. |
+| [0.5.6](0.5.6.md) | 2026-11-23 | Inkling 2 Mini on a small card or two cards (experts on the CPU, layer split) with prompts 21 to 25% faster and a second pack (MX8); parallel slots decode together on every model; Hy4-flash stray tokens fixed; `--seed` in the CLI. |
+| [0.5.5](0.5.5.md) | 2026-11-21 | Inkling 2 Mini: a looped mixture of experts on one card, with images, the DSpark drafter and up to 1M tokens of context where the card has room. |
+| [0.5.0](0.5.0.md) | 2026-11-19 | Hy4-flash: a mixture of experts with a 1M-token context (elastic fp16 or FP8 caches), images, the DFly2 drafter and a shipped expert profile; per-layer expert copies, a bounded lend and partial reclaim in the shared expert tier. |
+| [0.4.1](0.4.1.md) | 2026-11-16 | Qwen3.8-27B on two cards (prompt line, layer split), YaRN past 262,144 and K/V streaming; Flash-Next's RAM plan leaves room again on 64 GB boxes; `--parallel` prompts tokenized in the engine; DeepSeek tiers on up to four cards. |
+| [0.4.0](0.4.0.md) | 2026-11-14 | Qwen3.8-27B, the first dense model: QUASAR's NVFP4 checkpoint with an FP8 head, the DFlash 2 drafter in windows of up to 16 with exact speculative sampling, batched slots; one checkpoint transfer for every model. |
+| [0.3.3](0.3.3.md) | 2026-11-12 | Answer now, logprobs, documents and video in messages, session-affinity slots, faster Flash-Next long prompts on one card, a DeepSeek NVFP4 pack, a container image, `--no-answer-room` becomes `--answer-room 0`. |
 | [0.3.2](0.3.2.md) | 2026-11-08 | A faster clean build, `tools/package_release.py` for Linux and Windows x64 archives, an install that finds its files beside `bin/`, a RAM tier that keeps the file cache its floor, Q6_K short-row and AVX-512 exact-row kernels. |
 | [0.3.1](0.3.1.md) | 2026-11-08 | Experts on the SSD are said in the log, the console and the stats page; drafting in every slot; a shared peer-card prompt path; faster decode kernels; new packs; one RAM reserve and guard for every model (`--ram-reserve-mib`); default context 8,192. |
 | [0.3.0](0.3.0.md) | 2026-11-05 | A model adapter registry, a router that swaps between configured entries, and the config file's v2 shape. |

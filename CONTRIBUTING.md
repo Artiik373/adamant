@@ -30,6 +30,7 @@ Amperite targets large mixture-of-experts models (Hy4-flash, Qwen3.8-Flash-Next)
 3. **A quality check:**
    - Bitwise-identical output: show the greedy-identity check against the previous build. Pin the expert tiers, since changes in GPU module size move the auto-sized tiers and change rounding.
    - Changed numerics (new reduction order, precision, quantization): run the perplexity/KLD gate against the BF16 reference ([docs/precision/quality.md](docs/precision/quality.md#the-bf16-reference)) through the decode path. Report PPL, mean KLD and top-1 agreement next to the previous build's. Large changes need the full 100-chunk run, not just the 20-chunk quick gate. The `docs/precision/` page that covers the change is updated in the same change, with fresh numbers where it quotes them.
+   - The bar: a default path is lossless only when mean KLD and top-1 are the same or better than the previous build's (within the gate's noise). A change that costs quality is opt-in (a flag, as `--kv fp8` is) and its precision page states the measured cost.
 4. **Benchmark hygiene:**
    - Every performance number states the enforced GPU power limit, and A/B runs match it.
    - A/B comparisons alternate the two builds in the same session (ABBA), with the expert tiers pinned to the same placement in both. Numbers taken in different sessions drift and aren't comparable.
@@ -57,11 +58,10 @@ Amperite targets large mixture-of-experts models (Hy4-flash, Qwen3.8-Flash-Next)
 ## Other ways to help
 
 - Cannot contribute code? Add a benchmark run from your hardware to the community table (details in [community runs](docs/community.md)):
-  1. Run `basalt-bench --community --model PACK --submitter YourName`. It adds the row to `docs/community/benchmarks.json` ([building](docs/building.md)).
-  2. Review the row. After a hand edit, format and check it with `python3 tools/check_benchmarks.py --fix docs/community/benchmarks.json`.
-  3. Commit it.
-  4. Open a pull request; the `pages` workflow runs the same check.
-  5. Once merged, the row appears on the runs page.
+  1. Run `basalt-bench --community --model PACK --submitter YourName`. It writes the row to its own file under `docs/community/runs/` ([building](docs/building.md)).
+  2. Review the file. After a hand edit, format and check it with `python3 tools/check_benchmarks.py --fix docs/community`.
+  3. Commit the new or changed file.
+  4. Open a pull request; the `community` workflow runs the same check.
 - Ampere (sm_86) machines with spare GPU time help validate the port; multi-card systems also cover peer expert execution.
 - A few hours of remote access to a machine speeds up development.
 - Or sponsor the project through GitHub Sponsors (the repository's Sponsor button): it pays for tokens for agentic development and for time on different hardware to test on.

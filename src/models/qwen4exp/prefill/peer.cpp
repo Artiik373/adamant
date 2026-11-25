@@ -1,3 +1,4 @@
+#include "basalt/core/gpu_mem_info.hpp"
 #include "state.hpp"
 #include "layout.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
@@ -43,8 +44,8 @@ void Prefill::set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
     }
 }
 
-// The peer card's prompt buffers for chunks of up to `Tp` tokens in groups of `G` rows: the shared transport's
-// dimensions, in one place so that the tier's reserve and the allocation count the same bytes.
+// The peer card's prompt buffers for routed-only chunks of up to `Tp` tokens in groups of `G` rows: the shared
+// transport's dimensions, in one place so that the tier's reserve and the allocation count the same bytes.
 static PeerShare::Dims share_dims(int64_t Tp, int64_t G, const MmqPlan& mp) {
     PeerShare::Dims d;
     d.n_embd = N;
@@ -61,57 +62,45 @@ static PeerShare::Dims share_dims(int64_t Tp, int64_t G, const MmqPlan& mp) {
     d.bufs = 2;
     return d;
 }
-static bool make_peer(core::PeerExperts* peer, int64_t T_max, std::unique_ptr<PeerPrefill>& out,
-                      std::string& err) {
+
+// The longest routed-only chunk the peer takes for chunks of up to `chunk` tokens.
+static int64_t peer_tokens(int64_t chunk) { return std::min<int64_t>({chunk, kPeerSlowRows, stream_all_min() - 1}); }
+
+uint64_t Prefill::peer_bytes(int64_t chunk) {
+    if (!mmq_plan().any) return 0;
+    const int64_t Tp = peer_tokens(chunk);
+    return PeerShare::peer_bytes(share_dims(Tp, Tp, mmq_plan()));
+}
+
+bool Prefill::set_peer(core::PeerExperts* peer, std::string& err) {
+    Impl& m = *impl_;
+    if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
+    // The peer takes the rows of the routed-only chunks (below stream_all_min()) up to kPeerSlowRows tokens: the
+    // activations and result rows cross through host staging (cudaMemcpyPeerAsync) and the streamed ring stays off.
+    if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
     auto pp = std::make_unique<PeerPrefill>();
     pp->peer = peer;
-    pp->T_max = std::min<int64_t>(T_max, stream_all_min() - 1);
+    pp->T_max = peer_tokens(m.T_max);
     pp->G = pp->T_max;   // one expert never has more rows than the chunk has tokens
-    const int64_t Tp = pp->T_max;   // the longest chunk the peer takes
-    pp->cap_rows = Tp * K;
+    pp->cap_rows = pp->T_max * K;
     int prim = 0;
     cudaGetDevice(&prim);
     pp->dev = peer->device();
-    bool ok = true;
+    pp->share = std::make_unique<PeerShare>();
+    std::string e2;
+    const bool ok = pp->share->open(prim, pp->dev, share_dims(pp->T_max, pp->G, mmq_plan()), e2);
     size_t fb = 0, tb = 0;
-    if (ok) {
-        pp->share = std::make_unique<PeerShare>();
-        std::string e2;
-        ok = pp->share->open(prim, pp->dev, share_dims(Tp, pp->G, mmq_plan()), e2);
-    }
     {
         const core::OnDevice od(pp->dev);
-        cudaMemGetInfo(&fb, &tb);
+        basalt::core::gpu_mem_info(&fb, &tb);
     }
     if (!ok) {
         cudaGetLastError();
-        err = "prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib or use --no-peer-prefill)";
+        err = "prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib)";
         return false;
     }
-    basalt::log::info("basalt prefill", "peer GPU %d computes its experts' rows of each prompt chunk up to %lld tokens, "
-                         "with compact group buffers; %zu MiB left free on it", pp->dev, (long long) Tp, fb >> 20);
-    out = std::move(pp);
-    return true;
-}
-
-uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share) {
-    if (!mmq_plan().any) return 0;
-    PeerPrefill pp;
-    pp.T_max = std::min<int64_t>(chunk, streamed_share ? stream_all_min() - 1 : kPeerSlowRows);
-    pp.G = pp.T_max;
-    return PeerShare::peer_bytes(share_dims(pp.T_max, pp.G, mmq_plan()));
-}
-
-bool Prefill::set_peer(core::PeerExperts* peer, bool streamed_share, std::string& err) {
-    Impl& m = *impl_;
-    if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
-    // The peer takes the rows of the routed-only chunks (below stream_all_min()): the activations and
-    // result rows cross through the share's host staging and the streamed ring stays off.
-    if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
-    std::unique_ptr<PeerPrefill> pp;
-    const int64_t t_routed = streamed_share ? m.T_max : std::min<int64_t>(m.T_max, kPeerSlowRows);
-    bool ok = make_peer(peer, t_routed, pp, err);
-    if (!ok) return false;
+    basalt::log::info("basalt prefill", "peer GPU %d computes its experts' rows of each prompt chunk up to %lld tokens, with "
+                      "compact group buffers; %zu MiB left free on it", pp->dev, (long long) pp->T_max, fb >> 20);
     m.pp = std::move(pp);
     return true;
 }

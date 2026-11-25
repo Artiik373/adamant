@@ -50,16 +50,19 @@ def _unmark(text: str) -> str:
 _H, _THINK, _TEXT, _TERR, _TTXT, _J, _E = (_PMARK[t] for t in (HEADER, THINK, TEXT, TOOL_ERROR, TOOL_TEXT, TOOL_JSON, END))
 MAX_EFFORT = 0.99
 _NAME = re.compile(r'\s*\{\s*"name"\s*:\s*("(?:[^"\\]|\\.)*")')   # a call object's own name, first key
+_ARGS = re.compile(r'"args"\s*:')
 
 
 class _Blocks:
     """The block structure of the model's text. `state` is "between" (a block may open), "reasoning", "content",
-    "name" (a tool call's name) or "call" (its JSON); text is held back while it may still be the start of a marker."""
+    "name" (a tool call's name), "call" (its JSON) or "literal_call" (the JSON of a call the request cannot make, passed
+    on as text); text is held back while it may still be the start of a marker."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = True):
         self.state = "between"
         self.buf = ""
         self.stream_tools = stream_tools
+        self.calls = bool(tools)        # no tools offered (none in the request, or tool_choice "none"): no calls
         self.call: ToolCall | None = None
         self.head = ""                  # the call's `{"name":...,"args":` prefix, once read
         self.raw = ""                   # the call's JSON so far
@@ -125,7 +128,7 @@ class _Blocks:
         if rest[:1] in _PTEXT:          # another block's marker: not a call
             self.buf, self.state = rest, "content"
             return True
-        self.buf, self.state = rest, "name"
+        self.buf, self.state = rest, "name" if self.calls else "content"
         return True
 
     # ------------------------------------------------------------------ a tool call
@@ -143,6 +146,10 @@ class _Blocks:
         return True
 
     def _open_call(self, out: list, name: str) -> None:
+        if not self.calls:              # the request offers no tools: the call is text, its marker and JSON as written
+            out.append(Event("content", TOOL_JSON))
+            self.state = "literal_call"
+            return
         self.call = ToolCall(name=name, arguments={})
         self.state, self.head, self.raw, self.streamed, self.started = "call", "", "", 0, False
         self.json, self.fed = frontend.JsonPrefix(), 0
@@ -166,10 +173,10 @@ class _Blocks:
     def _args_text(self) -> str | None:
         """The arguments' JSON text read so far, once the `{"name":...,"args":` prefix has passed."""
         if not self.head:
-            i = self.raw.find('"args":')
-            if i < 0:
+            m = _ARGS.search(self.raw)
+            if not m:
                 return None
-            self.head = self.raw[:i + len('"args":')]
+            self.head = self.raw[:m.end()]
         return self.raw[len(self.head):]
 
     def _stream_args(self, out: list) -> None:
@@ -188,8 +195,14 @@ class _Blocks:
         end = self.buf.find(_E)
         keep = 0 if end >= 0 else frontend.hold_back(self.buf, (_E,))
         take = self.buf[:end] if end >= 0 else self.buf[:len(self.buf) - keep]
-        self.raw += take
         self.buf = self.buf[end + len(_E):] if end >= 0 else self.buf[len(self.buf) - keep:]
+        if self.state == "literal_call":
+            if take:
+                out.append(Event("content", take))
+            if end >= 0:
+                self.state = "between"
+            return end >= 0
+        self.raw += take
         self._start(out)
         self._stream_args(out)
         if end < 0:
@@ -213,10 +226,12 @@ class _Blocks:
             self.call = None
             return
         self.call.name = name
-        if self.stream_tools and not self.started:      # the name came with the end: the call is told whole
-            self.started = True
-            out.append(Event("tool_start", call=self.call))
-            out.append(Event("tool_args", json.dumps(args, ensure_ascii=False, separators=(",", ":")), call=self.call))
+        if self.stream_tools:
+            if not self.started:      # the name came with the end: the call is told whole
+                self.started = True
+                out.append(Event("tool_start", call=self.call))
+            if self.streamed == 0:    # zero-arg call (no "args" key) or args never reached a safe prefix before end
+                out.append(Event("tool_args", json.dumps(args, ensure_ascii=False, separators=(",", ":")), call=self.call))
         out.append(Event("tool_call", call=ToolCall(name=name, arguments=args, id=self.call.id)))
         self.call = None
 
@@ -473,7 +488,8 @@ def _text_back(events: list[Event]) -> list[Event]:
 
 class Inkling2Parser(_Blocks):
     """The block parser, and the XML-written calls of the answer text read as calls (see _XmlCalls) when the request
-    offers tools."""
+    offers tools. A request that offers none (tool_choice "none" offers none) gets no calls in either notation: what
+    the model writes as one is text."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = True):
         super().__init__(thinking=thinking, tools=tools, stream_tools=stream_tools)

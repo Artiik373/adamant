@@ -14,6 +14,7 @@
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/kernels/cpu/swiglu.hpp"
 #include "basalt/log.hpp"
+#include "basalt/platform/compiler.hpp"
 
 #include "basalt/ggml/ggml.h"
 
@@ -474,6 +475,10 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
         exl3_pack_act(x, (int) f.n_embd, (uint16_t*) dst);
         return;
     }
+    if constexpr (platform::kArm64) {   // every activation format through the NEON build's quantizer
+        traits(f.gu_act)->from_float(x, dst, f.n_embd);
+        return;
+    }
     static const bool avx512 = cpu_avx512_ok();
     if (f.gu_act == GGML_TYPE_Q8_K) {   // ggml's reference quantizer is scalar
         if (avx512) {
@@ -600,8 +605,13 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         mx8_down_rows(f, blob, hq, nt, out, r0, r1);
         return;
     }
-    const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
     const int n = (int) f.n_ff;
+    // Larger Q5_1 groups amortize the shared unpack; small groups keep the per-token dot.
+    if (f.d_type == GGML_TYPE_Q5_1 && nt >= 3 && cpu_avx2_ok()) {
+        kq256_rows(f.d_type, blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
+        return;
+    }
+    const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
     float sd = 1.f;
     if (f.tail) std::memcpy(&sd, blob + f.bytes - f.tail + 8, 4);
     static const bool avx512 = cpu_avx512_ok();

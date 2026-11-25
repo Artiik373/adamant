@@ -24,10 +24,10 @@
 namespace basalt::prefill {
 using namespace detail;
 
-// multi-GPU: the peer GPU's share of a prompt chunk's experts, on the shared transport (prefill::PeerShare).  Per MoE
-// layer the peer computes the rows routed to the experts it holds, with the products the primary would run on them (MMQ
-// from its own slots gathered into group buffers), and the rows land in the primary's Dm - the rows are laid out
-// local-first, so the peer's are one contiguous block at the end.
+// multi-GPU: the peer GPU's share of a routed-only prompt chunk's experts, on the shared transport (prefill::PeerShare).
+// Per MoE layer the peer computes the rows routed to the experts it holds, with the products the primary would run on
+// them (MMQ from its own slots gathered into group buffers), and the rows land in the primary's Dm - the rows are laid
+// out local-first, so the peer's are one contiguous block at the end.
 struct PeerPrefill {
     core::PeerExperts* peer = nullptr;
     int dev = -1;
@@ -35,13 +35,6 @@ struct PeerPrefill {
     // a group = up to MMQ_GROUP experts and at most G rows, one launch
     int64_t G = 0;
     std::unique_ptr<PeerShare> share;
-    std::vector<void*> owned;
-    ~PeerPrefill() {
-        share.reset();
-        if (dev < 0) return;
-        const core::OnDevice od(dev);
-        for (void* p : owned) cudaFree(p);
-    }
 };
 
 // A peer group buffer: gate/up of up to MMQ_GROUP experts and a zeroed tail, then from this offset their down matrices,

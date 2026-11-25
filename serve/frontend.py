@@ -505,6 +505,8 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
               **effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort"))}
     if reasoning.get("enabled") is False:                 # the generic off switch; true is the route's default
         kwargs["enable_thinking"] = False
+    if req.get("enable_thinking") is False:               # the top-level switch (vLLM, DashScope); true is the default
+        kwargs["enable_thinking"] = False
     if "reasoning_effort" in template_kw:
         kwargs.update(effort_kwargs(template_kw["reasoning_effort"]))
     if "enable_thinking" in template_kw and not template_kw["enable_thinking"]:
@@ -1322,7 +1324,13 @@ class OutputParser(CodeTracker):
                 body = self.buf[:i]
                 self.buf = self.buf[i + len(CALL_END):]
                 name = self._resolve(body.strip()[len("<function="):].split(">", 1)[0])
-                call = parse_tool_call(body, self.schemas.get(name))
+                try:
+                    call = parse_tool_call(body, self.schemas.get(name))
+                except ValueError:
+                    out.append(Event("content", CALL_START + body + CALL_END))
+                    self._reset_scan()
+                    self.state, self.lead = "content", True
+                    continue
                 call.name = name     # parse_tool_call reads the name from the text: the call carries the declared tool
                 if self.scall is not None:
                     call.id = self.scall.id
@@ -1336,7 +1344,12 @@ class OutputParser(CodeTracker):
         out = self.feed("", final=True)
         if self.state == "call" and self.stream_tools and self.scall is not None:
             if self.ss == "done":               # only </tool_call> is missing
-                out.append(Event("tool_call", call=self.scall))
+                try:
+                    call = parse_tool_call(self.buf, self.schemas.get(self.scall.name))
+                    call.id = self.scall.id
+                except ValueError:
+                    call = self.scall
+                out.append(Event("tool_call", call=call))
             self.buf = ""
             self._reset_scan()
             return out

@@ -1,7 +1,9 @@
-// tests/program/gpu_select_test.cpp - the gpu setting over fake card tables: parsing, the card choice, the roles.
+// tests/program/gpu_select_test.cpp - the gpu, gpu-mode and gpu-share settings over fake card tables: parsing, every error
+// text, the card choice, the model's modes, the roles.
 #include "basalt/program/gpu_select.hpp"
 #include "basalt/cuda_target.hpp"
 
+#include "basalt/core/cuda_cc.hpp"
 #include "basalt/platform/process.hpp"
 
 #include <cstdio>
@@ -11,6 +13,11 @@
 
 using namespace basalt::program;
 
+// the capability this build is for: a "Blackwell" card of the tests is one of it
+static const int kOursMajor = basalt::core::kCudaCCMajor;
+static const int kOursMinor = basalt::core::kCudaCCMinor;
+static const std::string kOurs = basalt::core::cuda_cc_name();
+
 static int g_fail = 0;
 #define CHECK(c)                                                              \
     do {                                                                      \
@@ -19,7 +26,8 @@ static int g_fail = 0;
 #define CHECK_STR(got, want)                                                                         \
     do {                                                                                             \
         const std::string g_ = (got);                                                                \
-        if (g_ != (want)) { std::printf("FAIL %s:%d: got \"%s\" want \"%s\"\n", __FILE__, __LINE__, g_.c_str(), want); ++g_fail; } \
+        const std::string w_ = (want);                                                               \
+        if (g_ != w_) { std::printf("FAIL %s:%d: got \"%s\" want \"%s\"\n", __FILE__, __LINE__, g_.c_str(), w_.c_str()); ++g_fail; } \
     } while (0)
 
 static constexpr uint64_t G = 1ull << 30;
@@ -36,15 +44,17 @@ static GpuCard card(int smi, const char* name, int major, int minor, double gbps
     return c;
 }
 
-static GpuChoice pick(const std::string& text, const std::vector<GpuCard>& v, bool known = true) {
+static GpuChoice pick(const std::string& text, const std::vector<GpuCard>& v, const std::string& mode = "",
+                      const std::string& share = "", bool known = true) {
     GpuSpec s;
+    GpuMode m = GpuMode::One;
     std::string err;
-    if (!parse_gpu_spec(text, s, err)) {
-        GpuChoice c;
+    GpuChoice c;
+    if (!parse_gpu_spec(text, s, err) || !parse_gpu_mode(mode, m, err)) {
         c.error = err;
         return c;
     }
-    return choose_gpus(s, v, known);
+    return choose_gpus(s, m, share, v, known);
 }
 
 static std::string cards(const GpuChoice& c) {
@@ -53,113 +63,191 @@ static std::string cards(const GpuChoice& c) {
     return s;
 }
 
-static std::string roles(const std::vector<GpuCard>& v, const GpuChoice& c, int tiers) {
-    RoleInputs in;
-    for (int i : c.cards) in.cards.push_back(v[(size_t) i]);
-    in.max_expert_tiers = tiers;
-    std::string s;
-    for (GpuRole r : choose_roles(in)) s += (s.empty() ? "" : ",") + std::string(gpu_role_name(r));
-    return s;
-}
-
 int main() {
-    // Parsing.
+    // Parsing: a number, a list, all; any other word (the removed "auto" too) gets the one error.
     {
+        const char* want = "gpu \"%s\": expected a card number like 0, a list like 0,1 (the first is the main card), or all; see docs/configuration/gpus.md";
         GpuSpec s;
         std::string err;
         CHECK(parse_gpu_spec("", s, err) && s.kind == GpuSpec::Kind::Unset);
-        CHECK(parse_gpu_spec("auto", s, err) && s.kind == GpuSpec::Kind::Auto);
-        CHECK(parse_gpu_spec(" 1 , 0 ", s, err) && s.kind == GpuSpec::Kind::List && s.list.size() == 2 && s.list[0] == 1);
+        CHECK(parse_gpu_spec("all", s, err) && s.kind == GpuSpec::Kind::All && s.text == "all");
+        CHECK(parse_gpu_spec("0", s, err) && s.kind == GpuSpec::Kind::List && s.list.size() == 1 && s.text == "0");
+        CHECK(parse_gpu_spec(" 1 , 0 ", s, err) && s.kind == GpuSpec::Kind::List && s.list.size() == 2 && s.list[0] == 1 && s.text == "1,0");
+        CHECK(parse_gpu_spec("1,0,2", s, err) && s.list.size() == 3);
         CHECK(!parse_gpu_spec("0,0", s, err));
         CHECK_STR(err, "gpu 0,0: GPU 0 is listed twice");
-        CHECK(!parse_gpu_spec("x", s, err));
-        CHECK(!parse_gpu_spec("0,", s, err));
-        CHECK(!parse_gpu_spec("-1", s, err));
+        for (const char* bad : {"auto", "x", "0,", "-1", "0,all", "ALL"}) {
+            CHECK(!parse_gpu_spec(bad, s, err));
+            char b[160];
+            std::snprintf(b, sizeof b, want, bad);
+            CHECK_STR(err, b);
+        }
+        GpuMode m = GpuMode::Tensor;
+        CHECK(parse_gpu_mode("", m, err) && m == GpuMode::One);
+        CHECK(parse_gpu_mode("peer", m, err) && m == GpuMode::Peer);
+        CHECK(parse_gpu_mode(" split ", m, err) && m == GpuMode::Split);
+        CHECK(parse_gpu_mode("tensor", m, err) && m == GpuMode::Tensor);
+        CHECK(!parse_gpu_mode("auto", m, err));
+        CHECK_STR(err, "gpu-mode \"auto\": expected peer, split or tensor; see docs/configuration/gpus.md");
+        CHECK(!parse_gpu_mode("Peer", m, err));
     }
     // Exact capability matching is shared with the runtime.
     {
-        static_assert(!basalt::cuda_target::supports(8, 9));
-        static_assert(basalt::cuda_target::supports(8, 6));
-        static_assert(!basalt::cuda_target::supports(8, 0));
-        static_assert(!basalt::cuda_target::supports(9, 0));
-        static_assert(!basalt::cuda_target::supports(12, 0));
-        CHECK(gpu_main_supported(card(0, "unknown", 0, 0, 0, 0)));
-        CHECK(!gpu_main_supported(card(0, "invalid", 0, 9, 0, 0)));
-        for (const auto& cc : {std::pair{8, 0}, std::pair{8, 9}, std::pair{9, 0},
-                               std::pair{12, 0}, std::pair{13, 0}}) {
-            const std::vector<GpuCard> v = {card(0, "unsupported", cc.first, cc.second, 1, 1)};
-            CHECK(!pick("", v).error.empty());
-            CHECK(!pick("0", v).error.empty());
-            CHECK_STR(pick("auto", v).error, "gpu auto: no sm_86 GPU visible");
-        }
-        const std::vector<GpuCard> ampere = {card(0, "ampere", 8, 6, 448, 8)};
-        CHECK(pick("auto", ampere).error.empty());
-        CHECK(pick("0", ampere).error.empty());
-    }
-    // Explicit order, default warnings, role assignment and serialization.
-    {
-        const std::vector<GpuCard> v = {card(0, "fast", 8, 6, 1008, 24), card(1, "small", 8, 6, 504, 12)};
+        const std::vector<GpuCard> v = {card(0, "RTX 5090", kOursMajor, kOursMinor, 1792, 32), card(1, "RTX 5060 Ti", kOursMajor, kOursMinor, 448, 16)};
         GpuChoice c = pick("", v);
         CHECK_STR(cards(c), "0");
-        CHECK_STR(c.warning, "GPU 1 (small) unused; use gpu 0,1 or gpu auto");
-        c = pick("0,1", v);
+        CHECK(c.mode == GpuMode::One && c.shares.empty() && c.error.empty());
+        CHECK_STR(c.warning, "GPU 1 (RTX 5060 Ti) unused; to use more cards set gpu (0,1 or all) and gpu-mode");
+        c = pick("0,1", v, "peer");
         CHECK_STR(cards(c), "0,1");
-        CHECK(c.warning.empty() && c.error.empty());
-        CHECK_STR(roles(v, c, 1), "main,expert tier");
-        CHECK_STR(cards(pick("1,0", v)), "1,0");
+        CHECK(c.warning.empty() && c.error.empty() && c.mode == GpuMode::Peer && c.shares.empty());
+        CHECK_STR(cards(pick("1,0", v, "split")), "1,0");
+        CHECK_STR(cards(pick("0,1", v, "tensor")), "0,1");
         CHECK_STR(cards(pick("1", v)), "1");
         CHECK(pick("1", v).warning.empty());
-        CHECK_STR(cards(pick("auto", v)), "0,1");
+        c = pick("all", v, "peer");
+        CHECK_STR(cards(c), "0,1");
+        CHECK(c.error.empty() && c.warning.empty());
         CHECK_STR(pick("2", v).error, "gpu 2: 2 GPUs are visible (0-1)");
+        CHECK_STR(pick("0,2", v, "peer").error, "gpu 2: 2 GPUs are visible (0-1)");
         CHECK_STR(pick("0,0", v).error, "gpu 0,0: GPU 0 is listed twice");
-        CHECK_STR(gpu_plan_json(v, pick("1,0", v)),
-                  "{\"devices\":\"1,0\",\"cards\":[{\"visible\":1,\"token\":\"1\",\"smi\":1,\"name\":\"small\"},"
-                  "{\"visible\":0,\"token\":\"0\",\"smi\":0,\"name\":\"fast\"}],\"notes\":[],\"warning\":\"\",\"error\":\"\"}");
+        // shares: normalized, in the order of gpu
+        c = pick("0,1", v, "peer", "3,1");
+        CHECK(c.error.empty() && c.shares.size() == 2 && c.shares[0] == 0.75 && c.shares[1] == 0.25);
+        c = pick("1,0", v, "split", " 1 , 1 ");
+        CHECK(c.error.empty() && c.shares.size() == 2 && c.shares[0] == 0.5);
+        c = pick("all", v, "tensor", "2.5,7.5");
+        CHECK(c.error.empty() && c.shares.size() == 2 && c.shares[0] == 0.25);
+        CHECK_STR(gpu_plan_json(v, pick("1,0", v, "peer", "3,1")),
+                  "{\"devices\":\"1,0\",\"cards\":[{\"visible\":1,\"token\":\"1\",\"smi\":1,\"name\":\"RTX 5060 Ti\"},"
+                  "{\"visible\":0,\"token\":\"0\",\"smi\":0,\"name\":\"RTX 5090\"}],\"mode\":\"peer\",\"shares\":[0.75,0.25],"
+                  "\"notes\":[],\"warning\":\"\",\"error\":\"\"}");
+        CHECK_STR(gpu_plan_json(v, pick("0,1", v, "split")),
+                  "{\"devices\":\"0,1\",\"cards\":[{\"visible\":0,\"token\":\"0\",\"smi\":0,\"name\":\"RTX 5090\"},"
+                  "{\"visible\":1,\"token\":\"1\",\"smi\":1,\"name\":\"RTX 5060 Ti\"}],\"mode\":\"split\",\"shares\":[],"
+                  "\"notes\":[],\"warning\":\"\",\"error\":\"\"}");
+        CHECK_STR(gpu_plan_json(v, pick("0,1", v, "tensor", "1,1")),
+                  "{\"devices\":\"0,1\",\"cards\":[{\"visible\":0,\"token\":\"0\",\"smi\":0,\"name\":\"RTX 5090\"},"
+                  "{\"visible\":1,\"token\":\"1\",\"smi\":1,\"name\":\"RTX 5060 Ti\"}],\"mode\":\"tensor\",\"shares\":[0.5,0.5],"
+                  "\"notes\":[],\"warning\":\"\",\"error\":\"\"}");
+        CHECK_STR(gpu_plan_json(v, pick("0", v)),
+                  "{\"devices\":\"0\",\"cards\":[{\"visible\":0,\"token\":\"0\",\"smi\":0,\"name\":\"RTX 5090\"}],\"mode\":\"\","
+                  "\"shares\":[],\"notes\":[],\"warning\":\"\",\"error\":\"\"}");
         CHECK_STR(gpu_plan_json({}, GpuChoice{}, "qwen4exp", "", 0, 8, 8192, "Qwen3.8-Flash-Next", "--route-tail-skip"),
                   "{\"arch\":\"qwen4exp\",\"model\":\"Qwen3.8-Flash-Next\",\"community_kv\":\"\",\"quality_flags\":\"\",\"quality_window\":\"0\","
-                  "\"lossy\":\"--route-tail-skip\",\"spec\":8,\"max_context\":8192,\"devices\":\"\",\"cards\":[],\"notes\":[],"
-                  "\"warning\":\"\",\"error\":\"\"}");
+                  "\"lossy\":\"--route-tail-skip\",\"spec\":8,\"max_context\":8192,\"devices\":\"\",\"cards\":[],\"mode\":\"\",\"shares\":[],"
+                  "\"notes\":[],\"warning\":\"\",\"error\":\"\"}");
+        // every error text of the setting rules
+        CHECK_STR(pick("0,1", v).error, "gpu 0,1 names 2 cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md");
+        CHECK_STR(pick("1,0", v).error, "gpu 1,0 names 2 cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md");
+        CHECK_STR(pick("all", v).error, "gpu all names 2 cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md");
+        CHECK_STR(pick("0,1", v, "auto").error, "gpu-mode \"auto\": expected peer, split or tensor; see docs/configuration/gpus.md");
+        CHECK_STR(pick("0", v, "peer").error, "gpu-mode peer: gpu names one card (gpu \"0\"); a mode needs two or more");
+        CHECK_STR(pick("", v, "split").error, "gpu-mode split: gpu names one card (gpu \"0\"); a mode needs two or more");
+        CHECK_STR(pick("1", v, "tensor").error, "gpu-mode tensor: gpu names one card (gpu \"1\"); a mode needs two or more");
+        CHECK_STR(pick("0", v, "peer", "1").error, "gpu-mode peer: gpu names one card (gpu \"0\"); a mode needs two or more");
+        CHECK_STR(pick("0", v, "", "1").error, "gpu-share: gpu names one card (gpu \"0\"); shares need two or more");
+        CHECK_STR(pick("", v, "", "3,1").error, "gpu-share: gpu names one card (gpu \"0\"); shares need two or more");
+        CHECK_STR(pick("0,1", v, "peer", "3").error, "gpu-share \"3\": expected one positive number per card of gpu (2 cards), like 3,1");
+        CHECK_STR(pick("0,1", v, "peer", "3,1,1").error, "gpu-share \"3,1,1\": expected one positive number per card of gpu (2 cards), like 3,1");
+        for (const char* bad : {"0,1", "-1,2", "a,b", "3,", ",1", "nan,1", "inf,1", "1 2"}) {
+            char b[160];
+            std::snprintf(b, sizeof b, "gpu-share \"%s\": expected one positive number per card of gpu (2 cards), like 3,1", bad);
+            CHECK_STR(pick("0,1", v, "split", bad).error, b);
+        }
+        CHECK_STR(pick("all", v, "peer", "1,1,1").error, "gpu-share \"1,1,1\": expected one positive number per card of gpu (2 cards), like 3,1");
+        CHECK(pick("0,1", v, "peer", "3,1").cards.size() == 2);
+        CHECK(pick("0,1", v, "peer", "3,1").error.empty());
+        CHECK(pick("0,2", v, "peer", "3").cards.empty());   // the card number is checked first
     }
-    // Bandwidth precedes memory size; ties keep the lowest visible number.
+    // one visible card: all names one card
     {
-        const std::vector<GpuCard> v = {card(0, "small", 8, 6, 504, 12), card(1, "fast", 8, 6, 1008, 24)};
-        CHECK_STR(cards(pick("auto", v)), "1,0");
+        const std::vector<GpuCard> v = {card(0, "RTX 5090", kOursMajor, kOursMinor, 1792, 32)};
+        CHECK_STR(cards(pick("all", v)), "0");
+        CHECK_STR(pick("all", v, "peer").error, "gpu-mode peer: gpu names one card (gpu \"all\"); a mode needs two or more");
+        CHECK_STR(pick("all", v, "", "1,1").error, "gpu-share: gpu names one card (gpu \"all\"); shares need two or more");
+        CHECK(pick("", v).warning.empty());
+        const std::vector<GpuCard> none;
+        CHECK_STR(pick("all", none).error, "gpu all: no GPU is visible");
+        CHECK_STR(pick("all", none, "", "", false).error, "gpu all: GPUs not listable (no NVML)");
+    }
+    // The model's side: the mode it runs and the cards it takes.
+    {
+        const std::vector<GpuCard> v = {card(0, "RTX 5090", kOursMajor, kOursMinor, 1792, 32), card(1, "RTX 5060 Ti", kOursMajor, kOursMinor, 448, 16),
+                                        card(2, "RTX 5060 Ti", kOursMajor, kOursMinor, 448, 16), card(3, "RTX 5060 Ti", kOursMajor, kOursMinor, 448, 16),
+                                        card(4, "RTX 5060 Ti", kOursMajor, kOursMinor, 448, 16)};
+        const GpuModes hy4{4, 0, 0}, dense{2, 2, 0}, flash{4, 8, 0};
+        CHECK_STR(check_gpu_modes(pick("0,1", v, "peer"), "Hy4-flash", hy4), "");
+        CHECK_STR(check_gpu_modes(pick("0,1,2,3", v, "peer"), "Hy4-flash", hy4), "");
+        CHECK_STR(check_gpu_modes(pick("0", v), "Hy4-flash", hy4), "");
+        CHECK_STR(check_gpu_modes(pick("0,1", v, "split"), "Hy4-flash", hy4), "gpu-mode split: Hy4-flash does not run it; it runs peer");
+        CHECK_STR(check_gpu_modes(pick("0,1", v, "tensor"), "Qwen3.8-27B", dense),
+                  "gpu-mode tensor: Qwen3.8-27B does not run it (not built); it runs peer or split");
+        CHECK_STR(check_gpu_modes(pick("0,1", v, "tensor"), "Hy4-flash", hy4), "gpu-mode tensor: Hy4-flash does not run it (not built); it runs peer");
+        CHECK_STR(check_gpu_modes(pick("0,1", v, "peer"), "Inkling-2-Mini", GpuModes{0, 2, 0}), "gpu-mode peer: Inkling-2-Mini does not run it; it runs split");
+        CHECK_STR(check_gpu_modes(pick("0,1,2,3,4", v, "peer"), "Hy4-flash", hy4),
+                  "gpu-mode peer: Hy4-flash takes at most 4 cards (the main card and 3 peers); gpu names 5");
+        CHECK_STR(check_gpu_modes(pick("all", v, "peer"), "Hy4-flash", hy4),
+                  "gpu-mode peer: Hy4-flash takes at most 4 cards (the main card and 3 peers); gpu names 5");
+        CHECK_STR(check_gpu_modes(pick("0,1,2", v, "peer"), "Qwen3.8-27B", dense),
+                  "gpu-mode peer: Qwen3.8-27B takes at most 2 cards (the main card and 1 peer); gpu names 3");
+        CHECK_STR(check_gpu_modes(pick("0,1,2", v, "split"), "Qwen3.8-27B", dense), "gpu-mode split: Qwen3.8-27B takes at most 2 cards; gpu names 3");
+        CHECK_STR(check_gpu_modes(pick("0,1,2,3,4", v, "split"), "Qwen3.8-Flash-Next", flash), "");
+        CHECK_STR(check_gpu_modes(pick("0,1,2,3,4", v, "peer"), "Qwen3.8-Flash-Next", flash),
+                  "gpu-mode peer: Qwen3.8-Flash-Next takes at most 4 cards (the main card and 3 peers); gpu names 5");
+    }
+    // The same cards with the slower one first.
+    {
+        const std::vector<GpuCard> v = {card(0, "RTX 5060 Ti", kOursMajor, kOursMinor, 448, 16), card(1, "RTX 5090", kOursMajor, kOursMinor, 1792, 32)};
+        CHECK_STR(cards(pick("all", v, "split")), "0,1");   // the order is the user's: GPU 0 is main
+        CHECK_STR(cards(pick("1,0", v, "split")), "1,0");
         CHECK_STR(cards(pick("", v)), "0");
-        const std::vector<GpuCard> w = {card(0, "small", 8, 6, 504, 12), card(1, "large", 8, 6, 504, 24)};
-        CHECK_STR(cards(pick("auto", w)), "1,0");
-        const std::vector<GpuCard> eq = {card(0, "equal", 8, 6, 1008, 24), card(1, "equal", 8, 6, 1008, 24)};
-        CHECK_STR(cards(pick("auto", eq)), "0,1");
-        CHECK(pick("auto", eq).notes.empty());
-        CHECK_STR(roles(eq, pick("auto", eq), 1), "main,expert tier");
     }
-    // Automatic selection excludes unsupported devices, including newer ones.
+    // Four mixed cards, one of them not this build's: all takes them all and refuses the one that cannot run.
     {
-        const std::vector<GpuCard> v = {card(0, "middle", 8, 6, 672, 16), card(1, "other", 12, 0, 1792, 32),
-                                       card(2, "fast", 8, 6, 1008, 24), card(3, "small", 8, 6, 504, 12)};
-        GpuChoice c = pick("auto", v);
-        CHECK_STR(cards(c), "2,0,3");
-        CHECK(c.notes.size() == 1);
-        if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 1 (other) skipped, not sm_86");
-        CHECK_STR(roles(v, c, 1), "main,expert tier,idle");
-        CHECK_STR(roles(v, c, 3), "main,expert tier,expert tier");
-        c = pick("", v);
+        const std::vector<GpuCard> v = {card(0, "RTX 3080", kOursMajor, kOursMinor, 760, 10), card(1, "RTX 5090", 12, 0, 1792, 32),
+                                        card(2, "RTX 3090", kOursMajor, kOursMinor, 936, 24), card(3, "RTX 3060", kOursMajor, kOursMinor, 360, 12)};
+        CHECK_STR(pick("all", v, "peer").error, "gpu-mode peer: GPU 1 (RTX 5090) is sm_120; every card must be " + kOurs);
+        CHECK_STR(pick("0,2,3", v, "peer").error, "");
+        CHECK_STR(cards(pick("3,2,0", v, "split")), "3,2,0");
+        CHECK_STR(pick("0,1", v, "split").error, "gpu-mode split: GPU 1 (RTX 5090) is sm_120; every card must be " + kOurs);
+        CHECK_STR(pick("0,1", v, "tensor").error, "gpu-mode tensor: GPU 1 (RTX 5090) is sm_120; every card must be " + kOurs);
+        GpuChoice c = pick("", v);
         CHECK_STR(cards(c), "0");
-        CHECK_STR(c.warning, "GPU 2 (fast), GPU 3 (small) unused; use gpu 0,2,3 or gpu auto");
-        CHECK_STR(pick("1", v).error, "gpu: GPU 1 (other) is sm_120, not sm_86");
-        CHECK_STR(cards(pick("3,2,0", v)), "3,2,0");
-        const std::vector<GpuCard> first = {v[1], v[2]};
-        CHECK(!pick("", first).error.empty());
-        CHECK_STR(cards(pick("auto", first)), "1");
-        CHECK(pick("auto", first).notes.size() == 1);
+        CHECK_STR(c.warning, "GPU 2 (RTX 3090), GPU 3 (RTX 3060) unused; to use more cards set gpu (0,1 or all) and gpu-mode");
+        CHECK_STR(pick("1", v).error, "gpu 1: GPU 1 (RTX 5090) is sm_120; the main card must be " + kOurs);
+        CHECK_STR(pick("1,0", v, "peer").error, "gpu 1,0: GPU 1 (RTX 5090) is sm_120; the main card must be " + kOurs);
     }
-    // No card list (no management library, no CUDA_VISIBLE_DEVICES): numbers pass, auto cannot run.
+    // An Ada (sm_89) card: no role at all
+    {
+        const std::vector<GpuCard> v = {card(0, "RTX 3090", kOursMajor, kOursMinor, 936, 24), card(1, "RTX 4060 Ti", 8, 9, 288, 16)};
+        CHECK_STR(pick("1,0", v, "peer").error, "gpu 1,0: GPU 1 (RTX 4060 Ti) is sm_89; the main card must be " + kOurs);
+        CHECK_STR(pick("0,1", v, "peer").error, "gpu-mode peer: GPU 1 (RTX 4060 Ti) is sm_89; every card must be " + kOurs);
+        CHECK_STR(pick("all", v, "split").error, "gpu-mode split: GPU 1 (RTX 4060 Ti) is sm_89; every card must be " + kOurs);
+    }
+    // A laptop's own card beside a desktop card in an enclosure: the order is the user's, and unset is GPU 0 alone.
+    {
+        const std::vector<GpuCard> v = {card(0, "RTX 5080 Laptop GPU", kOursMajor, kOursMinor, 896, 16), card(1, "RTX 5090", kOursMajor, kOursMinor, 1792, 32)};
+        CHECK_STR(cards(pick("1,0", v, "peer")), "1,0");
+        CHECK_STR(cards(pick("", v)), "0");
+        CHECK(!pick("", v).warning.empty());
+    }
+    // A first card Basalt cannot run: unset is an error.
+    {
+        const std::vector<GpuCard> v = {card(0, "RTX 4090", 8, 9, 1008, 24), card(1, "RTX 5090", kOursMajor, kOursMinor, 1792, 32)};
+        CHECK_STR(pick("", v).error, "gpu 0: GPU 0 (RTX 4090) is sm_89; the main card must be " + kOurs);
+        CHECK_STR(pick("all", v, "peer").error, "gpu all: GPU 0 (RTX 4090) is sm_89; the main card must be " + kOurs);
+        CHECK_STR(cards(pick("1", v)), "1");
+    }
+    // No card list (no management library, no CUDA_VISIBLE_DEVICES): numbers pass, all cannot run.
     {
         const std::vector<GpuCard> none;
-        CHECK_STR(cards(pick("", none, false)), "0");
-        CHECK(pick("", none, false).warning.empty());
-        CHECK_STR(cards(pick("3,1", none, false)), "3,1");
-        CHECK(!pick("auto", none, false).error.empty());
-        CHECK_STR(pick("", none, true).error, "gpu: no GPU is visible");
+        CHECK_STR(cards(pick("", none, "", "", false)), "0");
+        CHECK(pick("", none, "", "", false).warning.empty());
+        CHECK_STR(cards(pick("3,1", none, "peer", "", false)), "3,1");
+        CHECK_STR(pick("3,1", none, "", "", false).error, "gpu 3,1 names 2 cards: set gpu-mode to peer, split or tensor; see docs/configuration/gpus.md");
+        CHECK(!pick("all", none, "", "", false).error.empty());
+        CHECK_STR(pick("", none, "", "", true).error, "gpu: no GPU is visible");
     }
     // Under CUDA_VISIBLE_DEVICES the numbers count within its list, and the narrowed list keeps its tokens.
     {
@@ -180,28 +268,6 @@ int main() {
         CHECK(visible_gpus(known).empty() && known);
     }
     CHECK_STR(gpu_identity(3), "0,1,2");
-    // Expert placement over several tiers: equal cards alternate; bandwidth sets the share of the hot experts; a
-    // smaller card closes first and the others take the rest; a single tier takes the ranking in order.
-    {
-        const std::vector<uint64_t> eq(8, 10);
-        auto owners = [](const std::vector<int>& o) {
-            std::string s;
-            for (int x : o) s += x < 0 ? std::string("-") : std::to_string(x);
-            return s;
-        };
-        CHECK_STR(owners(spread_experts(eq, {{40, 448}, {40, 448}})), "01010101");
-        CHECK_STR(owners(spread_experts(eq, {{80, 1792}, {80, 896}})), "01001001");
-        CHECK_STR(owners(spread_experts(eq, {{20, 1792}, {100, 448}})), "01011111");
-        CHECK_STR(owners(spread_experts(eq, {{30, 448}})), "000-----");
-        CHECK_STR(owners(spread_experts(eq, {{0, 448}, {30, 448}})), "111-----");
-        // three and four tiers of mixed sizes and bandwidths: every expert placed while room lasts, none twice
-        const std::vector<uint64_t> mixed = {12, 12, 12, 8, 8, 8, 8, 8, 8, 8, 8, 8};
-        const std::vector<int> o3 = spread_experts(mixed, {{30, 1792}, {20, 896}, {60, 448}});
-        CHECK_STR(owners(o3), "012001222222");
-        const std::vector<int> o4 = spread_experts(mixed, {{16, 448}, {16, 448}, {16, 448}, {200, 1792}});
-        CHECK_STR(owners(o4), "012333333333");
-        CHECK_STR(owners(spread_experts(eq, {{0, 1}, {0, 1}, {0, 1}})), "--------");
-    }
     if (g_fail) { std::printf("gpu_select_test: %d failures\n", g_fail); return 1; }
     std::printf("gpu_select_test: ok\n");
     return 0;

@@ -17,6 +17,7 @@
 // while it is read, and the block's barrier publishes the copies to every thread.  The whole-tile and pair forms keep
 // two tiles in flight; the one-tile form needs a single slot.
 #include "basalt/models/qwen4exp/kernels/dense_tc.hpp"
+#include "basalt/core/device.hpp"
 #include "basalt/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
@@ -1029,11 +1030,12 @@ void launch_tile(const void* w, const void* x, float* y, int n_in, int n_out, in
                (const uint8_t*) x, y, n_in, n_out, ncols, rs);
 }
 
-// the one-tile path takes the shape
+// the one-tile path takes the shape: a tile per SM of the planning card (core::plan_sms), so a later stage on a smaller
+// card takes the main card's path (the two paths round differently)
 template<int TYPE>
 bool one_ok(const void* w, int n_in, int n_out) {
     return ((uintptr_t) w & 15) == 0 && (n_in / 256) * Fmt<TYPE>::SB % 16 == 0 &&
-           (n_out + 15) / 16 <= sm_count() && one_smem_bytes<TYPE, 24>(n_in) <= 99 * 1024;
+           (n_out + 15) / 16 <= basalt::core::plan_sms() && one_smem_bytes<TYPE, 24>(n_in) <= 99 * 1024;
 }
 
 template<int TYPE, int NW>
