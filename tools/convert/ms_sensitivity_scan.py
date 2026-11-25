@@ -193,9 +193,33 @@ def gptq_nvfp4(w, hu):
     return q
 
 
+@torch.no_grad()
+def fast_ldlq_batch(ws, hs, k, seeds, blk_sz: int = 64):
+    """Fast non-Viterbi proxy: Hadamard rotate + clipped uniform K-bit block-LDLQ (no 2^14 trellis search)."""
+    blk = 512 if ws[0].shape[1] % 512 == 0 else 128
+    rot = [ms.rotate_weight_and_hessian(w, h, block_size=blk, seed=sd) for w, h, sd in zip(ws, hs, seeds)]
+    hu = torch.stack([ms.cholesky_inv_upper(r[1]) for r in rot])
+    w_work = torch.stack([r[0] for r in rot]).float().clone()
+    std = w_work.std(dim=2, keepdim=True).clamp(min=1e-8)
+    clip = (1.5 + 0.45 * k) * std
+    half_levels = (1 << (k - 1)) - 0.5
+    step = clip / half_levels
+    q = torch.empty_like(w_work)
+    in_f = w_work.shape[2]
+    for c0 in range(0, in_f, blk_sz):
+        c1 = min(c0 + blk_sz, in_f)
+        qc = torch.round(w_work[:, :, c0:c1] / step).clamp(-half_levels, half_levels) * step
+        q[:, :, c0:c1] = qc
+        if c1 < in_f:
+            err = torch.linalg.solve_triangular(hu[:, c0:c1, c0:c1], w_work[:, :, c0:c1] - qc, upper=True, left=False)
+            w_work[:, :, c1:] -= torch.bmm(err, hu[:, c0:c1, c1:])
+    return [ms.fwht_blocks(q[i], block_size=blk) * rot[i][2].unsqueeze(0) for i in range(len(ws))]
+
+
 def quant_batch(ws, hs, k, seeds, lut, mode="ms", viterbi=(32, 8)):
-    """mode: ms; fp4round (the MS output rounded to NVFP4); e2m1 (the trellis searches on the E2M1 grid, one FP16
-    scale per row); gptqfp4 (GPTQ onto NVFP4, k unused). All in the rotated domain, where a kernel decodes."""
+    """mode: ms; ldlq (fast block-64 LDLQ proxy); fp4round; e2m1; gptqfp4. All in the rotated domain."""
+    if mode == "ldlq":
+        return fast_ldlq_batch(ws, hs, k, seeds)
     blk = 512 if ws[0].shape[1] % 512 == 0 else 128
     rot = [ms.rotate_weight_and_hessian(w, h, block_size=blk, seed=sd) for w, h, sd in zip(ws, hs, seeds)]
     hu = torch.stack([ms.cholesky_inv_upper(r[1]) for r in rot])
@@ -341,6 +365,8 @@ def main() -> None:
                    help="also: NVFP4 RTN and GPTQ, and per width the MS output rounded to NVFP4 and the trellis on the E2M1 grid")
     p.add_argument("--per-expert", action="store_true",
                    help="also: each expert's own output error at every width (experts_<layer>.json)")
+    p.add_argument("--proxy", action="store_true",
+                   help="use fast block-64 LDLQ proxy instead of 14-bit Viterbi for sensitivity ranking (~5.5x faster)")
     args = p.parse_args()
     assert args.widths and all(k in MS_BITS for k in args.widths), args.widths
 
@@ -417,7 +443,7 @@ def main() -> None:
                         moe.experts.gate_up_proj.data[e] = nvfp4(moe.experts.gate_up_proj[e]).to(gu_ref.dtype)
                         moe.experts.down_proj.data[e] = nvfp4(moe.experts.down_proj[e]).to(dn_ref.dtype)
                     continue
-                per_e = name[0] == "C" and args.per_expert and mode == "ms"
+                per_e = name[0] == "C" and args.per_expert and mode in ("ms", "ldlq")
                 quantize_experts(moe, x, idx, k, lut, es, eb=args.expert_batch, tau=args.hess_tau, l=l, mode=mode,
                                  errs=errs.setdefault(k, {}) if per_e else None,
                                  errs_proj={p: errs_proj[p].setdefault(k, {}) for p in ("gate", "up", "down")} if per_e else None,
@@ -439,8 +465,9 @@ def main() -> None:
         errs: dict = {}
         errs_proj: dict = {"gate": {}, "up": {}, "down": {}}
         print(f"layer {l}: forward done, peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
+        scan_mode = "ldlq" if args.proxy else "ms"
         for k in args.widths:
-            measure({k: sample}, f"C{k}")
+            measure({k: sample}, f"C{k}", scan_mode)
         if args.fp4:
             measure({0: sample}, "NVFP4")
             for k in args.widths:
