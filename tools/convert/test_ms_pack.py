@@ -222,6 +222,31 @@ class MsPackTest(unittest.TestCase):
         check_experts((5, 2))
         check_mixed()
 
+    def test_experts_per_proj(self) -> None:
+        hid, ff, n_exp = 64, 32, 2
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            exp_dir = td / "experts"
+            exp_dir.mkdir()
+            ks = [[4, 2, 5], [3, 5, 2]]
+            for l in range(1):
+                for r, (ni, no) in (("gate", (hid, ff)), ("up", (hid, ff)), ("down", (ff, hid))):
+                    ri = {"gate": 0, "up": 1, "down": 2}[r]
+                    data = b"".join(bytes(ms_pack.payload_bytes(ni, no, ks[e][ri])) for e in range(n_exp))
+                    (exp_dir / f"blk.{l}.ffn_{r}_exps.ms").write_bytes(data)
+                rec = {
+                    "layer": l, "k": ks, "n_expert": n_exp,
+                    "tensors": {f"blk.{l}.ffn_{r}_exps.weight": {"file": f"blk.{l}.ffn_{r}_exps.ms", "shape": [ni, no]}
+                                for r, (ni, no) in (("gate", (hid, ff)), ("up", (hid, ff)), ("down", (ff, hid)))},
+                }
+                (exp_dir / f"blk.{l}.experts.json").write_text(json.dumps(rec))
+            ex = ms_pack.Experts(exp_dir, 1)
+            self.assertTrue(ex.mixed)
+            txt = ex.layout_text().decode("utf-8").splitlines()
+            self.assertTrue(txt[1].endswith("425352"), txt[1])
+            chunks = list(ex.chunks(group=2))
+            self.assertEqual(chunks[0][:3], bytes([4, 2, 5]))
+
     def test_pack(self) -> None:
         for k in ms_pack.MS_BITS:
             check_pack(k)

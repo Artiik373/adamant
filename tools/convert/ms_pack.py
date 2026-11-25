@@ -107,7 +107,7 @@ MIX_HEAD = 16     # a mixed layer's blob: byte 0 = K, zero pad, then gate | up |
 
 class Experts:
     """The routed experts of `<ms-dir>/experts`, one record per layer, checked before anything is written.
-    A record's k is one width, or a list of one width per expert (a mixed layer: blobs at their own sizes)."""
+    A record's k is one width, a list of one width per expert, or a list of [k_gate, k_up, k_down] per expert."""
 
     def __init__(self, exp_dir: Path, n_layers: int):
         self.layers = []
@@ -117,17 +117,32 @@ class Experts:
                 raise PackError(f"{p}: missing (every layer needs its experts)")
             rec = json.loads(p.read_text(encoding="utf-8"))
             n = int(rec["n_expert"])
-            k = rec["k"] if isinstance(rec["k"], int) else [int(v) for v in rec["k"]]
-            ks = [k] * n if isinstance(k, int) else k
-            if len(ks) != n or not set(ks) <= set(MS_BITS):
-                raise PackError(f"{p.name}: K {k}")
+            raw_k = rec["k"]
+            if isinstance(raw_k, int):
+                k = raw_k
+                ks_roles = ([k] * n, [k] * n, [k] * n)
+                per_proj = False
+            elif isinstance(raw_k, list) and len(raw_k) == n and all(isinstance(v, int) for v in raw_k):
+                k = [int(v) for v in raw_k]
+                ks_roles = (k, k, k)
+                per_proj = False
+            elif (isinstance(raw_k, list) and len(raw_k) == n
+                  and all(isinstance(v, list) and len(v) == 3 for v in raw_k)):
+                k = [[int(x) for x in v] for v in raw_k]
+                ks_roles = ([v[0] for v in k], [v[1] for v in k], [v[2] for v in k])
+                per_proj = True
+            else:
+                raise PackError(f"{p.name}: K {raw_k}")
+            for kr in ks_roles:
+                if not set(kr) <= set(MS_BITS):
+                    raise PackError(f"{p.name}: K {raw_k}")
             files, sizes = [], []
-            for role in ROLES:
+            for role, kr in zip(ROLES, ks_roles):
                 t = rec["tensors"][f"blk.{l}.ffn_{role}_exps.weight"]
                 n_in, n_out = (int(d) for d in t["shape"])
                 if n_in % 32:
                     raise PackError(f"{p.name}: {role} n_in {n_in} is not a multiple of 32")
-                per = [payload_bytes(n_in, n_out, ke) for ke in ks]
+                per = [payload_bytes(n_in, n_out, ke) for ke in kr]
                 f = exp_dir / t["file"]
                 if f.stat().st_size != sum(per):
                     raise PackError(f"{f.name}: {f.stat().st_size} B, expected {sum(per)}")
@@ -135,12 +150,12 @@ class Experts:
                 sizes.append(per)
             if self.layers and n != self.layers[0][1]:
                 raise PackError(f"{p.name}: {n} experts, layer 0 has {self.layers[0][1]}")
-            self.layers.append((k, n, files, sizes))
+            self.layers.append((k, n, files, sizes, per_proj))
         self.n_expert = self.layers[0][1]
         self.mixed = any(not isinstance(k, int) for k, *_ in self.layers)
 
     def expert_bytes(self, l: int, e: int) -> int:
-        k, _, _, sizes = self.layers[l]
+        k, _, _, sizes, _ = self.layers[l]
         return (0 if isinstance(k, int) else MIX_HEAD) + sum(s[e] for s in sizes)
 
     def blob_bytes(self, l: int) -> int:
@@ -158,7 +173,7 @@ class Experts:
         return sum(self.layer_bytes(l) for l in range(len(self.layers))) + self.pad_bytes()
 
     def chunks(self, group: int = 16):
-        for k, n, files, sizes in self.layers:
+        for k, n, files, sizes, per_proj in self.layers:
             fs = [open(f, "rb") for f in files]
             try:
                 for s in range(0, n, group):
@@ -168,7 +183,8 @@ class Experts:
                     out = []
                     for e in es:
                         if not isinstance(k, int):
-                            out.append(bytes([k[e]]) + bytes(MIX_HEAD - 1))
+                            head = bytes(k[e]) if per_proj else bytes([k[e]])
+                            out.append(head + bytes(MIX_HEAD - len(head)))
                         for r, (part, sz) in enumerate(zip(parts, sizes)):
                             out.append(part[at[r]:at[r] + sz[e]])
                             at[r] += sz[e]
@@ -181,11 +197,15 @@ class Experts:
 
     def layout_text(self) -> bytes:
         lines, off = [], 0
-        for l, (k, n, _, _) in enumerate(self.layers):
+        for l, (k, n, _, _, per_proj) in enumerate(self.layers):
             blob = self.blob_bytes(l)
             if isinstance(k, int):
                 t = MS_TYPE_BASE + k
                 lines.append(f"{l} {t} {t} {off} {blob} {t}\n")
+            elif per_proj:
+                t = MS_MIX + max(max(v) for v in k)
+                ks_str = "".join(f"{a}{b}{c}" for a, b, c in k)
+                lines.append(f"{l} {t} {t} {off} {blob} {t} {ks_str}\n")
             else:
                 t = MS_MIX + max(k)
                 lines.append(f"{l} {t} {t} {off} {blob} {t} {''.join(str(v) for v in k)}\n")

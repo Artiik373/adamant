@@ -51,6 +51,36 @@ class PlanSolver(unittest.TestCase):
         with self.assertRaises(SystemExit):
             solve({"0": {"2": 1.0, "3": 0.5}}, layer_bytes(2) - 1)
 
+    def test_per_proj_and_spine_cli(self):
+        import json
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            scan = td / "scan"
+            scan.mkdir()
+            (scan / "scan.jsonl").write_text(json.dumps({"layer": 0, "C3": {"out_rel": 0.1}}) + "\n")
+            ep = {
+                "gate": {"2": {"0": 4.0, "1": 4.0}, "3": {"0": 1.0, "1": 1.0}, "4": {"0": 0.2, "1": 0.2}},
+                "up":   {"2": {"0": 1.0, "1": 1.0}, "3": {"0": 0.8, "1": 0.8}, "4": {"0": 0.7, "1": 0.7}},
+                "down": {"2": {"0": 2.0, "1": 2.0}, "3": {"0": 0.5, "1": 0.5}, "4": {"0": 0.1, "1": 0.1}},
+            }
+            (scan / "experts_0.json").write_text(json.dumps({"errs_proj": ep}))
+            spine = {"blk.0.attn_q.weight": {"shape": [2560, 2560], "costs": {"4": 0.5, "6": 0.01}}}
+            (td / "spine.json").write_text(json.dumps(spine))
+            out = td / "plan.json"
+            subprocess.run([
+                sys.executable, str(Path(__file__).resolve().parent / "ms_plan_solver.py"),
+                "--experts-dir", str(scan), "--per-proj", "--spine-costs", str(td / "spine.json"),
+                "--budget-gib", "0.02", "--out", str(out),
+            ], check=True)
+            res = json.loads(out.read_text())
+            self.assertEqual(len(res["experts_k"]), 1)
+            self.assertEqual(len(res["experts_k"][0]), 2)
+            self.assertEqual(len(res["experts_k"][0][0]), 3)
+            self.assertIn("blk.0.attn_q.weight", res["spine_k"])
+
 
 if __name__ == "__main__":
     unittest.main()

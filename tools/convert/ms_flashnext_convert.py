@@ -184,15 +184,24 @@ def expert_hessians(x: torch.Tensor, idx: torch.Tensor, e: int, w_gu: torch.Tens
 
 
 def k_label(k) -> str:
-    return f"MS_C{k}" if isinstance(k, int) else "MS mix " + "/".join(f"C{w}:{k.count(w)}" for w in sorted(set(k)))
+    if isinstance(k, int):
+        return f"MS_C{k}"
+    flat = [x for v in k for x in (v if isinstance(v, (list, tuple)) else (v,))]
+    return "MS mix " + "/".join(f"C{w}:{flat.count(w)}" for w in sorted(set(flat)))
 
 
 EXPERT_BATCH = 0   # --expert-batch; 0: from the window
 
 
+def _norm_expert_ks(k, n_exp: int) -> list[tuple[int, int, int]]:
+    if isinstance(k, int):
+        return [(k, k, k)] * n_exp
+    return [(v[0], v[1], v[2]) if isinstance(v, (list, tuple)) else (v, v, v) for v in k]
+
+
 def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0.0, tok_w=None,
                  cold_frac: float | None = None) -> dict:
-    """k: one width for the layer, or a list with one width per expert (a mixed layer)."""
+    """k: one width for the layer, a list of one width per expert, or a list of [k_gate, k_up, k_down] per expert."""
     ex = moe.experts
     h_all = x_ref = None
     if tau > 0:   # the layer-wide statistics the shrinkage pulls toward: all tokens, and a fixed sample of them
@@ -209,6 +218,7 @@ def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0
         if n_cold > 0:
             for ei in torch.topk(counts, n_cold, largest=False).indices.tolist():
                 is_cold[ei] = True
+    k_triples = _norm_expert_ks(k, n_exp)
     files = {n: open(out_dir / f"blk.{l}.ffn_{n}_exps.ms", "wb") for n in ("gate", "up", "down")}
     # experts per batch: the back-pointer buffer grows with the window
     eb = EXPERT_BATCH or 8 * 32 // VITERBI[0]
@@ -218,24 +228,44 @@ def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0
             es = list(range(e0, min(e0 + eb, n_exp)))
             hs = [expert_hessians(x, idx, e, ex.gate_up_proj[e].float(), wts, tau, h_all, x_ref, tok_w) for e in es]
             zero += sum(1 for h in hs if h[2] == 0)
-            ks = [k] * len(es) if isinstance(k, int) else [k[e] for e in es]
-            got = {}
-            for kk, cold in sorted({(ki, is_cold[es[i]]) for i, ki in enumerate(ks)}):   # one coder call per (width, tier)
-                sub = [i for i, ki in enumerate(ks) if ki == kk and is_cold[es[i]] == cold]
-                ids = [es[i] for i in sub]
+            got_g, got_u, got_d = {}, {}, {}
+            for cold in (False, True):
                 kw = {"sign_trials": 1, "scale_passes": 1, "viterbi": COLD_VITERBI} if cold else {}
-                gu = code(ex.gate_up_proj[ids].float(), torch.stack([hs[i][0] for i in sub]), kk, lut,
-                          [l * 4096 + 2 * e + 1 for e in ids], **kw)
-                dn = code(ex.down_proj[ids].float(), torch.stack([hs[i][1] for i in sub]), kk, lut,
-                          [l * 4096 + 2 * e + 2 for e in ids], **kw)
-                for e, a, b in zip(ids, gu, dn):
-                    got[e] = (kk, a, b)
+                same_ks = sorted({k_triples[es[i]][0] for i in range(len(es))
+                                  if is_cold[es[i]] == cold and k_triples[es[i]][0] == k_triples[es[i]][1]})
+                for kk in same_ks:
+                    sub = [i for i in range(len(es)) if is_cold[es[i]] == cold
+                           and k_triples[es[i]][0] == kk and k_triples[es[i]][1] == kk]
+                    ids = [es[i] for i in sub]
+                    gu = code(ex.gate_up_proj[ids].float(), torch.stack([hs[i][0] for i in sub]), kk, lut,
+                              [l * 4096 + 2 * e + 1 for e in ids], **kw)
+                    rb_gu = ms_row_bytes(n_embd, kk) * n_ff
+                    for e, (rows, signs, _) in zip(ids, gu):
+                        got_g[e] = (rows[:rb_gu], signs)
+                        got_u[e] = (rows[rb_gu:], signs)
+                for proj_idx, sl_gu, got_p in ((0, slice(None, n_ff), got_g), (1, slice(n_ff, None), got_u)):
+                    diff_ks = sorted({k_triples[es[i]][proj_idx] for i in range(len(es))
+                                      if is_cold[es[i]] == cold and k_triples[es[i]][0] != k_triples[es[i]][1]})
+                    for kk in diff_ks:
+                        sub = [i for i in range(len(es)) if is_cold[es[i]] == cold
+                               and k_triples[es[i]][0] != k_triples[es[i]][1] and k_triples[es[i]][proj_idx] == kk]
+                        ids = [es[i] for i in sub]
+                        res = code(ex.gate_up_proj[ids, sl_gu].float(), torch.stack([hs[i][0] for i in sub]), kk, lut,
+                                   [l * 4096 + 2 * e + 1 + proj_idx * 2048 for e in ids], **kw)
+                        for e, (rows, signs, _) in zip(ids, res):
+                            got_p[e] = (rows, signs)
+                dn_ks = sorted({k_triples[es[i]][2] for i in range(len(es)) if is_cold[es[i]] == cold})
+                for kk in dn_ks:
+                    sub = [i for i in range(len(es)) if is_cold[es[i]] == cold and k_triples[es[i]][2] == kk]
+                    ids = [es[i] for i in sub]
+                    dn = code(ex.down_proj[ids].float(), torch.stack([hs[i][1] for i in sub]), kk, lut,
+                              [l * 4096 + 2 * e + 2 for e in ids], **kw)
+                    for e, (rows_d, signs_d, _) in zip(ids, dn):
+                        got_d[e] = (rows_d, signs_d)
             for e in es:   # in expert order
-                kk, (rows, signs, _), (rows_d, signs_d, _) = got[e]
-                rb_gu = ms_row_bytes(n_embd, kk) * n_ff
-                files["gate"].write(rows[:rb_gu] + signs.tobytes())
-                files["up"].write(rows[rb_gu:] + signs.tobytes())
-                files["down"].write(rows_d + signs_d.tobytes())
+                files["gate"].write(got_g[e][0] + got_g[e][1].tobytes())
+                files["up"].write(got_u[e][0] + got_u[e][1].tobytes())
+                files["down"].write(got_d[e][0] + got_d[e][1].tobytes())
     finally:
         for f in files.values():
             f.close()
@@ -581,9 +611,15 @@ def main() -> None:
     cfg = Qwen4ExpTextConfig(**tc)
     nl = cfg.num_hidden_layers
     plan = json.loads(args.plan.read_text())["experts_k"]
-    # a layer's entry: one width, or a list of one width per routed expert
-    assert len(plan) == nl and all(k in MS_BITS if isinstance(k, int) else len(k) == cfg.num_experts and set(k) <= set(MS_BITS)
-                                   for k in plan), "bad plan"
+    # a layer's entry: one width, one width per expert, or [k_gate, k_up, k_down] per expert
+    def _valid_layer_k(k):
+        if isinstance(k, int):
+            return k in MS_BITS
+        if not isinstance(k, list) or len(k) != cfg.num_experts:
+            return False
+        return all((v in MS_BITS if isinstance(v, int) else isinstance(v, list) and len(v) == 3 and set(v) <= set(MS_BITS))
+                   for v in k)
+    assert len(plan) == nl and all(_valid_layer_k(k) for k in plan), "bad plan"
     wmap = json.loads((args.hf_dir / "model.safetensors.index.json").read_text())["weight_map"]
     calib = torch.load(args.calib, map_location="cpu", weights_only=True)
     cal_ids, _ = split_calib(calib, args.calib_seqs, 0)

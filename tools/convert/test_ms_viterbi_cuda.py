@@ -204,6 +204,35 @@ class ConverterPayload(unittest.TestCase):
             for proj in ("gate", "up", "down"):
                 self.assertTrue((Path(td) / f"blk.0.ffn_{proj}_exps.ms").stat().st_size > 0)
 
+    def test_code_experts_per_proj(self):
+        import tempfile
+        from types import SimpleNamespace
+        from ms_flashnext_convert import code_experts
+        from ms_pack import payload_bytes
+
+        dev = torch.device("cuda")
+        lut = ms.build_1mad_lut(dev)
+        g = torch.Generator(device=dev).manual_seed(44)
+        n_exp, n_ff, n_embd = 2, 32, 64
+        moe = SimpleNamespace(
+            experts=SimpleNamespace(
+                gate_up_proj=torch.randn(n_exp, 2 * n_ff, n_embd, device=dev, generator=g),
+                down_proj=torch.randn(n_exp, n_embd, n_ff, device=dev, generator=g),
+            )
+        )
+        x = torch.randn(20, n_embd, device=dev, generator=g)
+        idx = torch.zeros(20, 2, dtype=torch.long, device=dev)
+        idx[:, 1] = 1
+        ks = [[4, 2, 5], [3, 3, 4]]
+        with tempfile.TemporaryDirectory() as td:
+            code_experts(moe, x, idx, ks, lut, 0, Path(td))
+            self.assertEqual((Path(td) / "blk.0.ffn_gate_exps.ms").stat().st_size,
+                             sum(payload_bytes(n_embd, n_ff, k[0]) for k in ks))
+            self.assertEqual((Path(td) / "blk.0.ffn_up_exps.ms").stat().st_size,
+                             sum(payload_bytes(n_embd, n_ff, k[1]) for k in ks))
+            self.assertEqual((Path(td) / "blk.0.ffn_down_exps.ms").stat().st_size,
+                             sum(payload_bytes(n_ff, n_embd, k[2]) for k in ks))
+
 
 if __name__ == "__main__":
     unittest.main()
