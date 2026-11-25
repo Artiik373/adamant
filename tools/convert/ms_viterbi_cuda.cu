@@ -22,7 +22,15 @@ constexpr int STATE_MASK = NUM_STATES - 1;
 __device__ __forceinline__ float decode_1mad(int s) {
     uint32_t x = static_cast<uint32_t>(s) * MAD_MUL + MAD_ADD;
     int v = static_cast<int>((x & 0xFFu) + ((x >> 8) & 0xFFu) + ((x >> 16) & 0xFFu) + ((x >> 24) & 0xFFu)) - 510;
+#ifdef MS_FP4_C
+    // probe: the value snapped to the nearest E2M1 level times MS_FP4_C
+    const float a = fabsf(static_cast<float>(v)) / MS_FP4_C;
+    const float l = a < 0.25f ? 0.f : a < 0.75f ? 0.5f : a < 1.25f ? 1.f : a < 1.75f ? 1.5f
+                  : a < 2.5f ? 2.f : a < 3.5f ? 3.f : a < 5.f ? 4.f : 6.f;
+    return copysignf(l * MS_FP4_C, static_cast<float>(v));
+#else
     return static_cast<float>(v);
+#endif
 }
 
 // n consecutive elements written as one aligned vector store where n fits one
