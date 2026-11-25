@@ -54,12 +54,15 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst);
 /// h (n_ff floats) -> the down activation (h_bytes).
 void native_quant_h(const NativeFmt& f, const float* h, void* dst);
 
-/// A mixed MS layer's blob head (layout v9).
+/// A mixed MS layer's blob head (layout v9): byte 0 = k_gate, byte 1 = k_up (0: same), byte 2 = k_down (0: same).
 inline constexpr size_t kMsMixHead = 16;
-/// The format of one blob of an MS layer: f itself, or for a mixed layer the format at the blob's own K, with
+inline constexpr uint16_t ms_pack_k3(int kg, int ku, int kd) noexcept {
+    return (uint16_t) ((kg & 0xF) | ((ku & 0xF) << 4) | ((kd & 0xF) << 8));
+}
+/// The format of one blob of an MS layer: f itself, or for a mixed layer the format at the blob's own K(s), with
 /// `blob` moved past the head.
 const NativeFmt& ms_blob_fmt(const NativeFmt& f, const uint8_t*& blob);
-/// A mixed MS layer's format at width k (2..6): its geometry and SwiGLU limit, one K.
+/// A mixed MS layer's format at width k (2..6) or packed ms_pack_k3(kg, ku, kd).
 const NativeFmt& ms_fmt_k(const NativeFmt& f, int k);
 
 /// NVFP4 blobs end in FP32 {s_gate, s_up, s_down, 0}: the scale tail's byte count.

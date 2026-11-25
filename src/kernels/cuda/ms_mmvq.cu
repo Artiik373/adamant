@@ -509,8 +509,12 @@ void ms_dequant_dense_f16(int ggml_type, const void* weights, int64_t k, int64_t
 }
 
 void ms_dequant_expert_f16(int ggml_type, const void* blob, int64_t n_embd, int64_t n_ff, size_t up_off,
-                           size_t down_off, uint16_t* dq_gu, uint16_t* dq_d, void* stream) {
-    if (!basalt::ms_tensor_type((uint32_t) ggml_type) || n_embd <= 0 || n_embd % 32 || n_ff <= 0 || n_ff % 32 ||
+                           size_t down_off, uint16_t* dq_gu, uint16_t* dq_d, void* stream,
+                           int up_type, int d_type) {
+    if (up_type < 0) up_type = ggml_type;
+    if (d_type < 0) d_type = ggml_type;
+    if (!basalt::ms_tensor_type((uint32_t) ggml_type) || !basalt::ms_tensor_type((uint32_t) up_type) ||
+        !basalt::ms_tensor_type((uint32_t) d_type) || n_embd <= 0 || n_embd % 32 || n_ff <= 0 || n_ff % 32 ||
         blob == nullptr || dq_gu == nullptr || dq_d == nullptr)
         throw std::invalid_argument("ms_dequant_expert_f16: unsupported type, shape or pointer");
     namespace mc = adamant::kernels::ms_cuda;
@@ -520,26 +524,35 @@ void ms_dequant_expert_f16(int ggml_type, const void* blob, int64_t n_embd, int6
     const auto s = static_cast<cudaStream_t>(stream);
     const int ne = (int) n_embd, nf = (int) n_ff;
     cudaError_t err = cudaSuccess;
-    auto run = [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
-        if (err == cudaSuccess) err = mc::launch_ms_dequant_rows<K>(b, 0, nf, nf, ne, gu, s, 2 * ne);
-        if (err == cudaSuccess) err = mc::launch_ms_dequant_rows<K>(b + up_off, 0, nf, nf, ne, gu + ne, s, 2 * ne);
-        if (err == cudaSuccess) err = mc::launch_ms_dequant_rows<K>(b + down_off, 0, ne, ne, nf, d, s);
+    auto with_k = [&](int tp, auto fn) {
+        switch (basalt::ms_bits((uint32_t) tp)) {
+        case 2: fn(std::integral_constant<int, 2>{}); break;
+        case 3: fn(std::integral_constant<int, 3>{}); break;
+        case 4: fn(std::integral_constant<int, 4>{}); break;
+        case 5: fn(std::integral_constant<int, 5>{}); break;
+        default: fn(std::integral_constant<int, 6>{}); break;
+        }
     };
-    switch (basalt::ms_bits((uint32_t) ggml_type)) {
-    case 2: run(std::integral_constant<int, 2>{}); break;
-    case 3: run(std::integral_constant<int, 3>{}); break;
-    case 4: run(std::integral_constant<int, 4>{}); break;
-    case 5: run(std::integral_constant<int, 5>{}); break;
-    default: run(std::integral_constant<int, 6>{}); break;
-    }
+    with_k(ggml_type, [&](auto kc) {
+        if (err == cudaSuccess) err = mc::launch_ms_dequant_rows<decltype(kc)::value>(b, 0, nf, nf, ne, gu, s, 2 * ne);
+    });
+    with_k(up_type, [&](auto kc) {
+        if (err == cudaSuccess) err = mc::launch_ms_dequant_rows<decltype(kc)::value>(b + up_off, 0, nf, nf, ne, gu + ne, s, 2 * ne);
+    });
+    with_k(d_type, [&](auto kc) {
+        if (err == cudaSuccess) err = mc::launch_ms_dequant_rows<decltype(kc)::value>(b + down_off, 0, ne, ne, nf, d, s);
+    });
     if (err != cudaSuccess) throw std::runtime_error(std::string("ms_dequant_expert_f16: ") + cudaGetErrorString(err));
 }
 
 void ms_experts_to_q8_0_slots(int ggml_type, const uint8_t* const* blobs, const int32_t* slots, int n,
                               int64_t n_embd, int64_t n_ff, size_t up_off, size_t down_off, void* gu_dst,
-                              size_t gu_stride, void* d_dst, size_t d_stride, void* stream) {
-    if (!basalt::ms_tensor_type((uint32_t) ggml_type) || n_embd != 2560 || n_ff != 640 || n < 1 || n > kMsGroupMax ||
+                              size_t gu_stride, void* d_dst, size_t d_stride, void* stream,
+                              int up_type, int d_type) {
+    if (up_type < 0) up_type = ggml_type;
+    if (d_type < 0) d_type = ggml_type;
+    if (!basalt::ms_tensor_type((uint32_t) ggml_type) || !basalt::ms_tensor_type((uint32_t) up_type) ||
+        !basalt::ms_tensor_type((uint32_t) d_type) || n_embd != 2560 || n_ff != 640 || n < 1 || n > kMsGroupMax ||
         blobs == nullptr || gu_dst == nullptr || d_dst == nullptr)
         throw std::invalid_argument("ms_experts_to_q8_0: unsupported type, shape, count or pointer");
     MsBlobs g{};
@@ -556,33 +569,50 @@ void ms_experts_to_q8_0_slots(int ggml_type, const uint8_t* const* blobs, const 
         const int want = sm_count() * 4, need = (rows + kWarps - 1) / kWarps;
         return (unsigned) (want < need ? want : need);
     };
-    auto run = [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
-        ms_q80_rows_kernel<K, 2560, 640, 2><<<grid(n * 1280), kWarps * 32, 0, s>>>(g, n, 0, up_off, gu, gu_stride);
-        ms_q80_rows_kernel<K, 640, 2560, 1><<<grid(n * 2560), kWarps * 32, 0, s>>>(g, n, down_off, down_off, d, d_stride);
+    auto with_k = [&](int tp, auto fn) {
+        switch (basalt::ms_bits((uint32_t) tp)) {
+        case 2: fn(std::integral_constant<int, 2>{}); break;
+        case 3: fn(std::integral_constant<int, 3>{}); break;
+        case 4: fn(std::integral_constant<int, 4>{}); break;
+        case 5: fn(std::integral_constant<int, 5>{}); break;
+        default: fn(std::integral_constant<int, 6>{}); break;
+        }
     };
-    switch (basalt::ms_bits((uint32_t) ggml_type)) {
-    case 2: run(std::integral_constant<int, 2>{}); break;
-    case 3: run(std::integral_constant<int, 3>{}); break;
-    case 4: run(std::integral_constant<int, 4>{}); break;
-    case 5: run(std::integral_constant<int, 5>{}); break;
-    default: run(std::integral_constant<int, 6>{}); break;
+    if (ggml_type == up_type) {
+        with_k(ggml_type, [&](auto kc) {
+            constexpr int K = decltype(kc)::value;
+            ms_q80_rows_kernel<K, 2560, 640, 2><<<grid(n * 1280), kWarps * 32, 0, s>>>(g, n, 0, up_off, gu, gu_stride);
+        });
+    } else {
+        uint8_t* up_dst = gu + (size_t) n_ff * (n_embd / 32) * sizeof(adamant::kernels::ms_cuda::MsQ80);
+        with_k(ggml_type, [&](auto kc) {
+            constexpr int K = decltype(kc)::value;
+            ms_q80_rows_kernel<K, 2560, 640, 1><<<grid(n * 640), kWarps * 32, 0, s>>>(g, n, 0, 0, gu, gu_stride);
+        });
+        with_k(up_type, [&](auto kc) {
+            constexpr int K = decltype(kc)::value;
+            ms_q80_rows_kernel<K, 2560, 640, 1><<<grid(n * 640), kWarps * 32, 0, s>>>(g, n, up_off, up_off, up_dst, gu_stride);
+        });
     }
+    with_k(d_type, [&](auto kc) {
+        constexpr int K = decltype(kc)::value;
+        ms_q80_rows_kernel<K, 640, 2560, 1><<<grid(n * 2560), kWarps * 32, 0, s>>>(g, n, down_off, down_off, d, d_stride);
+    });
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) throw std::runtime_error(std::string("ms_experts_to_q8_0: ") + cudaGetErrorString(err));
 }
 
 void ms_experts_to_q8_0(int ggml_type, const uint8_t* const* blobs, int n, int64_t n_embd, int64_t n_ff,
                         size_t up_off, size_t down_off, void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride,
-                        void* stream) {
+                        void* stream, int up_type, int d_type) {
     ms_experts_to_q8_0_slots(ggml_type, blobs, nullptr, n, n_embd, n_ff, up_off, down_off, gu_dst, gu_stride, d_dst,
-                             d_stride, stream);
+                             d_stride, stream, up_type, d_type);
 }
 
 void ms_expert_to_q8_0(int ggml_type, const void* blob, int64_t n_embd, int64_t n_ff, size_t up_off, size_t down_off,
-                       void* gu_dst, void* d_dst, void* stream) {
+                       void* gu_dst, void* d_dst, void* stream, int up_type, int d_type) {
     const uint8_t* b = static_cast<const uint8_t*>(blob);
-    ms_experts_to_q8_0(ggml_type, &b, 1, n_embd, n_ff, up_off, down_off, gu_dst, 0, d_dst, 0, stream);
+    ms_experts_to_q8_0(ggml_type, &b, 1, n_embd, n_ff, up_off, down_off, gu_dst, 0, d_dst, 0, stream, up_type, d_type);
 }
 
 }  // namespace basalt::kernels

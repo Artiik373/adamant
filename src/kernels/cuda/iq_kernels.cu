@@ -3413,11 +3413,14 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     if (basalt::ms_expert_type((uint32_t) gu_type)) {   // three MS payloads: rows, then the input signs
         // a mixed layer: the widest K's geometry, and the slot holds the blob's head too
         const bool mix = basalt::ms_mix_type((uint32_t) gu_type);
-        const int k = mix ? basalt::ms_mix_bits((uint32_t) gu_type) : basalt::ms_bits((uint32_t) gu_type);
-        L.gu_row = L.up_row = (size_t) basalt::ms_row_bytes((uint64_t) n_embd, k);
-        L.d_row = (size_t) basalt::ms_row_bytes((uint64_t) n_ff, k);
+        const int kg = mix ? basalt::ms_mix_bits((uint32_t) gu_type) : basalt::ms_bits((uint32_t) gu_type);
+        const int ku = mix ? kg : basalt::ms_bits((uint32_t) L.up_type);
+        const int kd = mix ? kg : basalt::ms_bits((uint32_t) d_type);
+        L.gu_row = (size_t) basalt::ms_row_bytes((uint64_t) n_embd, kg);
+        L.up_row = (size_t) basalt::ms_row_bytes((uint64_t) n_embd, ku);
+        L.d_row = (size_t) basalt::ms_row_bytes((uint64_t) n_ff, kd);
         L.up_off = (size_t) n_ff * L.gu_row + (size_t) n_embd;
-        L.down_off = 2 * L.up_off;
+        L.down_off = L.up_off + (size_t) n_ff * L.up_row + (size_t) n_embd;
         L.bytes = L.down_off + (size_t) n_embd * L.d_row + (size_t) n_ff + (mix ? cpu::kMsMixHead : 0);
         return L;
     }

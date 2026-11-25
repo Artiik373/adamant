@@ -145,8 +145,8 @@ void ms_gu_rows(const NativeFmt& fl, const uint8_t* blob, const void* const* act
     u.resize((size_t) nt * (size_t) f.n_ff);
     up.resize((size_t) nt);
     for (int t = 0; t < nt; ++t) up[(size_t) t] = u.data() + (size_t) t * f.n_ff;
-    ms_rows(f.ms_k, blob, n, ag, nt, ff, r0, r1);
-    ms_rows(f.ms_k, blob + f.up_off, n, au, nt, up.data(), r0, r1);
+    ms_rows(basalt::ms_bits((uint32_t) f.gu_type), blob, n, ag, nt, ff, r0, r1);
+    ms_rows(basalt::ms_bits((uint32_t) f.up_type), blob + f.up_off, n, au, nt, up.data(), r0, r1);
     for (int t = 0; t < nt; ++t)
         for (int r = r0; r < r1; ++r) {
             float a = ff[t][r], b = up[(size_t) t][r];
@@ -165,7 +165,7 @@ void ms_down_rows(const NativeFmt& fl, const uint8_t* blob, const void* const* h
     const uint8_t* rows = blob + f.down_off;
     thread_local MsIn cd;
     const MsAct* const* a = ms_inputs(cd, (const int8_t*) rows + (size_t) f.n_embd * f.d_row, hq, nt, n);
-    ms_rows(f.ms_k, rows, n, a, nt, out, r0, r1);
+    ms_rows(basalt::ms_bits((uint32_t) f.d_type), rows, n, a, nt, out, r0, r1);
 }
 
 }  // namespace
@@ -308,10 +308,9 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     if (up_type < 0) up_type = gu_type;
     if (basalt::ms_tensor_type((uint32_t) gu_type) || basalt::ms_tensor_type((uint32_t) d_type) ||
         basalt::ms_tensor_type((uint32_t) up_type)) {
-        if (gu_type != d_type || gu_type != up_type) {
-            err = "native experts: an MS layer has one K for gate, up and down";
-            return false;
-        }
+        const int kg = basalt::ms_bits((uint32_t) gu_type);
+        const int ku = basalt::ms_bits((uint32_t) up_type);
+        const int kd = basalt::ms_bits((uint32_t) d_type);
         if (!cpu_avx2_ok()) {
             err = "native experts: MS experts need an AVX2 CPU";
             return false;
@@ -320,17 +319,19 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
             err = "native experts: MS geometry is not whole 128-column blocks";
             return false;
         }
-        const int k = basalt::ms_bits((uint32_t) gu_type);
-        f.gu_type = f.d_type = f.up_type = gu_type;
-        f.ms_k = k;
+        f.gu_type = gu_type;
+        f.up_type = up_type;
+        f.d_type = d_type;
+        f.ms_k = std::max({kg, ku, kd});
         f.n_embd = n_embd;
         f.n_ff = n_ff;
         f.swiglu_limit = swiglu_limit;
         f.gu_act = f.d_act = -1;
-        f.gu_row = f.up_row = (size_t) basalt::ms_row_bytes((uint64_t) n_embd, k);
-        f.d_row = (size_t) basalt::ms_row_bytes((uint64_t) n_ff, k);
+        f.gu_row = (size_t) basalt::ms_row_bytes((uint64_t) n_embd, kg);
+        f.up_row = (size_t) basalt::ms_row_bytes((uint64_t) n_embd, ku);
+        f.d_row = (size_t) basalt::ms_row_bytes((uint64_t) n_ff, kd);
         f.up_off = f.gu_row * (size_t) n_ff + (size_t) n_embd;
-        f.down_off = 2 * f.up_off;
+        f.down_off = f.up_off + f.up_row * (size_t) n_ff + (size_t) n_embd;
         f.bytes = f.down_off + f.d_row * (size_t) n_embd + (size_t) n_ff;
         f.tail = 0;
         f.act_bytes = (size_t) n_embd * 4;   // fp32: no range limit before the int8 rotated input
@@ -434,18 +435,30 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 
 const NativeFmt& ms_blob_fmt(const NativeFmt& f, const uint8_t*& blob) {
     if (!f.ms_mix) return f;
-    const NativeFmt& g = ms_fmt_k(f, blob[0]);
+    const int kg = blob[0];
+    const int ku = blob[1] ? blob[1] : kg;
+    const int kd = blob[2] ? blob[2] : kg;
+    const NativeFmt& g = ms_fmt_k(f, ms_pack_k3(kg, ku, kd));
     blob += kMsMixHead;
     return g;
 }
 
 const NativeFmt& ms_fmt_k(const NativeFmt& f, int k) {
-    thread_local NativeFmt by_k[7];
-    NativeFmt& g = by_k[k < 2 || k > 6 ? 0 : k];
-    if (g.ms_k != k || g.n_embd != f.n_embd || g.n_ff != f.n_ff || g.swiglu_limit != f.swiglu_limit) {
+    const int kg = k <= 6 ? k : (k & 0xF);
+    const int ku = k <= 6 ? k : ((k >> 4) & 0xF);
+    const int kd = k <= 6 ? k : ((k >> 8) & 0xF);
+    if (kg < 2 || kg > 6 || ku < 2 || ku > 6 || kd < 2 || kd > 6) {
+        basalt::log::error("basalt", "mixed MS expert: bad K %d/%d/%d", kg, ku, kd);
+        std::exit(1);
+    }
+    thread_local NativeFmt by_k[5][5][5];
+    NativeFmt& g = by_k[kg - 2][ku - 2][kd - 2];
+    if (basalt::ms_bits((uint32_t) g.gu_type) != kg || basalt::ms_bits((uint32_t) g.up_type) != ku ||
+        basalt::ms_bits((uint32_t) g.d_type) != kd || g.n_embd != f.n_embd || g.n_ff != f.n_ff ||
+        g.swiglu_limit != f.swiglu_limit) {
         std::string err;
-        if (k < 2 || k > 6 || !native_fmt(120 + k, 120 + k, f.n_embd, f.n_ff, g, err, f.swiglu_limit)) {
-            basalt::log::error("basalt", "mixed MS expert: bad K %d", k);
+        if (!native_fmt(120 + kg, 120 + kd, f.n_embd, f.n_ff, g, err, f.swiglu_limit, 120 + ku)) {
+            basalt::log::error("basalt", "mixed MS expert: bad K %d/%d/%d", kg, ku, kd);
             std::exit(1);
         }
     }

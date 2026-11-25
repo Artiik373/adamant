@@ -21,7 +21,7 @@ struct ExpertLayout {
     std::vector<uint64_t> offset, bytes;  ///< per layer: where its 512 blobs start, bytes per blob (a slot)
     std::vector<std::vector<uint64_t>> eoff;   ///< per layer: a mixed layer's blob offsets from its start (n_expert + 1),
                                                ///< empty for a layer of one format
-    std::vector<std::vector<uint8_t>> ek;       ///< per layer: a mixed layer's K an expert (empty otherwise)
+    std::vector<std::vector<uint16_t>> ek;      ///< per layer: a mixed layer's K (or packed kg|(ku<<4)|(kd<<8)) an expert
     int version = 0;                      ///< the layout header's version (0 = none given)
     uint64_t max_blob = 0;
     uint64_t total = 0;                   ///< the experts section's size

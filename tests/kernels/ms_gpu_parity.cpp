@@ -66,15 +66,23 @@ void ref_gemv_k(int k, const std::vector<uint8_t>& p, const float* x, float* y, 
     }
 }
 
-// One expert's blob [gate | up | down] at K; a mixed layer's blob starts with its head (byte 0 = K).
-std::vector<uint8_t> random_blob(int k, bool mix, std::mt19937& rng) {
+// One expert's blob [gate | up | down] at (kg, ku, kd); a mixed layer's blob starts with its head (bytes 0..2 = kg, ku, kd).
+std::vector<uint8_t> random_blob3(int kg, int ku, int kd, bool mix, std::mt19937& rng) {
     const int H = 2560, FF = 640;
     std::vector<uint8_t> b(mix ? basalt::kernels::cpu::kMsMixHead : 0, 0);
-    if (mix) b[0] = (uint8_t) k;
-    for (const std::vector<uint8_t>& p : {random_payload(k, H, FF, rng), random_payload(k, H, FF, rng),
-                                          random_payload(k, FF, H, rng)})
+    if (mix) {
+        b[0] = (uint8_t) kg;
+        b[1] = (uint8_t) ku;
+        b[2] = (uint8_t) kd;
+    }
+    for (const std::vector<uint8_t>& p : {random_payload(kg, H, FF, rng), random_payload(ku, H, FF, rng),
+                                          random_payload(kd, FF, H, rng)})
         b.insert(b.end(), p.begin(), p.end());
     return b;
+}
+
+std::vector<uint8_t> random_blob(int k, bool mix, std::mt19937& rng) {
+    return random_blob3(k, k, k, mix, rng);
 }
 
 template <int K>
@@ -629,6 +637,79 @@ int main() {
     run_grouped({2, 2, 2, 2}, 0.f, 46);
     run_grouped({5, 5, 5, 5}, 0.f, 47);
     run_grouped({5, 5, 5, 5}, 7.f, 48);
+    {   // mixed per-projection K (k_gate, k_up, k_down)
+        std::mt19937 rng(49);
+        const int H = 2560, FF = 640, G = 2, NT = 4;
+        const int ks3[G][3] = {{4, 2, 5}, {3, 5, 2}};
+        const auto L = gpu::native_expert_layout(135, 135, H, FF, 0.f, 135);
+        std::vector<std::vector<uint8_t>> blobs = {
+            random_blob3(ks3[0][0], ks3[0][1], ks3[0][2], true, rng),
+            random_blob3(ks3[1][0], ks3[1][1], ks3[1][2], true, rng),
+        };
+        std::vector<int32_t> start = {0, 2, 4}, tok = {0, 2, 1, 3}, dst = {2, 0, 3, 1};
+        std::vector<float> x((size_t) NT * H);
+        for (float& v : x) v = std::uniform_real_distribution<float>(-1.f, 1.f)(rng);
+        std::vector<void*> dblob(G);
+        std::vector<unsigned long long> hp(G);
+        for (int g = 0; g < G; ++g) {
+            CK(cudaMalloc(&dblob[g], blobs[g].size()));
+            CK(cudaMemcpy(dblob[g], blobs[g].data(), blobs[g].size(), cudaMemcpyHostToDevice));
+            hp[g] = (unsigned long long) dblob[g];
+        }
+        unsigned long long* d_ptr;
+        int32_t *d_start, *d_ng, *d_dst, *d_tok;
+        float *d_x, *d_out;
+        void *d_q, *d_scr;
+        const size_t qb = gpu::native_q8_1_bytes(H, NT);
+        CK(cudaMalloc(&d_ptr, G * 8)); CK(cudaMalloc(&d_start, (G + 1) * 4)); CK(cudaMalloc(&d_ng, 4));
+        CK(cudaMalloc(&d_dst, 16)); CK(cudaMalloc(&d_tok, 16)); CK(cudaMalloc(&d_x, x.size() * 4));
+        CK(cudaMalloc(&d_q, qb)); CK(cudaMalloc(&d_out, (size_t) 4 * H * 4));
+        CK(cudaMalloc(&d_scr, gpu::native_expert_scratch_bytes(4, FF)));
+        CK(cudaMemcpy(d_ptr, hp.data(), G * 8, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_start, start.data(), (G + 1) * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_ng, &G, 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_dst, dst.data(), 16, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_tok, tok.data(), 16, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+        cudaStream_t s; CK(cudaStreamCreate(&s));
+        gpu::native_quantize_q8_1(d_x, d_q, H, NT, s);
+        gpu::native_expert_grouped(L, d_ptr, d_start, d_ng, d_dst, d_tok, G, 4, d_q, d_scr, d_out, s);
+        CK(cudaStreamSynchronize(s));
+        std::vector<uint8_t> q(qb); std::vector<float> got(4 * H);
+        CK(cudaMemcpy(q.data(), d_q, qb, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(got.data(), d_out, got.size() * 4, cudaMemcpyDeviceToHost));
+        CK(cudaStreamDestroy(s));
+        for (void* pp : dblob) cudaFree(pp);
+        for (void* pp : {(void*) d_ptr, (void*) d_start, (void*) d_ng, (void*) d_dst, (void*) d_tok, (void*) d_x, d_q,
+                         (void*) d_out, d_scr}) cudaFree(pp);
+        double err = 0, mag = 0;
+        std::vector<float> xd(H), gg(FF), uu(FF), hh(FF), y(H);
+        for (int g = 0; g < G; ++g) {
+            const auto b = blobs[g].begin() + basalt::kernels::cpu::kMsMixHead;
+            const size_t up_off = FF * ms::ms_row_bytes(H, ks3[g][0]) + H;
+            const size_t down_off = up_off + FF * ms::ms_row_bytes(H, ks3[g][1]) + H;
+            const std::vector<uint8_t> pg(b, b + up_off), pu(b + up_off, b + down_off), pd(b + down_off, blobs[g].end());
+            for (int e = start[g]; e < start[g + 1]; ++e) {
+                for (int i = 0; i < H; ++i) {
+                    const uint8_t* qb8 = q.data() + ((size_t) tok[e] * (H / 32) + i / 32) * 36;
+                    uint16_t d16; std::memcpy(&d16, qb8, 2);
+                    xd[i] = ms::fp16_to_fp32(d16) * (float) (int8_t) qb8[4 + i % 32];
+                }
+                ref_gemv_k(ks3[g][0], pg, xd.data(), gg.data(), H, FF);
+                ref_gemv_k(ks3[g][1], pu, xd.data(), uu.data(), H, FF);
+                for (int i = 0; i < FF; ++i) hh[i] = (gg[i] / (1.f + std::exp(-gg[i]))) * uu[i];
+                ref_gemv_k(ks3[g][2], pd, hh.data(), y.data(), FF, H);
+                for (int i = 0; i < H; ++i) {
+                    err = std::max(err, (double) std::abs(got[(size_t) dst[e] * H + i] - y[i]));
+                    mag = std::max(mag, (double) std::abs(y[i]));
+                }
+            }
+        }
+        const double rel = err / std::max(mag, 1e-12);
+        std::printf("  MS per-proj grouped (4/2/5, 3/5/2)  max err %.2e of max |y| %.2e  (rel %.1e, tol 1e-04) %s\n",
+                    err, mag, rel, rel <= 1e-4 ? "ok" : "FAIL");
+        if (rel > 1e-4) ++g_fail;
+    }
     run_grouped({4, 4, 4, 4}, 7.f, 15);
     run_grouped({3, 2, 4, 3}, 0.f, 49);
     run_grouped({6, 2, 5, 3}, 7.f, 50);

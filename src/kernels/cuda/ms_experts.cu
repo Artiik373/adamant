@@ -32,15 +32,23 @@ __device__ __forceinline__ const int8_t* signs_of(const uint8_t* payload, int n_
 template <int K>
 __device__ __forceinline__ size_t gu_bytes() { return (size_t) 640 * mc::ms_row_bytes(2560, K) + 2560; }
 
-// f(K, blob) for one group's blob.  K > 0: the layer's K.  K == 0: a mixed layer, the K in the blob's head.
+__device__ __forceinline__ size_t gu_bytes_k(int k) { return (size_t) 640 * mc::ms_row_bytes(2560, k) + 2560; }
+
+// f(K, payload) for one projection (proj 0=gate, 1=up, 2=down) of a group's blob.
 template <int K, class F>
-__device__ __forceinline__ void with_k(unsigned long long ptr, F&& f) {
+__device__ __forceinline__ void with_proj(unsigned long long ptr, int proj, F&& f) {
     const uint8_t* b = reinterpret_cast<const uint8_t*>(ptr);
     if constexpr (K > 0) {
-        f(std::integral_constant<int, K>{}, b);
+        const size_t off = (size_t) proj * gu_bytes<K>();
+        f(std::integral_constant<int, K>{}, b + off);
     } else {
-        const uint8_t* p = b + basalt::kernels::cpu::kMsMixHead;
-        switch (__ldg(b)) {   // block-uniform
+        const int kg = __ldg(b);
+        const int ku = __ldg(b + 1) ? (int) __ldg(b + 1) : kg;
+        const int kd = __ldg(b + 2) ? (int) __ldg(b + 2) : kg;
+        const int kk = proj == 0 ? kg : proj == 1 ? ku : kd;
+        const size_t off = proj == 0 ? 0 : proj == 1 ? gu_bytes_k(kg) : gu_bytes_k(kg) + gu_bytes_k(ku);
+        const uint8_t* p = b + basalt::kernels::cpu::kMsMixHead + off;
+        switch (kk) {   // block-uniform
         case 2: f(std::integral_constant<int, 2>{}, p); break;
         case 3: f(std::integral_constant<int, 3>{}, p); break;
         case 4: f(std::integral_constant<int, 4>{}, p); break;
@@ -60,9 +68,9 @@ __global__ void __launch_bounds__(kThreads) ms_rotate_in_kernel(
     constexpr int N = 2560;
     const int ng = *n_groups;
     const int z = blockIdx.z;
-    for (int g = blockIdx.y; g < ng; g += gridDim.y) with_k<K>(grp_ptr[g], [&](auto kc, const uint8_t* b) {
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) with_proj<K>(grp_ptr[g], z, [&](auto kc, const uint8_t* p) {
         constexpr int KK = decltype(kc)::value;
-        const int8_t* sg = signs_of<KK, N>(b + (z ? gu_bytes<KK>() : 0), n_ff);
+        const int8_t* sg = signs_of<KK, N>(p, n_ff);
         for (int e = grp_start[g] + blockIdx.x; e < grp_start[g + 1]; e += gridDim.x)
             mc::ms_stage_q8_rotated(xr + ((size_t) e * 2 + z) * N, x + (size_t) ent_tok[e] * (N / 32), sg, N,
                                     mc::ms_hadamard_block(N));
@@ -77,9 +85,9 @@ __global__ void __launch_bounds__(kThreads) ms_swiglu_rot_kernel(
     float* __restrict__ h, float limit) {
     constexpr int N = 640, N_OUT = 2560;
     const int ng = *n_groups;
-    for (int g = blockIdx.y; g < ng; g += gridDim.y) with_k<K>(grp_ptr[g], [&](auto kc, const uint8_t* b) {
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) with_proj<K>(grp_ptr[g], 2, [&](auto kc, const uint8_t* p) {
         constexpr int KK = decltype(kc)::value;
-        const int8_t* sg = signs_of<KK, N>(b + 2 * gu_bytes<KK>(), N_OUT);
+        const int8_t* sg = signs_of<KK, N>(p, N_OUT);
         for (int e = grp_start[g] + blockIdx.x; e < grp_start[g + 1]; e += gridDim.x) {
             const float* ge = gate + (size_t) e * N;
             const float* ue = up + (size_t) e * N;
@@ -149,13 +157,12 @@ __global__ void __launch_bounds__(kThreads, STEPS <= 5 ? 4 : 3) ms_rows_kernel( 
     if (r >= n_out) return;
     float* __restrict__ out = blockIdx.z ? out1 : out0;
     const float rs = rsqrtf((float) mc::ms_hadamard_block(N_IN));
-    for (int g = blockIdx.y; g < ng; g += gridDim.y) with_k<KL>(grp_ptr[g], [&](auto kc, const uint8_t* b) {
+    const int proj = GU ? (blockIdx.z ? 1 : 0) : 2;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) with_proj<KL>(grp_ptr[g], proj, [&](auto kc, const uint8_t* p) {
         constexpr int K = decltype(kc)::value;
         constexpr int stride_words = (int) (((4 + ((N_IN - 1) * K + 7) / 8) + 3) & ~3) / 4;
         const int lane_bit = 4 * lane * K + 18, w_lane = lane_bit >> 5, b_lane = lane_bit & 31;
-        // gate, up: payload z; down: the third
-        const size_t off = GU ? (blockIdx.z ? gu_bytes<K>() : 0) : 2 * gu_bytes<K>();
-        const uint32_t* g32 = reinterpret_cast<const uint32_t*>(b + off) + (size_t) r * stride_words;
+        const uint32_t* g32 = reinterpret_cast<const uint32_t*>(p) + (size_t) r * stride_words;
         uint32_t wa[STEPS], wb[STEPS];
         #pragma unroll
         for (int st = 0; st < STEPS; ++st) {

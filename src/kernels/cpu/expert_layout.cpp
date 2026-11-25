@@ -183,10 +183,12 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
         }
         NativeFmt f;
         std::vector<uint64_t> eo;
-        std::vector<uint8_t> ekl;
-        if (basalt::ms_mix_type((uint32_t) gt)) {   // v9: one K an expert; the format is the widest K's, the slot its blob plus the head
+        std::vector<uint16_t> ekl;
+        if (basalt::ms_mix_type((uint32_t) gt)) {   // v9: per-expert or per-projection K; format is widest K's
             std::string ks;
-            if (L.version < 9 || dt != gt || ut != gt || !(ss >> ks) || (int64_t) ks.size() != L.n_expert) {
+            const bool per_proj = L.version >= 9 && dt == gt && ut == gt && (ss >> ks) &&
+                                  (int64_t) ks.size() == 3 * L.n_expert;
+            if (!per_proj && (L.version < 9 || dt != gt || ut != gt || (int64_t) ks.size() != L.n_expert)) {
                 err = "expert layout: a malformed mixed line: " + line.substr(0, 80);
                 return false;
             }
@@ -207,13 +209,16 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
             f.ms_mix = true;
             f.gu_type = f.d_type = f.up_type = (int) gt;
             f.bytes += kMsMixHead;
-            eo.resize(ks.size() + 1);
-            ekl.resize(ks.size());
-            for (size_t e = 0; e < ks.size(); ++e) {
+            eo.resize((size_t) L.n_expert + 1);
+            ekl.resize((size_t) L.n_expert);
+            for (size_t e = 0; e < (size_t) L.n_expert; ++e) {
+                const int kg = per_proj ? ks[3 * e] - '0' : ks[e] - '0';
+                const int ku = per_proj ? ks[3 * e + 1] - '0' : kg;
+                const int kd = per_proj ? ks[3 * e + 2] - '0' : kg;
                 NativeFmt g;
-                if (!native_fmt(120 + (ks[e] - '0'), 120 + (ks[e] - '0'), n_embd, n_ff, g, err, swiglu_limit)) return false;
+                if (!native_fmt(120 + kg, 120 + kd, n_embd, n_ff, g, err, swiglu_limit, 120 + ku)) return false;
                 eo[e + 1] = eo[e] + kMsMixHead + g.bytes;
-                ekl[e] = (uint8_t) (ks[e] - '0');
+                ekl[e] = ms_pack_k3(kg, ku, kd);
             }
         } else if (!native_fmt((int) gt, (int) dt, n_embd, n_ff, f, err, swiglu_limit, (int) ut)) {
             return false;
