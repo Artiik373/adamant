@@ -51,16 +51,27 @@ SPINE = {  # HF module -> GGUF tensor suffix
 }
 
 
+_PACK_SHIFTS: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
 def pack_rows(states: torch.Tensor, scales: torch.Tensor, k: int) -> bytes:
     """MS rows (ms_pack.py format): fp16 scale, uint16 start state, MSB-first k-bit symbols of states[:, 1:], zero pad."""
     rows, n = states.shape
     rb = ms_row_bytes(n, k)
+    key = (states.device, k)
+    shifts = _PACK_SHIFTS.get(key)
+    if shifts is None:
+        shifts = (
+            torch.arange(k - 1, -1, -1, device=states.device, dtype=torch.uint8),
+            torch.arange(7, -1, -1, device=states.device, dtype=torch.uint8),
+        )
+        _PACK_SHIFTS[key] = shifts
+    s_k, s_8 = shifts
     sym = (states[:, 1:] & ((1 << k) - 1)).to(torch.uint8)
-    bits = (sym.unsqueeze(-1) >> torch.arange(k - 1, -1, -1, device=sym.device, dtype=torch.uint8)) & 1
-    bits = bits.reshape(rows, -1)
+    bits = ((sym.unsqueeze(-1) >> s_k) & 1).reshape(rows, -1)
     nbytes = (bits.shape[1] + 7) // 8
     bits = torch.nn.functional.pad(bits, (0, nbytes * 8 - bits.shape[1])).reshape(rows, nbytes, 8)
-    packed = (bits << torch.arange(7, -1, -1, device=sym.device, dtype=torch.uint8)).sum(-1, dtype=torch.uint8)
+    packed = (bits << s_8).sum(-1, dtype=torch.uint8)
     out = torch.zeros(rows, rb, dtype=torch.uint8, device=sym.device)
     out[:, 0:2] = scales.to(torch.float16).view(torch.uint8).reshape(rows, 2)
     out[:, 2:4] = (states[:, 0] & ms.STATE_MASK).to(torch.int16).view(torch.uint8).reshape(rows, 2)
@@ -109,8 +120,9 @@ def _viterbi_with_scale_passes(w_rot: torch.Tensor, hu: torch.Tensor, h_rot: tor
 
 
 def code(ws: torch.Tensor, hs: torch.Tensor, k: int, lut, seeds, sign_trials: int | None = None,
-         scale_passes: int | None = None, viterbi: tuple[int, int] | None = None) -> list:
-    """Code E matrices [E, out, in] on Hessians [E, in, in]: (rows bytes, int8 signs, decoded W) per matrix."""
+         scale_passes: int | None = None, viterbi: tuple[int, int] | None = None,
+         return_deq: bool = True) -> list:
+    """Code E matrices [E, out, in] on Hessians [E, in, in]: (rows bytes, int8 signs, decoded W or None) per matrix."""
     blk = largest_pow2_divisor(int(ws.shape[2]), cap=512)
     trials = SIGN_TRIALS if sign_trials is None else sign_trials
     passes = SCALE_PASSES if scale_passes is None else scale_passes
@@ -128,7 +140,7 @@ def code(ws: torch.Tensor, hs: torch.Tensor, k: int, lut, seeds, sign_trials: in
     out = []
     for i, r in enumerate(rot):
         signs = r[2]
-        deq = ms.fwht_blocks(q[i], block_size=blk) * signs.unsqueeze(0)
+        deq = ms.fwht_blocks(q[i], block_size=blk) * signs.unsqueeze(0) if return_deq else None
         out.append((pack_rows(states[i], scales[i], k), signs.to(torch.int8).cpu().numpy(), deq))
     return out
 
@@ -230,12 +242,13 @@ def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0
                 is_cold[ei] = True
     k_triples = _norm_expert_ks(k, n_exp)
     files = {n: open(out_dir / f"blk.{l}.ffn_{n}_exps.ms", "wb") for n in ("gate", "up", "down")}
-    # experts per batch: the back-pointer buffer grows with the window
+    # experts per batch: the back-pointer buffer grows with the window; group widths over 32-expert chunks to avoid fragmentation
     eb = EXPERT_BATCH or max(1, 8 * 32 // VITERBI[0])
+    chunk_exp = min(n_exp, max(eb, 32))
     zero = 0
     try:
-        for e0 in range(0, n_exp, eb):
-            es = list(range(e0, min(e0 + eb, n_exp)))
+        for e0 in range(0, n_exp, chunk_exp):
+            es = list(range(e0, min(e0 + chunk_exp, n_exp)))
             w_gu_b = ex.gate_up_proj[es].to(dev).float()
             w_dn_b = ex.down_proj[es].to(dev).float()
             hs = [expert_hessians(x, idx, e, w_gu_b[i], wts, tau, h_all, x_ref, tok_w) for i, e in enumerate(es)]
@@ -248,32 +261,38 @@ def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0
                 for kk in same_ks:
                     sub = [i for i in range(len(es)) if is_cold[es[i]] == cold
                            and k_triples[es[i]][0] == kk and k_triples[es[i]][1] == kk]
-                    ids = [es[i] for i in sub]
-                    gu = code(w_gu_b[sub], torch.stack([hs[i][0] for i in sub]), kk, lut,
-                              [l * 4096 + 2 * e + 1 for e in ids], **kw)
                     rb_gu = ms_row_bytes(n_embd, kk) * n_ff
-                    for e, (rows, signs, _) in zip(ids, gu):
-                        got_g[e] = (rows[:rb_gu], signs)
-                        got_u[e] = (rows[rb_gu:], signs)
+                    for b0 in range(0, len(sub), eb):
+                        sub_b = sub[b0 : b0 + eb]
+                        ids = [es[i] for i in sub_b]
+                        gu = code(w_gu_b[sub_b], torch.stack([hs[i][0] for i in sub_b]), kk, lut,
+                                  [l * 4096 + 2 * e + 1 for e in ids], return_deq=False, **kw)
+                        for e, (rows, signs, _) in zip(ids, gu):
+                            got_g[e] = (rows[:rb_gu], signs)
+                            got_u[e] = (rows[rb_gu:], signs)
                 for proj_idx, sl_gu, got_p in ((0, slice(None, n_ff), got_g), (1, slice(n_ff, None), got_u)):
                     diff_ks = sorted({k_triples[es[i]][proj_idx] for i in range(len(es))
                                       if is_cold[es[i]] == cold and k_triples[es[i]][0] != k_triples[es[i]][1]})
                     for kk in diff_ks:
                         sub = [i for i in range(len(es)) if is_cold[es[i]] == cold
                                and k_triples[es[i]][0] != k_triples[es[i]][1] and k_triples[es[i]][proj_idx] == kk]
-                        ids = [es[i] for i in sub]
-                        res = code(w_gu_b[sub, sl_gu], torch.stack([hs[i][0] for i in sub]), kk, lut,
-                                   [l * 4096 + 2 * e + 1 + proj_idx * 2048 for e in ids], **kw)
-                        for e, (rows, signs, _) in zip(ids, res):
-                            got_p[e] = (rows, signs)
+                        for b0 in range(0, len(sub), eb):
+                            sub_b = sub[b0 : b0 + eb]
+                            ids = [es[i] for i in sub_b]
+                            res = code(w_gu_b[sub_b, sl_gu], torch.stack([hs[i][0] for i in sub_b]), kk, lut,
+                                       [l * 4096 + 2 * e + 1 + proj_idx * 2048 for e in ids], return_deq=False, **kw)
+                            for e, (rows, signs, _) in zip(ids, res):
+                                got_p[e] = (rows, signs)
                 dn_ks = sorted({k_triples[es[i]][2] for i in range(len(es)) if is_cold[es[i]] == cold})
                 for kk in dn_ks:
                     sub = [i for i in range(len(es)) if is_cold[es[i]] == cold and k_triples[es[i]][2] == kk]
-                    ids = [es[i] for i in sub]
-                    dn = code(w_dn_b[sub], torch.stack([hs[i][1] for i in sub]), kk, lut,
-                              [l * 4096 + 2 * e + 2 for e in ids], **kw)
-                    for e, (rows_d, signs_d, _) in zip(ids, dn):
-                        got_d[e] = (rows_d, signs_d)
+                    for b0 in range(0, len(sub), eb):
+                        sub_b = sub[b0 : b0 + eb]
+                        ids = [es[i] for i in sub_b]
+                        dn = code(w_dn_b[sub_b], torch.stack([hs[i][1] for i in sub_b]), kk, lut,
+                                  [l * 4096 + 2 * e + 2 for e in ids], return_deq=False, **kw)
+                        for e, (rows_d, signs_d, _) in zip(ids, dn):
+                            got_d[e] = (rows_d, signs_d)
             for e in es:   # in expert order
                 files["gate"].write(got_g[e][0] + got_g[e][1].tobytes())
                 files["up"].write(got_u[e][0] + got_u[e][1].tobytes())
@@ -606,6 +625,8 @@ def main() -> None:
     p.add_argument("--cold-commit", type=int, default=8, help="Viterbi commit length for cold experts")
     p.add_argument("--max-vram-gib", type=float, default=22.0,
                    help="hard per-process VRAM cap in GiB to prevent WDDM paging (0: off)")
+    p.add_argument("--save-every", type=int, default=8,
+                   help="write state.pt resume checkpoint every N layers (0: off)")
     args = p.parse_args()
     if args.reuse_layers and not args.reuse_from:
         p.error("--reuse-layers needs --reuse-from")
@@ -748,11 +769,16 @@ def main() -> None:
         t_fwd = time.time() - t0
 
         mods = dict(layer.named_modules())
+        spine_groups: dict[tuple[int, int], list] = {}
         for name in sorted(hess):
             gguf = f"blk.{l}.{SPINE[name]}"
             w, hh = to_gguf_order(gguf, mods[name].weight.float(), hess.pop(name) / counts[name])
-            rows, signs, _ = code(w.unsqueeze(0), hh.unsqueeze(0), args.spine_k, lut, [l * 4096 + 3000 + len(gguf)])[0]
-            write_record(out, gguf, args.spine_k, w.shape[1], w.shape[0], rows, signs)
+            spine_groups.setdefault((w.shape[0], w.shape[1]), []).append((gguf, w, hh, l * 4096 + 3000 + len(gguf)))
+        for (_, _), grp in spine_groups.items():
+            res = code(torch.stack([g[1] for g in grp]), torch.stack([g[2] for g in grp]), args.spine_k, lut,
+                       [g[3] for g in grp], return_deq=False)
+            for (gguf, w, _, _), (rows, signs, _) in zip(grp, res):
+                write_record(out, gguf, args.spine_k, w.shape[1], w.shape[0], rows, signs)
         t_spine = time.time() - t0 - t_fwd
 
         moe = layer.mlp
@@ -771,7 +797,8 @@ def main() -> None:
                            args.hess_tau, tok_w)
         del layer, moe, x, idx, wts
         torch.cuda.empty_cache()
-        torch.save({"next_layer": l + 1, "h": h}, state)
+        if args.save_every > 0 and ((l + 1) % args.save_every == 0 or (l == last and args.stop_after is not None)):
+            torch.save({"next_layer": l + 1, "h": h}, state)
         print(f"layer {l:2d} {cfg.layer_types[l]:>17}: experts {k_label(plan[l])} (zero-token {rec['zero_token_experts']}) | "
               f"fwd {t_fwd:.0f}s spine {t_spine:.0f}s experts {time.time() - t0 - t_fwd - t_spine:.0f}s "
               f"total {time.time() - t0:.0f}s", flush=True)
