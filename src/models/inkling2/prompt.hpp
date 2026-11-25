@@ -36,6 +36,6 @@ public:
 std::unique_ptr<PromptRunner> make_prompt(InklingModel& m, void* stream, std::string& err);
 
 /// The device bytes of the prompt path (one for every session).
-uint64_t prompt_bytes(const Geometry& g);
+uint64_t prompt_bytes(const Geometry& g, bool loopcd);
 
 }  // namespace basalt::models::inkling2

@@ -61,6 +61,9 @@ struct CommonOptions {
     /// --diag-split-at N: diagnostic, a model split across two cards at layer N whatever the start would pick (0: off)
     int diag_rows = 0;
     int diag_split_at = 0;
+    /// --loopcd MODE:W: LoopCD for a looped model (0 off, 1 hidden, 2 logits, 3 adaptive logits) and its strength W
+    int loopcd = 0;
+    float loopcd_w = 0;
     /// The engine's expert profile for the model (--expert-profile, else data/profiles/<key>.prof, cli::profile_key),
     /// or the --expert-profile-save file a start places from; empty means none.  A profile decides residency by routing
     /// frequency instead of by first use.

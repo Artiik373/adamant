@@ -281,4 +281,11 @@ void moe_finish(const MoeFinish& a, int rows, void* stream);
 /// x = cap * tanh(x / cap) over rows of n values (row stride ld).
 void softcap(float* x, int rows, int n, int64_t ld, float cap, void* stream);
 
+/// LoopCD over n values of two pairs: a += omega * (a - fa), b += omega * (b - fb).
+void loopcd(float* a, const float* fa, float* b, const float* fb, int64_t n, float omega, void* stream);
+
+/// LoopCD-Logits over rows of n logits (row stride ld): z += w * (z - z1); adaptive: w scaled by 1 - (p1 - p2), the margin of
+/// the two largest probabilities of softmax(z).
+void loopcd_logits(float* z, const float* z1, int rows, int n, int64_t ld, float w, bool adaptive, void* stream);
+
 }  // namespace basalt::models::inkling2

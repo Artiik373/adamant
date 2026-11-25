@@ -81,6 +81,7 @@ struct Scratch {
     uint32_t* pf_sink_ = nullptr;               // the prefetch's keep-alive word
     float* lp_ = nullptr;                       // the log probabilities' scratch
     float* blog_ = nullptr;                     // a batch window's logits, every row, before each session takes its own
+    float* wlog_ = nullptr;                     // LoopCD-Logits: the weak coda's logits
     int32_t *io_d_ = nullptr, *tok_d_ = nullptr, *pos_d_ = nullptr;   // a call's tokens, then its positions
     static constexpr int kGuessExperts = 8;     // the experts a window's guess requests a visit (rows x kGuessExperts / rows)
     static constexpr int kGuessRows = 2;        // the widest window guessed (wider ones keep the read-ahead)
@@ -146,7 +147,7 @@ struct Shared {
         const int64_t E = g.n_embd, R = kMaxRows;
         const int64_t ctx = m.context();
         // the row buffers of one call, by their roles in the walk
-        for (float*& b : x.role_) b = f(R * E);
+        for (int i = 0; i < (m.flags().loopcd > 0 ? kBufs : (int) Buf::F12); ++i) x.role_[i] = f(R * E);
         x.emb_ = f(R * E);
         x.mix_ = f(3 * R * E);
         x.msg_ = f((int64_t) (g.loop_end - g.loop_start) * kStreams * R * E);
@@ -174,6 +175,7 @@ struct Shared {
         x.pf_sink_ = (uint32_t*) alloc(4);
         x.lp_ = f((int64_t) bk::row_logprobs_scratch_floats(kMaxRows, g.n_vocab) + R * (bk::kLogprobStride + 1));
         x.blog_ = f(R * (int64_t) g.n_vocab);
+        if (m.flags().loopcd >= 2) x.wlog_ = f(R * (int64_t) g.n_vocab);
         x.io_d_ = (int32_t*) alloc((size_t) 2 * R * 4);
         x.tok_d_ = x.io_d_;
         x.pos_d_ = x.io_d_ + R;
@@ -253,7 +255,7 @@ public:
             err = "cannot create a stream";
             return false;
         }
-        if (!walk(g_, walk_, err)) return false;
+        if (!walk(g_, walk_, err, m_.flags().loopcd == 1)) return false;
         {   // the runs of visits on each card (one run, the whole walk, on one card)
             std::vector<int> card_of((size_t) g_.n_layers);
             for (int l = 0; l < g_.n_layers; ++l) card_of[(size_t) l] = m_.card_of(l);
@@ -1157,6 +1159,11 @@ private:
             for (size_t si = sg.s0; si < sg.s1; ++si) {
                 const Step& s = walk_.steps[si];
                 const Visit& v = g_.visits[(size_t) s.visit];
+                if (s.keep_first) {   // LoopCD: the first pass's pair, kept
+                    cudaMemcpyAsync(kb(Buf::F12), kb(s.bank[0]), RE * 4, cudaMemcpyDeviceToDevice, k.stream);
+                    cudaMemcpyAsync(kb(Buf::FOut), kb(s.bank[1]), RE * 4, cudaMemcpyDeviceToDevice, k.stream);
+                }
+                if (s.loopcd) loopcd(kb(s.cd[0]), kb(Buf::F12), kb(s.cd[1]), kb(Buf::FOut), (int64_t) RE, m_.flags().loopcd_w, k.stream);
                 const float* msgs = nullptr;
                 if (s.msgs) {
                     const int core = g_.loop_end - g_.loop_start;
@@ -1181,7 +1188,7 @@ private:
                 float* tap = nullptr;
                 if (si + 1 < sg.s1 && sg.card == 0) {
                     const Step& nx = walk_.steps[si + 1];
-                    if (int t = dspark_.slot_of_visit(nx.visit); t >= 0 && nx.hid == s.out) tap = dspark_.tap(t);
+                    if (int t = dspark_.slot_of_visit(nx.visit); t >= 0 && nx.hid == s.out && !nx.loopcd) tap = dspark_.tap(t);
                 }
                 tapped_in = tap != nullptr;
                 run_layer(v, kb(s.hid), blocks, s.n_blocks, msgs, rows, full_keys, kb(s.out), tap);
@@ -1212,6 +1219,21 @@ private:
         bk::native_q8_0_mmvq(m_.head(), (const uint8_t*) xq_[0] + (size_t) (rows - head - first) * q8_row, lg, E, g_.n_vocab, head,
                              stream_);
         softcap(lg, head, g_.n_vocab, g_.n_vocab, g_.logit_softcap, stream_);
+        if (walk_.weak) {   // LoopCD-Logits: the weak coda's logits of the same rows, then z += w * (z - z1)
+            MixNorm wn;
+            const size_t w0 = (size_t) (rows - head) * E;
+            for (int i = 0; i < walk_.n_weak_blocks; ++i) wn.st.s[wn.st.n++] = buf(walk_.weak_blocks[i]) + w0;
+            wn.st.s[wn.st.n++] = buf(walk_.weak_final) + w0;
+            wn.queries = m_.output_query();
+            wn.norm[0] = m_.output_norm();
+            wn.q8[0] = xq_[0];
+            wn.norm_out = fin_;
+            wn.eps = g_.rms_eps;
+            mix_norm(wn, 1, head, stream_);
+            bk::native_q8_0_mmvq(m_.head(), (const uint8_t*) xq_[0], wlog_, E, g_.n_vocab, head, stream_);
+            softcap(wlog_, head, g_.n_vocab, g_.n_vocab, g_.logit_softcap, stream_);
+            loopcd_logits(lg, wlog_, head, g_.n_vocab, g_.n_vocab, m_.flags().loopcd_w, m_.flags().loopcd == 3, stream_);
+        }
     }
 
     bool check(std::string& err) {

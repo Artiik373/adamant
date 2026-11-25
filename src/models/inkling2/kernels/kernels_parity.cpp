@@ -593,6 +593,49 @@ void test_softcap() {
     report("softcap", got, ref, 2e-6);
 }
 
+void test_loopcd() {   // a decode window's two pairs at the real width
+    const size_t n = 8 * (size_t) kWidth;
+    std::vector<float> a = randn(n, 2.f), fa = randn(n, 2.f), b = randn(n, 2.f), fb = randn(n, 2.f);
+    float *da = dev(a), *dfa = dev(fa), *db = dev(b), *dfb = dev(fb);
+    loopcd(da, dfa, db, dfb, (int64_t) n, 0.3f, nullptr);
+    const std::vector<float> ga = host(da, n), gb = host(db, n);
+    std::vector<double> ra(n), rb(n);
+    for (size_t i = 0; i < n; ++i) {
+        ra[i] = a[i] + 0.3 * ((double) a[i] - fa[i]);
+        rb[i] = b[i] + 0.3 * ((double) b[i] - fb[i]);
+    }
+    report("loopcd (block input)", ga, ra, 2e-6);
+    report("loopcd (output)", gb, rb, 2e-6);
+}
+
+void test_loopcd_logits() {   // a decode window's head rows over a vocabulary-sized row, fixed and adaptive strength
+    const int rows = 8, n = 201088;
+    for (int adaptive = 0; adaptive < 2; ++adaptive) {
+        std::vector<float> z = randn((size_t) rows * n, 4.f), z1 = randn((size_t) rows * n, 4.f);
+        z[3] = 30.f;   // a confident row: a wide top-two margin
+        z[(size_t) n + 7] = 12.f, z[(size_t) n + 9] = 12.f;   // a tie at the top: the full strength
+        float *dz = dev(z), *dz1 = dev(z1);
+        loopcd_logits(dz, dz1, rows, n, n, 0.5f, adaptive != 0, nullptr);
+        const std::vector<float> got = host(dz, z.size());
+        std::vector<double> ref(z.size());
+        for (int r = 0; r < rows; ++r) {
+            const float* zr = z.data() + (size_t) r * n;
+            double w = 0.5;
+            if (adaptive) {
+                double m1 = -1e300, m2 = -1e300, sum = 0;
+                for (int i = 0; i < n; ++i) {
+                    if (zr[i] > m1) m2 = m1, m1 = zr[i];
+                    else if (zr[i] > m2) m2 = zr[i];
+                }
+                for (int i = 0; i < n; ++i) sum += std::exp((double) zr[i] - m1);
+                w *= 1.0 - (1.0 / sum - std::exp(m2 - m1) / sum);
+            }
+            for (int i = 0; i < n; ++i) ref[(size_t) r * n + i] = zr[i] + w * ((double) zr[i] - z1[(size_t) r * n + i]);
+        }
+        report(adaptive ? "loopcd logits (adaptive)" : "loopcd logits (fixed)", got, ref, 1e-4);
+    }
+}
+
 // ---- a decode window's fused glue ---------------------------------------------------------------------------------------
 
 void test_mix_norm() {
@@ -1263,6 +1306,8 @@ int main() {
     test_post_conv();
     test_experts();
     test_softcap();
+    test_loopcd();
+    test_loopcd_logits();
     test_mix_norm();
     test_controllers();
     test_decode_prepare();

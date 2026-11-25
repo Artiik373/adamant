@@ -26,8 +26,12 @@ enum class Buf : uint8_t {
     I18,      ///< the coda's input (the last pass's output), a finished block
     H0,       ///< every other layer's output, alternately
     H1,
+    F12,      ///< LoopCD: the first pass's input of the loop's second block, kept
+    FOut,     ///< LoopCD: the first pass's output, kept
+    W0,       ///< LoopCD-Logits: the weak coda's outputs, alternately
+    W1,
 };
-constexpr int kBufs = 8;
+constexpr int kBufs = 12;
 
 struct Step {
     int visit = 0;               ///< index into Geometry::visits
@@ -37,6 +41,9 @@ struct Step {
     Buf blocks[kMaxMix] = {};
     bool msgs = false;           ///< a later pass of the loop: its inputs take messages mixed from the bank
     Buf bank[2] = {};            ///< the previous pass's input of the loop's second block, and its output
+    bool keep_first = false;     ///< LoopCD: before it, bank[0] and bank[1] (the first pass's pair) go to F12 and FOut
+    bool loopcd = false;         ///< LoopCD: before it, cd[i] += omega * (cd[i] - {F12, FOut}[i])
+    Buf cd[2] = {};              ///< the last pass's input of the loop's second block, and its output (the coda's input)
 };
 
 struct Walk {
@@ -44,6 +51,10 @@ struct Walk {
     Buf final_hid = Buf::H0;     ///< the last layer's output: the head mixes it with the finished blocks
     int n_blocks = 0;
     Buf blocks[kMaxMix] = {};
+    bool weak = false;           ///< LoopCD-Logits: the walk ends with the weak coda; its head reads these
+    Buf weak_final = Buf::W0;
+    int n_weak_blocks = 0;
+    Buf weak_blocks[kMaxMix] = {};
 };
 
 /// A run of steps on one card of a layer split, and the row buffers it pulls from the card before it first.
@@ -63,7 +74,9 @@ std::vector<Segment> split_walk(const Geometry& g, const Walk& w, const std::vec
 int split_handoffs(const Geometry& g, int cut);
 
 /// The walk of one forward over `g`'s visits. False with `err` for a layout it does not cover: it takes a prelude of one
-/// block, a loop of two blocks and a coda of one block (Inkling 2 Mini's 6 + 12 x passes + 6 layers).
-bool walk(const Geometry& g, Walk& w, std::string& err);
+/// block, a loop of two blocks and a coda of one block (Inkling 2 Mini's 6 + 12 x passes + 6 layers). `hidden` (LoopCD-Hidden)
+/// marks the steps that keep the first pass's pair and extrapolate the last pass's pair from it before the coda (two passes or
+/// more). Weak visits in `g` (add_weak_coda, LoopCD-Logits) run the coda again from the first pass's pair, kept the same way.
+bool walk(const Geometry& g, Walk& w, std::string& err, bool hidden = false);
 
 }  // namespace basalt::models::inkling2

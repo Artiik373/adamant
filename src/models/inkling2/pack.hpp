@@ -12,9 +12,11 @@
 
 namespace basalt::models::inkling2 {
 
-/// One application of a layer: the layer, its loop pass (0 outside the loop), and its own cache slot.
+/// One application of a layer: the layer, its loop pass (0 outside the loop), and its own cache slot. A weak visit is
+/// LoopCD-Logits' second coda, run on the loop's first pass.
 struct Visit {
     int layer = 0, pass = 0, slot = 0;
+    bool weak = false;
 };
 
 struct Geometry {
@@ -31,6 +33,12 @@ struct Geometry {
     std::vector<Visit> visits;       ///< the layer applications of one token, in order
     bool looped(int layer) const { return layer >= loop_start && layer < loop_end; }
     bool boundary(int layer) const { return layer % block == 0; }
+    /// the visits before the weak coda (all of them without LoopCD-Logits)
+    int strong_visits() const {
+        int n = 0;
+        for (const Visit& v : visits) n += !v.weak;
+        return n;
+    }
 };
 
 /// The DSpark drafter's settings (`inkling2.dspark.*`), present when the pack carries it.
@@ -75,6 +83,9 @@ struct Pack {
 /// coda; the first pass and the layers outside the loop take slots 0 .. layers - 1, each later pass of a core layer one
 /// slot after them.
 std::vector<Visit> loop_visits(int layers, int start, int end, int passes);
+
+/// LoopCD-Logits: the coda's layers once more, weak, after the visits, each with a slot of its own.
+void add_weak_coda(Geometry& g);
 
 /// Opens the pack and fills `p`. False with `err` when it is not an Inkling 2 pack, is malformed or has a layout this
 /// engine does not run.

@@ -136,10 +136,10 @@ model::Result dspark_plan(const Pack& pack, core::LoadPlan& reads, int file, int
         return fail("a DSpark layout this engine does not run (3 layers of 24 query and 8 key/value heads of 128, a block of 8, "
                     "a rank-256 Markov head, 4 target features)");
     for (int k = 0; k + 1 < kDsTargets; ++k)
-        if (d.targets[(size_t) k] < 0 || d.targets[(size_t) k] >= (int) g.visits.size() ||
+        if (d.targets[(size_t) k] < 0 || d.targets[(size_t) k] >= g.strong_visits() ||
             (k > 0 && d.targets[(size_t) k] <= d.targets[(size_t) k - 1]))
             return fail("its target visits are not in order within the target's visits");
-    if (d.targets.back() != (int) g.visits.size()) return fail("its last target is not the target's final normed state");
+    if (d.targets.back() != g.strong_visits()) return fail("its last target is not the target's final normed state");
 
     auto w = std::make_unique<DsparkWeights>();
     w->geo = d;

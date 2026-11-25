@@ -110,6 +110,8 @@ struct LoadRequest {
     std::vector<double> card_gbps;    ///< memory bandwidth of the main card, then of each peer device (GB/s, 0: unknown)
     int diag_rows = 0;                ///< diagnostic: rows of one forward call of a prompt (0: the model's own chunk)
     int diag_split_at = 0;            ///< diagnostic: a model's layers split at this one across two cards (0: off)
+    int loopcd = 0;                   ///< LoopCD for a looped model: 0 off, 1 hidden, 2 logits, 3 adaptive logits
+    float loopcd_w = 0;               ///< its strength (adaptive: the most)
 };
 
 struct DecodeRequest {

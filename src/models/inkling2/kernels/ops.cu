@@ -7,6 +7,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -561,6 +562,76 @@ __global__ void softcap_kernel(float* __restrict__ x, int n, int64_t ld, float c
     }
 }
 
+__global__ void loopcd_kernel(float* __restrict__ a, const float* __restrict__ fa, float* __restrict__ b,
+                              const float* __restrict__ fb, int64_t n, float omega) {
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
+        const float x = a[i], y = b[i];
+        a[i] = x + omega * (x - fa[i]);
+        b[i] = y + omega * (y - fb[i]);
+    }
+}
+
+// One row a block: z += w * (z - z1). Adaptive: w = w_max * (1 - (p1 - p2)), p1 and p2 the two largest of softmax(z).
+__global__ void __launch_bounds__(1024) loopcd_logits_kernel(float* __restrict__ z, const float* __restrict__ z1, int n,
+                                                              int64_t ld, float w, bool adaptive) {
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
+    float* zr = z + (size_t) blockIdx.x * ld;
+    const float* wr = z1 + (size_t) blockIdx.x * ld;
+    if (adaptive) {
+        __shared__ float sa[32], sb[32], ss[32];
+        __shared__ float m1s, m2s;
+        float a = -INFINITY, b = -INFINITY;   // the thread's two largest
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            const float x = zr[i];
+            if (x > a) {
+                b = a;
+                a = x;
+            } else if (x > b) {
+                b = x;
+            }
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            const float oa = __shfl_xor_sync(0xffffffffu, a, o), ob = __shfl_xor_sync(0xffffffffu, b, o);
+            const float hi = fmaxf(a, oa), lo = fmaxf(fminf(a, oa), fmaxf(b, ob));
+            a = hi;
+            b = lo;
+        }
+        const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = (blockDim.x + 31) >> 5;
+        if (lane == 0) sa[wid] = a, sb[wid] = b;
+        __syncthreads();
+        if (wid == 0) {
+            a = lane < nw ? sa[lane] : -INFINITY;
+            b = lane < nw ? sb[lane] : -INFINITY;
+            for (int o = 16; o > 0; o >>= 1) {
+                const float oa = __shfl_xor_sync(0xffffffffu, a, o), ob = __shfl_xor_sync(0xffffffffu, b, o);
+                const float hi = fmaxf(a, oa), lo = fmaxf(fminf(a, oa), fmaxf(b, ob));
+                a = hi;
+                b = lo;
+            }
+            if (lane == 0) m1s = a, m2s = b;
+        }
+        __syncthreads();
+        const float m1 = m1s;
+        float t = 0.f;
+        for (int i = threadIdx.x; i < n; i += blockDim.x) t += __expf(zr[i] - m1);
+        for (int o = 16; o > 0; o >>= 1) t += __shfl_xor_sync(0xffffffffu, t, o);
+        if (lane == 0) ss[wid] = t;
+        __syncthreads();
+        float sum = 0.f;
+        for (int i = 0; i < nw; ++i) sum += ss[i];
+        const float p1 = 1.f / sum, p2 = __expf(m2s - m1) / sum;
+        w *= 1.f - (p1 - p2);
+        __syncthreads();   // every thread has read the row before it changes
+    }
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float x = zr[i];
+        zr[i] = x + w * (x - wr[i]);
+    }
+}
+
 }  // namespace
 
 void attnres_mix(const MixStates& st, const float* queries, int n_q, int rows, float eps, float* out, int64_t out_stride,
@@ -661,6 +732,19 @@ void softcap(float* x, int rows, int n, int64_t ld, float cap, void* stream) {
     if (rows <= 0 || n <= 0) return;
     bk::launch_pdl(softcap_kernel, dim3(256, (unsigned) rows), dim3(256), 0, (cudaStream_t) stream, x, n, ld, cap);
     check("softcap");
+}
+
+void loopcd(float* a, const float* fa, float* b, const float* fb, int64_t n, float omega, void* stream) {
+    if (n <= 0) return;
+    const unsigned blocks = (unsigned) std::min<int64_t>((n + 255) / 256, 1024);
+    bk::launch_pdl(loopcd_kernel, dim3(blocks), dim3(256), 0, (cudaStream_t) stream, a, fa, b, fb, n, omega);
+    check("loopcd");
+}
+
+void loopcd_logits(float* z, const float* z1, int rows, int n, int64_t ld, float w, bool adaptive, void* stream) {
+    if (rows <= 0 || n <= 0) return;
+    bk::launch_pdl(loopcd_logits_kernel, dim3((unsigned) rows), dim3(1024), 0, (cudaStream_t) stream, z, z1, n, ld, w, adaptive);
+    check("loopcd_logits");
 }
 
 }  // namespace basalt::models::inkling2

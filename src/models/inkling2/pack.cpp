@@ -1,6 +1,7 @@
 // src/models/inkling2/pack.cpp - reads the Inkling 2 pack's meta section.
 #include "models/inkling2/pack.hpp"
 
+#include <algorithm>
 #include <sstream>
 
 namespace basalt::models::inkling2 {
@@ -33,6 +34,12 @@ std::vector<Visit> loop_visits(int layers, int start, int end, int passes) {
         for (int l = start; l < end; ++l) v.push_back({l, p, p == 0 ? l : layers + (p - 1) * (end - start) + (l - start)});
     for (int l = end; l < layers; ++l) v.push_back({l, 0, l});
     return v;
+}
+
+void add_weak_coda(Geometry& g) {
+    int slot = 0;
+    for (const Visit& v : g.visits) slot = std::max(slot, v.slot + 1);
+    for (int l = g.loop_end; l < g.n_layers; ++l) g.visits.push_back({l, 0, slot++, true});
 }
 
 bool open_pack(const std::string& path, Pack& p, std::string& err) {

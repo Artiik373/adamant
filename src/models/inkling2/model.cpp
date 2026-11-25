@@ -90,8 +90,8 @@ uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, int cut, in
     return caches + kSessionFixed + (uint64_t) kDecodeRows * (uint64_t) g.n_vocab * 4;
 }
 
-uint64_t shared_bytes(const Geometry& g, bool drafter) {
-    return kSharedFixed + prompt_bytes(g) + (drafter ? dspark_tap_bytes(std::max(kDecodeRows, kPromptChunk)) : 0);   // PROMPT, DSPARK HOOKS
+uint64_t shared_bytes(const Geometry& g, bool drafter, bool loopcd) {
+    return kSharedFixed + prompt_bytes(g, loopcd) + (drafter ? dspark_tap_bytes(std::max(kDecodeRows, kPromptChunk)) : 0);   // PROMPT, DSPARK HOOKS
 }
 
 InklingModel::InklingModel() = default;
@@ -167,6 +167,13 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
     std::string err;
     const std::string& path = req.paths.front();
     if (!open_pack(path, pack_, err)) return {model::Status::Error, "inkling2: " + err};
+    if (req.loopcd >= 2) {   // LoopCD-Logits: the coda once more on the first pass
+        if (pack_.geo.loop_passes < 2) return {model::Status::Error, "inkling2: --loopcd logits takes a loop of two passes or more"};
+        add_weak_coda(pack_.geo);
+    }
+    if (req.loopcd > 0)
+        basalt::log::info("basalt inkling2", "loopcd: %s, w %.2f, reference pass 1 of %d", req.loopcd == 1 ? "hidden" : req.loopcd == 2 ? "logits" : "adaptive logits",
+                          req.loopcd_w, pack_.geo.loop_passes);
     flags_ = req;
     cudaGetDevice(&device_);
     ldev_ = device_;
@@ -371,7 +378,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
             return session_bytes(g, c, fp8_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
         };
-        const uint64_t shared = shared_bytes(g, dspark_ != nullptr);
+        const uint64_t shared = shared_bytes(g, dspark_ != nullptr, req.loopcd > 0);
         if (cut_ > 0) {   // the layer split: each card holds its layers' experts (no spill), checked once they are placed
             if (req.expert_cache > 0) return fail("--expert-cache takes one card; the layer split keeps every expert on its card");
             if (model::Result r = load_experts(reads, file, experts); !r.ok()) return r;
@@ -381,7 +388,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                 cudaMemGetInfo(&fb, &tb);
                 const uint64_t need = (session_bytes(g, want, fp8_, cut_, c) +
                                        (c == 0 && dspark_ ? dspark_session_bytes(pack_, want) : 0)) * n_sess +
-                                      (c == 0 ? shared + spare : shared_bytes(g, false) + kCardSpare);
+                                      (c == 0 ? shared + spare : shared_bytes(g, false, req.loopcd > 0) + kCardSpare);
                 if (need > fb) {
                     cudaSetDevice(device_);
                     return fail("the layer split at layer " + std::to_string(cut_) + ": card " + std::to_string(card_device(c)) +
@@ -647,8 +654,8 @@ model::Result InklingModel::plan_cards(const model::LoadRequest& req) {
     }
     for (int c = 0; c <= g.n_layers; ++c) mm.split_handoffs.push_back(split_handoffs(g, c));
     mm.blob_bytes = experts / (uint64_t) mm.pairs;
-    mm.peer_overhead = kCardSpare + shared_bytes(g, false);
-    mm.main_overhead = kCardSpare + shared_bytes(g, req.spec >= 2) + dense + session_bytes(g, want, req.kv == "fp8") * n_sess +
+    mm.peer_overhead = kCardSpare + shared_bytes(g, false, req.loopcd > 0);
+    mm.main_overhead = kCardSpare + shared_bytes(g, req.spec >= 2, req.loopcd > 0) + dense + session_bytes(g, want, req.kv == "fp8") * n_sess +
                        (1000ull << 20);   // the drafter, as multi_gpu_plan counts it on the first card
     const program::MgPlan mp = program::plan_multi_gpu(cards, mm);
     basalt::log::info("basalt inkling2", "%s", mp.line.c_str());

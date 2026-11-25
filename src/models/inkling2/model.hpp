@@ -200,6 +200,6 @@ std::unique_ptr<model::ModelSession> make_session(InklingModel& model, std::stri
 uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, int cut = 0, int card = 0);
 /// The device bytes every session shares once on a card: the forward's scratch, the prompt path, the drafter's tap (the
 /// first card's).
-uint64_t shared_bytes(const Geometry& g, bool drafter);
+uint64_t shared_bytes(const Geometry& g, bool drafter, bool loopcd);
 
 }  // namespace basalt::models::inkling2

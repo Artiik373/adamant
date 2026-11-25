@@ -87,3 +87,20 @@ RAM (a Ryzen 9 9950X, AVX-512).
 The DSpark drafter only proposes; the target checks every draft, and a decode row rounds the same in any window. Greedy output
 with drafting equals plain greedy output (prose, struct and conversation, after short and 16K-token prompts, and a
 2,405-token prompt checked).
+
+## LoopCD
+
+`--loopcd MODE:W` (off by default) is LoopCD from arXiv 2610.02185. It changes the output distribution on purpose. The weak
+reference is the first loop pass. The strong state is the last pass.
+
+- `hidden:W` (paper Eq. 2): before the coda, the last pass's pair becomes `last + W * (last - first)`. Inkling 2 hands a pass
+  on as a pair (the input of the second block and the output, the bank that the next pass reads), so both members are
+  extrapolated. The coda and the head run once.
+- `logits:W` (Eq. 3): a second, weak coda runs on the first pass's pair. It has its own six visits and KV caches, and its
+  own head. The logits become `z + W * (z - z1)`. Both are after the softcap. The difference from the log-softmax form is a
+  constant for each row.
+- `adaptive:WMAX` (Eq. 4): the same, with `W = WMAX * (1 - (p1 - p2))`. Here p1 and p2 are the two largest probabilities of
+  the strong softmax.
+
+The arithmetic is FP32 in the decode path. The prompt path fills the weak coda's caches and runs no head. Off, the walk, the
+buffers, the caches and the output do not change. The quality against the BF16 reference is not measured with LoopCD on.

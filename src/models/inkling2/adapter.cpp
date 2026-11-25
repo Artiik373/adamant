@@ -60,10 +60,22 @@ public:
             o.diag_split_at = std::atoi(args.next("--diag-split-at"));
             return true;
         }
+        if (a == "--loopcd") {   // LoopCD (arXiv 2610.02185): hidden:W, logits:W or adaptive:WMAX
+            const std::string v = args.next("--loopcd");
+            const size_t c = v.find(':');
+            const std::string m = v.substr(0, c);
+            o.loopcd = m == "hidden" ? 1 : m == "logits" ? 2 : m == "adaptive" ? 3 : -1;
+            o.loopcd_w = c == std::string::npos ? -1.f : (float) std::atof(v.c_str() + c + 1);
+            return true;
+        }
         return dspark_parse_flag(a, args, o);   // DSPARK HOOK
     }
 
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
+        if (o.loopcd < 0 || (o.loopcd > 0 && !(o.loopcd_w > 0 && o.loopcd_w <= 4))) {
+            basalt::log::error("basalt inkling2", "--loopcd: hidden:W, logits:W or adaptive:WMAX, W in (0, 4]");
+            return 2;
+        }
         if (!o.kv.empty() && o.kv != "fp16" && o.kv != "fp8") {
             basalt::log::error("basalt inkling2", "--kv %s: the attention caches are fp16 (the default) or fp8", o.kv.c_str());
             return 2;

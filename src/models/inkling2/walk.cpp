@@ -5,23 +5,44 @@
 
 namespace basalt::models::inkling2 {
 
-bool walk(const Geometry& g, Walk& w, std::string& err) {
+bool walk(const Geometry& g, Walk& w, std::string& err, bool hidden) {
     if (g.block <= 0 || g.loop_start != g.block || g.loop_end - g.loop_start != 2 * g.block ||
         g.n_layers - g.loop_end != g.block || g.loop_passes < 1) {
         err = "the forward takes a prelude of one block, a loop of two blocks and a coda of one block";
         return false;
     }
     w = Walk{};
-    std::vector<Buf> blocks, pre_blocks;
+    w.weak = g.strong_visits() < (int) g.visits.size();
+    if (w.weak && g.loop_passes < 2) {
+        err = "LoopCD-Logits takes a loop of two passes or more";
+        return false;
+    }
+    const bool keep = (hidden || w.weak) && g.loop_passes > 1;
+    std::vector<Buf> blocks, pre_blocks, coda_blocks;
     Buf hid = Buf::X0;
     const auto mid = [](int pass) { return pass % 2 ? Buf::I12b : Buf::I12a; };
+    // the head's input of a coda: its last output and the finished blocks
+    const auto finish = [&](Buf& fin, int& n, Buf* out) {
+        if (blocks.size() + 1 > (size_t) kMaxMix) return false;
+        fin = hid;
+        n = (int) blocks.size();
+        std::copy(blocks.begin(), blocks.end(), out);
+        return true;
+    };
     for (size_t i = 0; i < g.visits.size(); ++i) {
         const Visit& v = g.visits[i];
         const int l = v.layer;
+        if (v.weak && !g.visits[i - 1].weak) {   // the weak coda: the strong one's blocks, the first pass's pair for the last
+            if (!finish(w.final_hid, w.n_blocks, w.blocks)) break;
+            blocks = coda_blocks;
+            blocks.back() = Buf::F12;
+            hid = Buf::FOut;
+        }
         if (l == g.loop_start) {
             if (v.pass == 0) pre_blocks = blocks;   // every pass starts from the blocks the prelude finished
             else blocks = pre_blocks;
         }
+        if (!v.weak && l == g.loop_end) coda_blocks = blocks;
         Step s;
         s.visit = (int) i;
         s.hid = hid;
@@ -31,10 +52,17 @@ bool walk(const Geometry& g, Walk& w, std::string& err) {
             s.msgs = true;
             s.bank[0] = mid(v.pass - 1);
             s.bank[1] = Buf::BankOut;
+            s.keep_first = keep && v.pass == 1 && l == g.loop_start;
+        }
+        if (hidden && g.loop_passes > 1 && !v.weak && l == g.loop_end && hid == Buf::I18) {
+            s.loopcd = true;
+            s.cd[0] = mid(g.loop_passes - 1);
+            s.cd[1] = Buf::I18;
         }
         // the output goes where the next visit keeps it
-        const Visit* nx = i + 1 < g.visits.size() ? &g.visits[i + 1] : nullptr;
-        if (nx && nx->layer == g.loop_start) s.out = nx->pass == 0 ? Buf::Pre : Buf::BankOut;
+        const Visit* nx = i + 1 < g.visits.size() && g.visits[i + 1].weak == v.weak ? &g.visits[i + 1] : nullptr;
+        if (v.weak) s.out = hid == Buf::W0 ? Buf::W1 : Buf::W0;
+        else if (nx && nx->layer == g.loop_start) s.out = nx->pass == 0 ? Buf::Pre : Buf::BankOut;
         else if (nx && nx->layer == g.loop_start + g.block) s.out = mid(nx->pass);
         else if (nx && nx->layer == g.loop_end) s.out = Buf::I18;
         else s.out = hid == Buf::H0 ? Buf::H1 : Buf::H0;
@@ -43,13 +71,11 @@ bool walk(const Geometry& g, Walk& w, std::string& err) {
         // a later pass reads the prelude's output again, not the previous pass's
         hid = nx && nx->layer == g.loop_start ? Buf::Pre : s.out;
     }
-    if (blocks.size() + 1 > (size_t) kMaxMix) {
+    if (w.steps.size() != g.visits.size() ||
+        !(w.weak ? finish(w.weak_final, w.n_weak_blocks, w.weak_blocks) : finish(w.final_hid, w.n_blocks, w.blocks))) {
         err = "more finished blocks than a mix reads";
         return false;
     }
-    w.final_hid = hid;
-    w.n_blocks = (int) blocks.size();
-    std::copy(blocks.begin(), blocks.end(), w.blocks);
     return true;
 }
 
@@ -71,10 +97,15 @@ std::vector<Segment> split_walk(const Geometry& g, const Walk& w, const std::vec
         if (segs.empty() || segs.back().card != card) segs.push_back(Segment{card, si, si, false, {}, {}});
         Segment& sg = segs.back();
         const bool mix = s.msgs && msg_pass[card] != v.pass;
-        if (mix) {
-            msg_pass[card] = v.pass;
+        if (mix || s.keep_first) {
+            if (mix) msg_pass[card] = v.pass;
             need(sg, s.bank[0]);
             need(sg, s.bank[1]);
+        }
+        if (s.keep_first) valid[(int) Buf::F12] = valid[(int) Buf::FOut] = (uint8_t) (1u << card);
+        if (s.loopcd) {   // the extrapolated pair is this card's alone
+            for (Buf b : {Buf::F12, Buf::FOut, s.cd[0], s.cd[1]}) need(sg, b);
+            valid[(int) s.cd[0]] = valid[(int) s.cd[1]] = (uint8_t) (1u << card);
         }
         need(sg, s.hid);
         for (int i = 0; i < s.n_blocks; ++i) need(sg, s.blocks[i]);
@@ -87,6 +118,10 @@ std::vector<Segment> split_walk(const Geometry& g, const Walk& w, const std::vec
     hs.head = true;
     for (int i = 0; i < w.n_blocks; ++i) need(hs, w.blocks[i]);
     need(hs, w.final_hid);
+    if (w.weak) {   // LoopCD-Logits: the weak coda's head too
+        for (int i = 0; i < w.n_weak_blocks; ++i) need(hs, w.weak_blocks[i]);
+        need(hs, w.weak_final);
+    }
     return segs;
 }
 
