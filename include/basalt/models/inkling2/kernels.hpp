@@ -349,8 +349,8 @@ void softcap(float* x, int rows, int n, int64_t ld, float cap, void* stream);
 /// LoopCD over n values of two pairs: a += omega * (a - fa), b += omega * (b - fb).
 void loopcd(float* a, const float* fa, float* b, const float* fb, int64_t n, float omega, void* stream);
 
-/// LoopCD-Logits over rows of n logits (row stride ld): z += w * (z - z1); adaptive: w scaled by 1 - (p1 - p2), the margin of
-/// the two largest probabilities of softmax(z).
+/// LoopCD-Logits over rows of n logits (row stride ld): z += w * (z - z1) on the tokens with p >= 0.1 p_max of softmax(z),
+/// every other token set to -1e30; adaptive: w scaled by 1 - (p1 - p2), the margin of the two largest probabilities.
 void loopcd_logits(float* z, const float* z1, int rows, int n, int64_t ld, float w, bool adaptive, void* stream);
 
 }  // namespace basalt::models::inkling2

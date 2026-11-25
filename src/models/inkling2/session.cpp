@@ -1706,7 +1706,7 @@ private:
             wn.norm_out = fin_;
             wn.eps = g_.rms_eps;
             mix_norm(wn, 1, head, stream_);
-            bk::native_q8_0_mmvq(m_.head(), (const uint8_t*) xq_[0], wlog_, E, g_.n_vocab, head, stream_);
+            bk::native_q8_planes_mmvq(m_.head(), (const uint8_t*) xq_[0], wlog_, E, g_.n_vocab, head, stream_);
             softcap(wlog_, head, g_.n_vocab, g_.n_vocab, g_.logit_softcap, stream_);
             loopcd_logits(lg, wlog_, head, g_.n_vocab, g_.n_vocab, m_.flags().loopcd_w, m_.flags().loopcd == 3, stream_);
         }

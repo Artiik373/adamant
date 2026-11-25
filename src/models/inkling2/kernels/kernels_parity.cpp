@@ -797,9 +797,22 @@ void test_loopcd_logits() {   // a decode window's head rows over a vocabulary-s
                 for (int i = 0; i < n; ++i) sum += std::exp((double) zr[i] - m1);
                 w *= 1.0 - (1.0 / sum - std::exp(m2 - m1) / sum);
             }
-            for (int i = 0; i < n; ++i) ref[(size_t) r * n + i] = zr[i] + w * ((double) zr[i] - z1[(size_t) r * n + i]);
+            double mx = -1e300;
+            for (int i = 0; i < n; ++i) mx = std::max(mx, (double) zr[i]);
+            for (int i = 0; i < n; ++i)
+                ref[(size_t) r * n + i] = zr[i] >= mx + std::log(0.1) ? zr[i] + w * ((double) zr[i] - z1[(size_t) r * n + i]) : -1e30;
         }
-        report(adaptive ? "loopcd logits (adaptive)" : "loopcd logits (fixed)", got, ref, 1e-4);
+        std::vector<float> kept = got;   // the dropped tokens must match exactly; the kept ones within tolerance
+        bool mask_ok = true;
+        for (size_t i = 0; i < ref.size(); ++i)
+            if (ref[i] <= -1e29 || kept[i] <= -1e29) {
+                mask_ok = mask_ok && ref[i] <= -1e29 && kept[i] <= -1e29;
+                ref[i] = kept[i] = 0;
+            }
+        failures += !mask_ok;
+        if (!mask_ok) std::printf("loopcd logits: plausibility mask differs  FAIL
+");
+        report(adaptive ? "loopcd logits (adaptive)" : "loopcd logits (fixed)", kept, ref, 1e-4);
     }
 }
 

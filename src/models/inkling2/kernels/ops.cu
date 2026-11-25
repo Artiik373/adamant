@@ -661,47 +661,47 @@ __global__ void loopcd_kernel(float* __restrict__ a, const float* __restrict__ f
 }
 
 // One row a block: z += w * (z - z1). Adaptive: w = w_max * (1 - (p1 - p2)), p1 and p2 the two largest of softmax(z).
+// One row a block: z += w * (z - z1) over the plausible tokens (p >= kPlausible * p_max of softmax(z)), every other token
+// out of the draw. Adaptive: w = w_max * (1 - (p1 - p2)), p1 and p2 the two largest of softmax(z).
+constexpr float kLogPlausible = -2.302585093f;   // ln 0.1
+
+__device__ __forceinline__ void top2_merge(float& a, float& b, float oa, float ob) {
+    const float hi = fmaxf(a, oa), lo = fmaxf(fminf(a, oa), fmaxf(b, ob));
+    a = hi;
+    b = lo;
+}
+
 __global__ void __launch_bounds__(1024) loopcd_logits_kernel(float* __restrict__ z, const float* __restrict__ z1, int n,
                                                               int64_t ld, float w, bool adaptive) {
     bk::pdl_wait();
     bk::pdl_launch_dependents();
     float* zr = z + (size_t) blockIdx.x * ld;
     const float* wr = z1 + (size_t) blockIdx.x * ld;
+    __shared__ float sa[32], sb[32], ss[32];
+    __shared__ float m1s, m2s;
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = (blockDim.x + 31) >> 5;
+    float a = -INFINITY, b = -INFINITY;   // the thread's two largest
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float x = zr[i];
+        if (x > a) {
+            b = a;
+            a = x;
+        } else if (x > b) {
+            b = x;
+        }
+    }
+    for (int o = 16; o > 0; o >>= 1) top2_merge(a, b, __shfl_xor_sync(0xffffffffu, a, o), __shfl_xor_sync(0xffffffffu, b, o));
+    if (lane == 0) sa[wid] = a, sb[wid] = b;
+    __syncthreads();
+    if (wid == 0) {
+        a = lane < nw ? sa[lane] : -INFINITY;
+        b = lane < nw ? sb[lane] : -INFINITY;
+        for (int o = 16; o > 0; o >>= 1) top2_merge(a, b, __shfl_xor_sync(0xffffffffu, a, o), __shfl_xor_sync(0xffffffffu, b, o));
+        if (lane == 0) m1s = a, m2s = b;
+    }
+    __syncthreads();
+    const float m1 = m1s;
     if (adaptive) {
-        __shared__ float sa[32], sb[32], ss[32];
-        __shared__ float m1s, m2s;
-        float a = -INFINITY, b = -INFINITY;   // the thread's two largest
-        for (int i = threadIdx.x; i < n; i += blockDim.x) {
-            const float x = zr[i];
-            if (x > a) {
-                b = a;
-                a = x;
-            } else if (x > b) {
-                b = x;
-            }
-        }
-        for (int o = 16; o > 0; o >>= 1) {
-            const float oa = __shfl_xor_sync(0xffffffffu, a, o), ob = __shfl_xor_sync(0xffffffffu, b, o);
-            const float hi = fmaxf(a, oa), lo = fmaxf(fminf(a, oa), fmaxf(b, ob));
-            a = hi;
-            b = lo;
-        }
-        const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = (blockDim.x + 31) >> 5;
-        if (lane == 0) sa[wid] = a, sb[wid] = b;
-        __syncthreads();
-        if (wid == 0) {
-            a = lane < nw ? sa[lane] : -INFINITY;
-            b = lane < nw ? sb[lane] : -INFINITY;
-            for (int o = 16; o > 0; o >>= 1) {
-                const float oa = __shfl_xor_sync(0xffffffffu, a, o), ob = __shfl_xor_sync(0xffffffffu, b, o);
-                const float hi = fmaxf(a, oa), lo = fmaxf(fminf(a, oa), fmaxf(b, ob));
-                a = hi;
-                b = lo;
-            }
-            if (lane == 0) m1s = a, m2s = b;
-        }
-        __syncthreads();
-        const float m1 = m1s;
         float t = 0.f;
         for (int i = threadIdx.x; i < n; i += blockDim.x) t += __expf(zr[i] - m1);
         for (int o = 16; o > 0; o >>= 1) t += __shfl_xor_sync(0xffffffffu, t, o);
@@ -711,11 +711,11 @@ __global__ void __launch_bounds__(1024) loopcd_logits_kernel(float* __restrict__
         for (int i = 0; i < nw; ++i) sum += ss[i];
         const float p1 = 1.f / sum, p2 = __expf(m2s - m1) / sum;
         w *= 1.f - (p1 - p2);
-        __syncthreads();   // every thread has read the row before it changes
     }
+    const float floor = m1 + kLogPlausible;   // p >= 0.1 p_max: z >= z_max + ln 0.1
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const float x = zr[i];
-        zr[i] = x + w * (x - wr[i]);
+        zr[i] = x >= floor ? x + w * (x - wr[i]) : -1e30f;
     }
 }
 

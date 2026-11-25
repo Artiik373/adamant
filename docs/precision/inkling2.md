@@ -222,7 +222,9 @@ reference is the first loop pass. The strong state is the last pass.
   extrapolated. The coda and the head run once.
 - `logits:W` (Eq. 3): a second, weak coda runs on the first pass's pair. It has its own six visits and KV caches, and its
   own head. The logits become `z + W * (z - z1)`. Both are after the softcap. The difference from the log-softmax form is a
-  constant for each row.
+  constant for each row. Only the plausible tokens (`p >= 0.1 * p_max` of the strong softmax, the mask of classic contrastive
+  decoding) keep a logit. The rest leave the draw, because without the mask, sampling at temperature 1 picks tail tokens
+  that the contrast boosts.
 - `adaptive:WMAX` (Eq. 4): the same, with `W = WMAX * (1 - (p1 - p2))`. Here p1 and p2 are the two largest probabilities of
   the strong softmax.
 
