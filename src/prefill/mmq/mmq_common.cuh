@@ -25,8 +25,8 @@
 #define GGML_COMMON_IMPL_CUDA
 #include "basalt/ggml/ggml_common.h"
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 890 && __CUDA_ARCH__ != 860
-#error "the MMQ kernels are built for compute capability 8.9 or 8.6 only"
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 860
+#error "the MMQ kernels are built for compute capability 8.6 only"
 #endif
 
 #define WARP_SIZE 32
@@ -77,7 +77,7 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 }
 
 // Programmatic dependent launch: a kernel waits for its predecessor, or signals that the next may start.
-// Below sm_90 (an Ada peer tier) the intrinsics lower to griddepcontrol, which does not exist there: both
+// Below sm_90 the intrinsics lower to griddepcontrol, which does not exist there: both
 // become no-ops and the host side launches these kernels the plain way.
 static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900

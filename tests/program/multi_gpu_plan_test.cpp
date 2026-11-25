@@ -26,7 +26,7 @@ static GpuCard card(int smi, const char* name, double gbps, uint64_t gib) {
     c.smi = smi;
     c.name = name;
     c.cc_major = 8;
-    c.cc_minor = 9;
+    c.cc_minor = 6;
     c.mem_gbps = gbps;
     c.vram = gib * GiB;
     return c;

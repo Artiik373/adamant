@@ -152,7 +152,7 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
     const int n = (int) visible.size();
     auto unsupported_main = [&](int i) {
         return "gpu: " + gpu_label(visible, i) + " is sm_" + std::to_string(visible[(size_t) i].cc_major) +
-               std::to_string(visible[(size_t) i].cc_minor) + ", not sm_89 or sm_86";
+               std::to_string(visible[(size_t) i].cc_minor) + ", not sm_86";
     };
     if (spec.kind == GpuSpec::Kind::Auto) {
         if (!known) {
@@ -163,10 +163,10 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
         std::vector<int> main_ok;
         for (int i = 0; i < n; ++i) {
             if (gpu_main_supported(visible[(size_t) i])) main_ok.push_back(i);
-            else c.notes.push_back("gpu auto: " + gpu_label(visible, i) + " skipped, not sm_89 or sm_86");
+            else c.notes.push_back("gpu auto: " + gpu_label(visible, i) + " skipped, not sm_86");
         }
         if (main_ok.empty()) {
-            c.error = n == 0 ? "gpu auto: no GPU is visible" : "gpu auto: no sm_89 or sm_86 GPU visible";
+            c.error = n == 0 ? "gpu auto: no GPU is visible" : "gpu auto: no sm_86 GPU visible";
             return c;
         }
         int best = main_ok[0];

@@ -78,19 +78,19 @@ int main() {
     }
     // Exact capability matching is shared with the runtime.
     {
-        static_assert(basalt::cuda_target::supports(8, 9));
+        static_assert(!basalt::cuda_target::supports(8, 9));
         static_assert(basalt::cuda_target::supports(8, 6));
         static_assert(!basalt::cuda_target::supports(8, 0));
         static_assert(!basalt::cuda_target::supports(9, 0));
         static_assert(!basalt::cuda_target::supports(12, 0));
         CHECK(gpu_main_supported(card(0, "unknown", 0, 0, 0, 0)));
         CHECK(!gpu_main_supported(card(0, "invalid", 0, 9, 0, 0)));
-        for (const auto& cc : {std::pair{8, 0}, std::pair{9, 0},
+        for (const auto& cc : {std::pair{8, 0}, std::pair{8, 9}, std::pair{9, 0},
                                std::pair{12, 0}, std::pair{13, 0}}) {
             const std::vector<GpuCard> v = {card(0, "unsupported", cc.first, cc.second, 1, 1)};
             CHECK(!pick("", v).error.empty());
             CHECK(!pick("0", v).error.empty());
-            CHECK_STR(pick("auto", v).error, "gpu auto: no sm_89 or sm_86 GPU visible");
+            CHECK_STR(pick("auto", v).error, "gpu auto: no sm_86 GPU visible");
         }
         const std::vector<GpuCard> ampere = {card(0, "ampere", 8, 6, 448, 8)};
         CHECK(pick("auto", ampere).error.empty());
@@ -98,7 +98,7 @@ int main() {
     }
     // Explicit order, default warnings, role assignment and serialization.
     {
-        const std::vector<GpuCard> v = {card(0, "fast", 8, 9, 1008, 24), card(1, "small", 8, 9, 504, 12)};
+        const std::vector<GpuCard> v = {card(0, "fast", 8, 6, 1008, 24), card(1, "small", 8, 6, 504, 12)};
         GpuChoice c = pick("", v);
         CHECK_STR(cards(c), "0");
         CHECK_STR(c.warning, "GPU 1 (small) unused; use gpu 0,1 or gpu auto");
@@ -122,30 +122,30 @@ int main() {
     }
     // Bandwidth precedes memory size; ties keep the lowest visible number.
     {
-        const std::vector<GpuCard> v = {card(0, "small", 8, 9, 504, 12), card(1, "fast", 8, 9, 1008, 24)};
+        const std::vector<GpuCard> v = {card(0, "small", 8, 6, 504, 12), card(1, "fast", 8, 6, 1008, 24)};
         CHECK_STR(cards(pick("auto", v)), "1,0");
         CHECK_STR(cards(pick("", v)), "0");
-        const std::vector<GpuCard> w = {card(0, "small", 8, 9, 504, 12), card(1, "large", 8, 9, 504, 24)};
+        const std::vector<GpuCard> w = {card(0, "small", 8, 6, 504, 12), card(1, "large", 8, 6, 504, 24)};
         CHECK_STR(cards(pick("auto", w)), "1,0");
-        const std::vector<GpuCard> eq = {card(0, "equal", 8, 9, 1008, 24), card(1, "equal", 8, 9, 1008, 24)};
+        const std::vector<GpuCard> eq = {card(0, "equal", 8, 6, 1008, 24), card(1, "equal", 8, 6, 1008, 24)};
         CHECK_STR(cards(pick("auto", eq)), "0,1");
         CHECK(pick("auto", eq).notes.empty());
         CHECK_STR(roles(eq, pick("auto", eq), 1), "main,expert tier");
     }
     // Automatic selection excludes unsupported devices, including newer ones.
     {
-        const std::vector<GpuCard> v = {card(0, "middle", 8, 9, 672, 16), card(1, "other", 12, 0, 1792, 32),
-                                       card(2, "fast", 8, 9, 1008, 24), card(3, "small", 8, 9, 504, 12)};
+        const std::vector<GpuCard> v = {card(0, "middle", 8, 6, 672, 16), card(1, "other", 12, 0, 1792, 32),
+                                       card(2, "fast", 8, 6, 1008, 24), card(3, "small", 8, 6, 504, 12)};
         GpuChoice c = pick("auto", v);
         CHECK_STR(cards(c), "2,0,3");
         CHECK(c.notes.size() == 1);
-        if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 1 (other) skipped, not sm_89 or sm_86");
+        if (c.notes.size() == 1) CHECK_STR(c.notes[0], "gpu auto: GPU 1 (other) skipped, not sm_86");
         CHECK_STR(roles(v, c, 1), "main,expert tier,idle");
         CHECK_STR(roles(v, c, 3), "main,expert tier,expert tier");
         c = pick("", v);
         CHECK_STR(cards(c), "0");
         CHECK_STR(c.warning, "GPU 2 (fast), GPU 3 (small) unused; use gpu 0,2,3 or gpu auto");
-        CHECK_STR(pick("1", v).error, "gpu: GPU 1 (other) is sm_120, not sm_89 or sm_86");
+        CHECK_STR(pick("1", v).error, "gpu: GPU 1 (other) is sm_120, not sm_86");
         CHECK_STR(cards(pick("3,2,0", v)), "3,2,0");
         const std::vector<GpuCard> first = {v[1], v[2]};
         CHECK(!pick("", first).error.empty());
