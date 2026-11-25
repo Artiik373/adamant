@@ -69,6 +69,10 @@ def pack_rows(states: torch.Tensor, scales: torch.Tensor, k: int) -> bytes:
 
 
 VITERBI = (48, 12)   # search window, commit length; set from --window/--commit
+COLD_VITERBI = (32, 8)   # search window, commit length for cold experts
+COLD_FRAC = 0.0     # fraction of lowest-token experts per layer using COLD_VITERBI; set from --cold-frac
+SIGN_TRIALS = 8     # sign-seed trials per matrix; set from --sign-trials
+SCALE_PASSES = 2    # Viterbi scale search passes; set from --scale-passes
 
 
 def refit_scales(w: torch.Tensor, states: torch.Tensor, scales: torch.Tensor, h: torch.Tensor, lut):
@@ -84,14 +88,36 @@ def refit_scales(w: torch.Tensor, states: torch.Tensor, scales: torch.Tensor, h:
     return s_new, c * s_new.float().unsqueeze(-1)
 
 
-def code(ws: torch.Tensor, hs: torch.Tensor, k: int, lut, seeds) -> list:
+def _viterbi_with_scale_passes(w_rot: torch.Tensor, hu: torch.Tensor, h_rot: torch.Tensor, k: int, lut, passes: int,
+                               viterbi: tuple[int, int]):
+    scales0, states, _ = viterbi_code_batched_cuda(w_rot, hu, k, lut, *viterbi)
+    scales, q = refit_scales(w_rot, states, scales0, h_rot, lut)
+    if passes >= 2 and bool((scales != scales0).any()):
+        scales2, states2, _ = viterbi_code_batched_cuda(w_rot, hu, k, lut, *viterbi, scales=scales)
+        scales2, q2 = refit_scales(w_rot, states2, scales2, h_rot, lut)
+        e1 = (torch.bmm(w_rot - q, h_rot) * (w_rot - q)).sum(-1)
+        e2 = (torch.bmm(w_rot - q2, h_rot) * (w_rot - q2)).sum(-1)
+        better = e2 < e1
+        scales = torch.where(better, scales2, scales)
+        states = torch.where(better.unsqueeze(-1), states2, states)
+        q = torch.where(better.unsqueeze(-1), q2, q)
+    return scales, states, q
+
+
+def code(ws: torch.Tensor, hs: torch.Tensor, k: int, lut, seeds, sign_trials: int | None = None,
+         scale_passes: int | None = None, viterbi: tuple[int, int] | None = None) -> list:
     """Code E matrices [E, out, in] on Hessians [E, in, in]: (rows bytes, int8 signs, decoded W) per matrix."""
     blk = largest_pow2_divisor(int(ws.shape[2]), cap=512)
+    trials = SIGN_TRIALS if sign_trials is None else sign_trials
+    passes = SCALE_PASSES if scale_passes is None else scale_passes
+    vit = VITERBI if viterbi is None else viterbi
+    if trials > 1:
+        seeds = [ms.best_sign_seed_joint(w, h, blk, s, trials) for w, h, s in zip(ws, hs, seeds)]
     rot = [ms.rotate_weight_and_hessian(w, h, block_size=blk, seed=s) for w, h, s in zip(ws, hs, seeds)]
     hu = torch.stack([ms.cholesky_inv_upper(r[1]) for r in rot])
     w_rot = torch.stack([r[0] for r in rot])
-    scales, states, _ = viterbi_code_batched_cuda(w_rot, hu, k, lut, *VITERBI)
-    scales, q = refit_scales(w_rot, states, scales, torch.stack([r[1] for r in rot]), lut)
+    h_rot = torch.stack([r[1] for r in rot])
+    scales, states, q = _viterbi_with_scale_passes(w_rot, hu, h_rot, k, lut, passes, vit)
     out = []
     for i, r in enumerate(rot):
         signs = r[2]
@@ -100,16 +126,23 @@ def code(ws: torch.Tensor, hs: torch.Tensor, k: int, lut, seeds) -> list:
     return out
 
 
-def code_rows(w: torch.Tensor, h: torch.Tensor, k: int, lut, seed: int, chunk: int = 16384):
+def code_rows(w: torch.Tensor, h: torch.Tensor, k: int, lut, seed: int, chunk: int = 16384,
+              sign_trials: int | None = None, scale_passes: int | None = None,
+              viterbi: tuple[int, int] | None = None):
     """One large matrix (the head) coded in row chunks on one Hessian; same rotation for every chunk."""
     blk = largest_pow2_divisor(int(w.shape[1]), cap=512)
+    trials = SIGN_TRIALS if sign_trials is None else sign_trials
+    passes = SCALE_PASSES if scale_passes is None else scale_passes
+    vit = VITERBI if viterbi is None else viterbi
+    if trials > 1:
+        seed = ms.best_sign_seed_joint(w[: min(w.shape[0], 4096)], h, blk, seed, trials)
     _, h_rot, signs = ms.rotate_weight_and_hessian(w[:1], h, block_size=blk, seed=seed)
     hu = ms.cholesky_inv_upper(h_rot).unsqueeze(0)
+    h_rot_b = h_rot.unsqueeze(0)
     parts = []
     for r0 in range(0, w.shape[0], chunk):
         w_rot = ms.fwht_blocks(w[r0 : r0 + chunk].float() * signs.unsqueeze(0), blk)
-        scales, states, _ = viterbi_code_batched_cuda(w_rot.unsqueeze(0), hu, k, lut, *VITERBI)
-        scales, _ = refit_scales(w_rot.unsqueeze(0), states, scales, h_rot.unsqueeze(0), lut)
+        scales, states, _ = _viterbi_with_scale_passes(w_rot.unsqueeze(0), hu, h_rot_b, k, lut, passes, vit)
         parts.append(pack_rows(states[0], scales[0], k))
     return b"".join(parts), signs.to(torch.int8).cpu().numpy()
 
@@ -157,7 +190,8 @@ def k_label(k) -> str:
 EXPERT_BATCH = 0   # --expert-batch; 0: from the window
 
 
-def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0.0) -> dict:
+def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0.0, tok_w=None,
+                 cold_frac: float | None = None) -> dict:
     """k: one width for the layer, or a list with one width per expert (a mixed layer)."""
     ex = moe.experts
     h_all = x_ref = None
@@ -167,6 +201,14 @@ def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0
         x_ref = x[torch.randperm(x.shape[0], generator=g)[:2048].to(x.device)]
     n_exp, two_ff, n_embd = ex.gate_up_proj.shape
     n_ff = two_ff // 2
+    cf = COLD_FRAC if cold_frac is None else cold_frac
+    is_cold = [False] * n_exp
+    if cf > 0.0:
+        counts = torch.bincount(idx.reshape(-1), minlength=n_exp)
+        n_cold = min(n_exp, max(0, int(n_exp * cf)))
+        if n_cold > 0:
+            for ei in torch.topk(counts, n_cold, largest=False).indices.tolist():
+                is_cold[ei] = True
     files = {n: open(out_dir / f"blk.{l}.ffn_{n}_exps.ms", "wb") for n in ("gate", "up", "down")}
     # experts per batch: the back-pointer buffer grows with the window
     eb = EXPERT_BATCH or 8 * 32 // VITERBI[0]
@@ -174,15 +216,18 @@ def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0
     try:
         for e0 in range(0, n_exp, eb):
             es = list(range(e0, min(e0 + eb, n_exp)))
-            hs = [expert_hessians(x, idx, e, ex.gate_up_proj[e].float(), wts, tau, h_all, x_ref) for e in es]
+            hs = [expert_hessians(x, idx, e, ex.gate_up_proj[e].float(), wts, tau, h_all, x_ref, tok_w) for e in es]
             zero += sum(1 for h in hs if h[2] == 0)
             ks = [k] * len(es) if isinstance(k, int) else [k[e] for e in es]
             got = {}
-            for kk in sorted(set(ks)):   # one coder call a width
-                sub = [i for i, ki in enumerate(ks) if ki == kk]
+            for kk, cold in sorted({(ki, is_cold[es[i]]) for i, ki in enumerate(ks)}):   # one coder call per (width, tier)
+                sub = [i for i, ki in enumerate(ks) if ki == kk and is_cold[es[i]] == cold]
                 ids = [es[i] for i in sub]
-                gu = code(ex.gate_up_proj[ids].float(), torch.stack([hs[i][0] for i in sub]), kk, lut, [l * 4096 + 2 * e + 1 for e in ids])
-                dn = code(ex.down_proj[ids].float(), torch.stack([hs[i][1] for i in sub]), kk, lut, [l * 4096 + 2 * e + 2 for e in ids])
+                kw = {"sign_trials": 1, "scale_passes": 1, "viterbi": COLD_VITERBI} if cold else {}
+                gu = code(ex.gate_up_proj[ids].float(), torch.stack([hs[i][0] for i in sub]), kk, lut,
+                          [l * 4096 + 2 * e + 1 for e in ids], **kw)
+                dn = code(ex.down_proj[ids].float(), torch.stack([hs[i][1] for i in sub]), kk, lut,
+                          [l * 4096 + 2 * e + 2 for e in ids], **kw)
                 for e, a, b in zip(ids, gu, dn):
                     got[e] = (kk, a, b)
             for e in es:   # in expert order
@@ -346,7 +391,7 @@ def two_stream_layer(layer, l, nl, h, hq, kws, bs, x, code_spine, code_moe, load
     for name in ("mlp.shared_expert.gate_proj", "mlp.shared_expert.up_proj"):
         code_spine(name, input_map(mods[name].weight.float(), hnn / n, cnn / n), hnn / n)
     mark("ffn-in")
-    rec = code_moe(x)
+    rec = code_moe(x, tw / tw.mean().clamp(min=1e-8))
     mark("experts")
     load(["mlp.shared_expert.gate_proj", "mlp.shared_expert.up_proj"], True)
     mark("load")
@@ -503,6 +548,16 @@ def main() -> None:
                    help="only the MTP drafter: the original layers run uncoded, then the drafter is coded")
     p.add_argument("--hess-affinity", action="store_true",
                    help="weight each routed token in its expert's Hessians by its router score squared")
+    p.add_argument("--sign-trials", type=int, default=8,
+                   help="sign-seed trials per matrix minimizing rotated kurtosis * LDLQ pivot sum (1: fixed seed)")
+    p.add_argument("--scale-passes", type=int, default=2, choices=(1, 2),
+                   help="Viterbi scale passes per matrix (2: re-search rows with refitted fp16 scale)")
+    p.add_argument("--tok-w", type=Path, default=None,
+                   help="optional .pt tensor of per-token Fisher/importance weights [N * seq_len]")
+    p.add_argument("--cold-frac", type=float, default=0.0,
+                   help="fraction of lowest-token experts per layer coded with --cold-window/--cold-commit and 1 pass/trial")
+    p.add_argument("--cold-window", type=int, default=32, help="Viterbi search window for cold experts")
+    p.add_argument("--cold-commit", type=int, default=8, help="Viterbi commit length for cold experts")
     args = p.parse_args()
     if args.reuse_layers and not args.reuse_from:
         p.error("--reuse-layers needs --reuse-from")
@@ -513,9 +568,13 @@ def main() -> None:
 
     dev = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True  # Hessian sums: TF32 inputs, FP32 accumulation
-    global VITERBI, EXPERT_BATCH
+    global VITERBI, COLD_VITERBI, COLD_FRAC, EXPERT_BATCH, SIGN_TRIALS, SCALE_PASSES
     VITERBI = (args.window, args.commit)
+    COLD_VITERBI = (args.cold_window, args.cold_commit)
+    COLD_FRAC = max(0.0, min(1.0, args.cold_frac))
     EXPERT_BATCH = args.expert_batch
+    SIGN_TRIALS = max(1, args.sign_trials)
+    SCALE_PASSES = args.scale_passes
     out = args.out_dir
     (out / "experts").mkdir(parents=True, exist_ok=True)
     tc = json.loads((args.hf_dir / "config.json").read_text())["text_config"]
@@ -528,6 +587,11 @@ def main() -> None:
     wmap = json.loads((args.hf_dir / "model.safetensors.index.json").read_text())["weight_map"]
     calib = torch.load(args.calib, map_location="cpu", weights_only=True)
     cal_ids, _ = split_calib(calib, args.calib_seqs, 0)
+    tok_w = None
+    if args.tok_w is not None:
+        tok_w = torch.load(args.tok_w, map_location=dev, weights_only=True).float().reshape(-1)
+        assert tok_w.numel() == cal_ids.numel(), f"tok-w length {tok_w.numel()} != calib tokens {cal_ids.numel()}"
+        tok_w = tok_w / tok_w.mean().clamp(min=1e-8)
     bs = args.batch_size
 
     # a large calibration set's stream (tokens x hyper-connection streams x hidden, bf16) stays in host RAM
@@ -586,12 +650,15 @@ def main() -> None:
                 rows, signs, _ = code(w.unsqueeze(0), hh.unsqueeze(0), args.spine_k, lut, [l * 4096 + 3000 + len(gguf)])[0]
                 write_record(out, gguf, args.spine_k, w.shape[1], w.shape[0], rows, signs)
 
-            def code_moe(xq):
+            def code_moe(xq, layer_tok_w=None):
                 with torch.no_grad():
                     parts = [layer.mlp.gate(c)[1:] for c in xq.split(65536)]
                     wts, idx = torch.cat([q[0] for q in parts]), torch.cat([q[1] for q in parts])
+                tw_use = layer_tok_w
+                if tok_w is not None:
+                    tw_use = tok_w if tw_use is None else (tw_use * tok_w)
                 return code_experts(layer.mlp, xq, idx, plan[l], lut, l, out / "experts",
-                                    wts if args.hess_affinity else None, args.hess_tau)
+                                    wts if args.hess_affinity else None, args.hess_tau, tw_use)
 
             x = torch.empty(cal_ids.numel(), cfg.hidden_size, dtype=torch.bfloat16, device=dev)
             rec = two_stream_layer(layer, l, nl, h, hq, kws, bs, x, code_spine, code_moe,
@@ -633,7 +700,7 @@ def main() -> None:
             wts, idx = torch.cat([p[0] for p in parts]), torch.cat([p[1] for p in parts])
             del parts
         rec = code_experts(moe, x, idx, plan[l], lut, l, out / "experts", wts if args.hess_affinity else None,
-                           args.hess_tau)
+                           args.hess_tau, tok_w)
         del layer, moe, x, idx, wts
         torch.cuda.empty_cache()
         torch.save({"next_layer": l + 1, "h": h}, state)

@@ -137,6 +137,73 @@ class ConverterPayload(unittest.TestCase):
         print("MSE by K:", {k: f"{v:.5f}" for k, v in mse.items()})
         self.assertTrue(all(mse[k] > mse[k + 1] for k in (2, 3, 4, 5)), mse)
 
+    def test_sign_trials_and_two_pass_scale_improve_heavy_tailed(self):
+        from ms_flashnext_convert import code
+
+        dev = torch.device("cuda")
+        lut = ms.build_1mad_lut(dev)
+        g = torch.Generator(device=dev).manual_seed(17)
+        # Real down_proj geometry: n_out=2560, n_in=640 (blk=128) with heavy-tailed outliers
+        w = torch.randn(1, 256, 640, device=dev, generator=g)
+        w[0, :32, :16] *= 8.0
+        x = torch.randn(1024, 640, device=dev, generator=g)
+        x[:, :64] *= 3.0
+        h = (x.T @ x / 1024).unsqueeze(0)
+
+        _, _, deq_base = code(w, h, 3, lut, [1], sign_trials=1, scale_passes=1)[0]
+        _, _, deq_2pass = code(w, h, 3, lut, [1], sign_trials=1, scale_passes=2)[0]
+        _, _, deq_opt = code(w, h, 3, lut, [1], sign_trials=8, scale_passes=2)[0]
+
+        def h_err(deq):
+            e = w[0] - deq
+            return ((e @ h[0]) * e).sum().item()
+
+        e_base, e_2pass, e_opt = h_err(deq_base), h_err(deq_2pass), h_err(deq_opt)
+        print(f"H-err heavy-tailed 256x640 MS_C3: base={e_base:.4f}, 2pass={e_2pass:.4f}, 2pass+sign8={e_opt:.4f}")
+        self.assertLessEqual(e_2pass, e_base)
+        self.assertLess(e_opt, e_base)
+
+    def test_expert_hessians_tok_w(self):
+        from ms_flashnext_convert import expert_hessians
+
+        dev = torch.device("cuda")
+        g = torch.Generator(device=dev).manual_seed(21)
+        x = torch.randn(32, 64, device=dev, generator=g)
+        idx = torch.zeros(32, 2, dtype=torch.long, device=dev)
+        w_gu = torch.randn(32, 64, device=dev, generator=g)
+        tok_w = torch.linspace(0.5, 1.5, 32, device=dev)
+        s1, d1, n1 = expert_hessians(x, idx, 0, w_gu)
+        s2, d2, n2 = expert_hessians(x, idx, 0, w_gu, tok_w=tok_w)
+        self.assertEqual(n1, 32)
+        self.assertEqual(n2, 32)
+        self.assertFalse(torch.allclose(s1, s2))
+        self.assertFalse(torch.allclose(d1, d2))
+
+    def test_code_experts_cold_frac(self):
+        import tempfile
+        from types import SimpleNamespace
+        from ms_flashnext_convert import code_experts
+
+        dev = torch.device("cuda")
+        lut = ms.build_1mad_lut(dev)
+        g = torch.Generator(device=dev).manual_seed(33)
+        n_exp, n_ff, n_embd = 4, 32, 64
+        moe = SimpleNamespace(
+            experts=SimpleNamespace(
+                gate_up_proj=torch.randn(n_exp, 2 * n_ff, n_embd, device=dev, generator=g),
+                down_proj=torch.randn(n_exp, n_embd, n_ff, device=dev, generator=g),
+            )
+        )
+        x = torch.randn(40, n_embd, device=dev, generator=g)
+        # Experts 0,1 hot; experts 2,3 cold (zero tokens)
+        idx = torch.zeros(40, 2, dtype=torch.long, device=dev)
+        idx[:, 1] = 1
+        with tempfile.TemporaryDirectory() as td:
+            rec = code_experts(moe, x, idx, [3, 4, 3, 4], lut, 0, Path(td), cold_frac=0.5)
+            self.assertEqual(rec["zero_token_experts"], 2)
+            for proj in ("gate", "up", "down"):
+                self.assertTrue((Path(td) / f"blk.0.ffn_{proj}_exps.ms").stat().st_size > 0)
+
 
 if __name__ == "__main__":
     unittest.main()

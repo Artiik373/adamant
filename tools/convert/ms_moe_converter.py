@@ -100,20 +100,53 @@ def best_sign_seed(w: torch.Tensor, block_size: int, seed: int, trials: int) -> 
     return best
 
 
+def _damped_hessian_for_pivots(h: torch.Tensor) -> torch.Tensor:
+    dtype = torch.float32 if h.is_cuda else torch.float64
+    h_d = h.detach().to(dtype=dtype)
+    h_d = 0.5 * (h_d + h_d.T)
+    mean_diag = h_d.diagonal().mean().clamp(min=1e-8)
+    return h_d + (0.01 * mean_diag) * torch.eye(h_d.shape[0], device=h_d.device, dtype=dtype)
+
+
 def best_sign_seed_h(h: torch.Tensor, block_size: int, seed: int, trials: int) -> int:
     """Of `trials` seeds (seed, seed + 1, ...), the one whose rotated Hessian has the smallest sum of LDLQ pivots
-    1 / Hu[c, c]^2 (tr D of H = L^T D L): the factor on the expected LDLQ error for a fixed per-column noise.
-    The pivots are those of a Cholesky of H in reverse order: one factorization, in float64 on the CPU."""
-    h = h.detach().to("cpu", torch.float64)
-    h = 0.5 * (h + h.T)
-    h = h + 0.01 * h.diagonal().mean() * torch.eye(h.shape[0], dtype=h.dtype)   # cholesky_inv_upper's damping
+    1 / Hu[c, c]^2 (tr D of H = L^T D L): the factor on the expected LDLQ error for a fixed per-column noise."""
+    if trials <= 1:
+        return seed
+    h_d = _damped_hessian_for_pivots(h)
     best, best_m = seed, None
-    for t in range(max(trials, 1)):
+    for t in range(trials):
         sd = seed + t
-        _, h_rot, _ = rotate_weight_and_hessian(h[:1], h, block_size, sd)
+        signs = random_hadamard_signs(h_d.shape[0], sd, h_d.device).to(h_d.dtype)
+        h_rot = fwht_blocks(h_d * signs.unsqueeze(0), block_size)
+        h_rot = fwht_blocks(h_rot.T * signs.unsqueeze(0), block_size).T
         m = (torch.linalg.cholesky(h_rot.flip(0, 1)).diagonal() ** 2).sum().item()
         if best_m is None or m < best_m:
             best, best_m = sd, m
+    return best
+
+
+def best_sign_seed_joint(
+    w: torch.Tensor, h: torch.Tensor, block_size: int, seed: int, trials: int
+) -> int:
+    """Of `trials` seeds, pick the one minimizing the product of rotated weight kurtosis and LDLQ pivot sum."""
+    if trials <= 1:
+        return seed
+    w_f = w.detach().float()
+    h_d = _damped_hessian_for_pivots(h)
+    best, best_m = seed, None
+    for t in range(trials):
+        sd = seed + t
+        signs = random_hadamard_signs(w_f.shape[1], sd, w_f.device)
+        wr = fwht_blocks(w_f * signs.unsqueeze(0), block_size)
+        kurt = (wr.pow(4).sum() / wr.pow(2).sum().pow(2).clamp(min=1e-12)).item()
+        hs = signs.to(h_d.dtype)
+        h_rot = fwht_blocks(h_d * hs.unsqueeze(0), block_size)
+        h_rot = fwht_blocks(h_rot.T * hs.unsqueeze(0), block_size).T
+        piv = (torch.linalg.cholesky(h_rot.flip(0, 1)).diagonal() ** 2).sum().item()
+        score = kurt * piv
+        if best_m is None or score < best_m:
+            best, best_m = sd, score
     return best
 
 
