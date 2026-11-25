@@ -2475,6 +2475,7 @@ private:
     // The published ids have landed (the stream goes on meanwhile); a launch that failed never writes them.
     bool await_ids(std::string& err) {
         const volatile uint32_t* seq = h_words_;
+        (void) cudaStreamQuery(stream_);   // submit the queued launches now: a batching driver holds them until the next call
         for (int s = 0; s < (1 << 22); ++s) {
             if (*seq == seq_want_) {
                 std::atomic_thread_fence(std::memory_order_acquire);

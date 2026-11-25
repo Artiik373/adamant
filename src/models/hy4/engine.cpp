@@ -1389,6 +1389,7 @@ bool Engine::step_window(const int32_t* tokens, int n, int64_t pos, int32_t* pic
             if (!cuda_ok(cudaStreamSynchronize(m.s), "the router", err)) return false;
             m.expert_groups_host(l, T);
             if (!m.segment(wide ? none : m.g_b[gi + (size_t) l], cap, [&] { m.ffn_post(l); }, err)) return false;
+            if (!cap) (void) cudaStreamQuery(m.s);   // submit the experts now: a batching driver holds them until the next sync
         }
         if (cap && e >= 0) ++mod;
         std::snprintf(nm, sizeof nm, "%03d_model.layers.%d", mod++, l);
