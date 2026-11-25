@@ -610,7 +610,7 @@ def main() -> None:
     if args.mtp_only and (args.two_stream or args.reuse_layers or args.stop_after is not None):
         p.error("--mtp-only runs every original layer: not with --two-stream, --reuse-layers or --stop-after")
 
-    dev = torch.device("cuda")
+    dev = torch.device("cuda:0")
     if args.max_vram_gib > 0:
         tot_vram = torch.cuda.get_device_properties(dev).total_memory
         frac = min(1.0, (args.max_vram_gib * (1 << 30)) / tot_vram)

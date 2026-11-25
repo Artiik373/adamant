@@ -372,7 +372,7 @@ def main() -> None:
     args = p.parse_args()
     assert args.widths and all(k in MS_BITS for k in args.widths), args.widths
 
-    dev = torch.device("cuda")
+    dev = torch.device("cuda:0")
     if args.max_vram_gib > 0:
         tot_vram = torch.cuda.get_device_properties(dev).total_memory
         frac = min(1.0, (args.max_vram_gib * (1 << 30)) / tot_vram)
