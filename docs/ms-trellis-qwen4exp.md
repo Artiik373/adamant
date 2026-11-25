@@ -98,8 +98,14 @@ python3 tests/test_ms_converter.py
 # 4. The engine paths (dense, routed experts on CPU and GPU, prompt conversion) and the pack writer
 build/Release/ms_cpu_test          # needs -DBUILD_TESTING=ON
 build/Release/ms_gpu_parity
-python3 -m unittest discover -s tools/convert -p "test_ms_pack.py"
+python3 tools/convert/run_tests.py
 
 # 5. Inspect the default <= 55 GB layer bit plan
 python3 tools/convert/ms_moe_converter.py --hf-dir /path/to/Qwen3.8-Flash-Next --calib-pt calib.pt --out-dir out_ms --dry-run
 ```
+
+## Windows Converter Notes & Default Gate
+
+- Run from the repo root with VS 2022 `vcvars64.bat` in `PATH` (for `ms_viterbi_cuda.cu` JIT) and Python 3.11; set `TRITON_CACHE_DIR` if running in a sandboxed directory.
+- Both `ms_flashnext_convert.py` and `ms_sensitivity_scan.py` default to `--max-vram-gib 22.0` to prevent silent Windows WDDM VRAM paging.
+- Any converter or kernel default change must pass a 1-layer real-model A/B (`eval_chat.pt` + GPU microbench) before changing defaults (`1/1` vs `8/2` on `Qwen3.8-Flash-Next` Layer 0 showed no improvement on real weights).

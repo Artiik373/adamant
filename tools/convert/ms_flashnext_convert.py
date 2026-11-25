@@ -278,6 +278,10 @@ def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0
                 files["gate"].write(got_g[e][0] + got_g[e][1].tobytes())
                 files["up"].write(got_u[e][0] + got_u[e][1].tobytes())
                 files["down"].write(got_d[e][0] + got_d[e][1].tobytes())
+            if e0 % 128 == 0:
+                print(f"  layer {l:2d} experts {e0}/{n_exp}: peak alloc "
+                      f"{torch.cuda.max_memory_allocated() / 2**30:.1f} reserved "
+                      f"{torch.cuda.max_memory_reserved() / 2**30:.1f} GiB", flush=True)
     finally:
         for f in files.values():
             f.close()
