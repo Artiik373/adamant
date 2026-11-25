@@ -367,10 +367,16 @@ def main() -> None:
                    help="also: each expert's own output error at every width (experts_<layer>.json)")
     p.add_argument("--proxy", action="store_true",
                    help="use fast block-64 LDLQ proxy instead of 14-bit Viterbi for sensitivity ranking (~5.5x faster)")
+    p.add_argument("--max-vram-gib", type=float, default=22.0,
+                   help="hard per-process VRAM cap in GiB to prevent WDDM paging (0: off)")
     args = p.parse_args()
     assert args.widths and all(k in MS_BITS for k in args.widths), args.widths
 
     dev = torch.device("cuda")
+    if args.max_vram_gib > 0:
+        tot_vram = torch.cuda.get_device_properties(dev).total_memory
+        frac = min(1.0, (args.max_vram_gib * (1 << 30)) / tot_vram)
+        torch.cuda.set_per_process_memory_fraction(frac, dev)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     tc = json.loads((args.hf_dir / "config.json").read_text())["text_config"]
     cfg = Qwen4ExpTextConfig(**tc)
@@ -411,7 +417,7 @@ def main() -> None:
         torch.cuda.empty_cache()
         if x.device != dev:
             free_b, _ = torch.cuda.mem_get_info(dev)
-            if free_b > x.numel() * x.element_size() + (3 << 30):
+            if free_b > x.numel() * x.element_size() + (5 << 30):
                 x = x.to(dev)
         moe = layer.mlp
         with torch.no_grad():   # in chunks, as the converter: only the top-k ids stay

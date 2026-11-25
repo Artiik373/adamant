@@ -231,7 +231,7 @@ def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0
     k_triples = _norm_expert_ks(k, n_exp)
     files = {n: open(out_dir / f"blk.{l}.ffn_{n}_exps.ms", "wb") for n in ("gate", "up", "down")}
     # experts per batch: the back-pointer buffer grows with the window
-    eb = EXPERT_BATCH or 8
+    eb = EXPERT_BATCH or max(1, 8 * 32 // VITERBI[0])
     zero = 0
     try:
         for e0 in range(0, n_exp, eb):
@@ -600,6 +600,8 @@ def main() -> None:
                    help="fraction of lowest-token experts per layer coded with --cold-window/--cold-commit and 1 pass/trial")
     p.add_argument("--cold-window", type=int, default=32, help="Viterbi search window for cold experts")
     p.add_argument("--cold-commit", type=int, default=8, help="Viterbi commit length for cold experts")
+    p.add_argument("--max-vram-gib", type=float, default=22.0,
+                   help="hard per-process VRAM cap in GiB to prevent WDDM paging (0: off)")
     args = p.parse_args()
     if args.reuse_layers and not args.reuse_from:
         p.error("--reuse-layers needs --reuse-from")
@@ -609,6 +611,10 @@ def main() -> None:
         p.error("--mtp-only runs every original layer: not with --two-stream, --reuse-layers or --stop-after")
 
     dev = torch.device("cuda")
+    if args.max_vram_gib > 0:
+        tot_vram = torch.cuda.get_device_properties(dev).total_memory
+        frac = min(1.0, (args.max_vram_gib * (1 << 30)) / tot_vram)
+        torch.cuda.set_per_process_memory_fraction(frac, dev)
     torch.backends.cuda.matmul.allow_tf32 = True  # Hessian sums: TF32 inputs, FP32 accumulation
     global VITERBI, COLD_VITERBI, COLD_FRAC, EXPERT_BATCH, SIGN_TRIALS, SCALE_PASSES
     VITERBI = (args.window, args.commit)
@@ -751,11 +757,11 @@ def main() -> None:
             wts, idx = torch.cat([p[0] for p in parts]), torch.cat([p[1] for p in parts])
             del parts
         if x.device != dev:
-            # Move 5 GiB expert weights to CPU so x (6.25 GiB) fits on GPU with >10 GiB headroom for parallel gathers
+            # Move 5 GiB expert weights to CPU so x (6.25 GiB) fits on GPU with headroom below --max-vram-gib
             moe.experts.to("cpu")
             torch.cuda.empty_cache()
             free_b, _ = torch.cuda.mem_get_info(dev)
-            if free_b > x.numel() * x.element_size() + (4 << 30):
+            if free_b > x.numel() * x.element_size() + (5 << 30):
                 x = x.to(dev)
         rec = code_experts(moe, x, idx, plan[l], lut, l, out / "experts", wts if args.hess_affinity else None,
                            args.hess_tau, tok_w)
