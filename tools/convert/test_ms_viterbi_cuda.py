@@ -233,6 +233,30 @@ class ConverterPayload(unittest.TestCase):
             self.assertEqual((Path(td) / "blk.0.ffn_down_exps.ms").stat().st_size,
                              sum(payload_bytes(n_ff, n_embd, k[2]) for k in ks))
 
+    def test_sensitivity_scan_errs_proj(self):
+        from types import SimpleNamespace
+        from ms_sensitivity_scan import quantize_experts
+
+        dev = torch.device("cuda")
+        lut = ms.build_1mad_lut(dev)
+        g = torch.Generator(device=dev).manual_seed(55)
+        n_exp, n_ff, n_embd = 2, 128, 128
+        moe = SimpleNamespace(
+            experts=SimpleNamespace(
+                gate_up_proj=torch.randn(n_exp, 2 * n_ff, n_embd, device=dev, generator=g),
+                down_proj=torch.randn(n_exp, n_embd, n_ff, device=dev, generator=g),
+            )
+        )
+        x = torch.randn(16, n_embd, device=dev, generator=g)
+        idx = torch.zeros(16, 2, dtype=torch.long, device=dev)
+        idx[:, 1] = 1
+        errs, errs_proj = {}, {"gate": {}, "up": {}, "down": {}}
+        quantize_experts(moe, x, idx, 3, lut, [0, 1], eb=2, errs=errs, errs_proj=errs_proj)
+        self.assertEqual(set(errs.keys()), {0, 1})
+        for p in ("gate", "up", "down"):
+            self.assertEqual(set(errs_proj[p].keys()), {0, 1})
+            self.assertTrue(all(v > 0.0 for v in errs_proj[p].values()))
+
 
 if __name__ == "__main__":
     unittest.main()

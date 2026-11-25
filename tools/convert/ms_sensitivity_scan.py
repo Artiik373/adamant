@@ -148,11 +148,67 @@ def prelude(cfg, hf: Path, wmap: dict, ids: torch.Tensor, dev, batch: int, host:
     return out, kws
 
 
-def quant_batch(ws, hs, k, seeds, lut):
+FP4_GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+
+
+def nvfp4(w):
+    """Round to NVFP4: E2M1 values, an E4M3 scale per 16 inputs, an FP32 scale per tensor."""
+    b = w.float().reshape(-1, 16)
+    g = (b.abs().amax() / (6 * 448)).clamp_min(1e-30)
+    s = ((b.abs().amax(1, keepdim=True) / 6 / g).to(torch.float8_e4m3fn).float() * g).clamp_min(1e-30)
+    grid = FP4_GRID.to(w.device)
+    a = (b / s).abs().clamp_max(6)
+    i = torch.bucketize(a, (grid[1:] + grid[:-1]) / 2)   # nearest grid point
+    return (grid[i] * b.sign() * s).reshape(w.shape)
+
+
+def fp4_lut(lut):
+    """The 1MAD values snapped to the E2M1 grid times c, with the c of least squared snap error."""
+    def snap(c):
+        a = (lut.abs() / c).clamp_max(6)
+        g = FP4_GRID.to(lut.device)
+        return g[torch.bucketize(a, (g[1:] + g[:-1]) / 2, right=True)] * lut.sign() * c   # ties up, as the kernel
+    c = min((float(c) for c in torch.linspace(20, 120, 1001)), key=lambda c: (snap(c) - lut).square().sum().item())
+    return snap(c), c
+
+
+@torch.no_grad()
+def gptq_nvfp4(w, hu):
+    """GPTQ onto NVFP4: w [E, out, in] rotated, hu [E, in, in] upper factor of H^-1. Block scales are set from the
+    error-fed weights when the column loop reaches each block of 16."""
+    w = w.float().clone()
+    g = (w.abs().amax((1, 2), keepdim=True) / (6 * 448)).clamp_min(1e-30)
+    grid = FP4_GRID.to(w.device)
+    mid = (grid[1:] + grid[:-1]) / 2
+    q = torch.empty_like(w)
+    for j in range(w.shape[2]):
+        if j % 16 == 0:
+            b = w[:, :, j : j + 16]
+            s = ((b.abs().amax(2) / 6 / g[:, :, 0]).to(torch.float8_e4m3fn).float() * g[:, :, 0]).clamp_min(1e-30)
+        col = w[:, :, j]
+        q[:, :, j] = grid[torch.bucketize((col / s).abs().clamp_max(6), mid)] * col.sign() * s
+        if j + 1 < w.shape[2]:
+            err = (col - q[:, :, j]) / hu[:, j, j].unsqueeze(1)
+            w[:, :, j + 1 :] -= err.unsqueeze(2) * hu[:, j, j + 1 :].unsqueeze(1)
+    return q
+
+
+def quant_batch(ws, hs, k, seeds, lut, mode="ms"):
+    """mode: ms; fp4round (the MS output rounded to NVFP4); e2m1 (the trellis searches on the E2M1 grid, one FP16
+    scale per row); gptqfp4 (GPTQ onto NVFP4, k unused). All in the rotated domain, where a kernel decodes."""
     blk = 512 if ws[0].shape[1] % 512 == 0 else 128
     rot = [ms.rotate_weight_and_hessian(w, h, block_size=blk, seed=sd) for w, h, sd in zip(ws, hs, seeds)]
     hu = torch.stack([ms.cholesky_inv_upper(r[1]) for r in rot])
-    _, _, q = viterbi_code_batched_cuda(torch.stack([r[0] for r in rot]), hu, k, lut)
+    w_rot = torch.stack([r[0] for r in rot])
+    if mode == "gptqfp4":
+        q = gptq_nvfp4(w_rot, hu)
+    elif mode == "e2m1":
+        lut4, c = fp4_lut(lut)
+        _, _, q = viterbi_code_batched_cuda(w_rot, hu, k, lut4, fp4_c=c)
+    else:
+        _, _, q = viterbi_code_batched_cuda(w_rot, hu, k, lut)
+    if mode == "fp4round":
+        q = torch.stack([nvfp4(qi) for qi in q])
     return [ms.fwht_blocks(q[i], block_size=blk) * rot[i][2].unsqueeze(0) for i in range(len(ws))]
 
 
@@ -162,10 +218,12 @@ def expert_out(xs, gu, dn):
     return (F.silu(g) * u) @ dn.T
 
 
-def quantize_experts(moe, x, idx, k, lut, experts, eb: int = 8, tau: float = 0.0, l: int = 0, errs=None):
+def quantize_experts(moe, x, idx, k, lut, experts, eb: int = 8, tau: float = 0.0, l: int = 0, errs=None, mode="ms",
+                     errs_proj=None):
     """Quantize the listed experts in place; all others keep their BF16 weights. tau > 0: the converter's shrunk
     Hessians. Each expert's Hessians are built before its weights are overwritten. errs (a dict): per expert, the
-    squared output error of the coded expert on its own calibration tokens (unweighted by the router)."""
+    squared output error of the coded expert on its own calibration tokens (unweighted by the router). errs_proj:
+    optional {"gate": {}, "up": {}, "down": {}} for each projection's isolated squared output error."""
     from ms_flashnext_convert import expert_hessians
     ex = moe.experts
     dev = ex.gate_up_proj.device   # x may be in host RAM: each expert's tokens go to the GPU on their own
@@ -174,31 +232,50 @@ def quantize_experts(moe, x, idx, k, lut, experts, eb: int = 8, tau: float = 0.0
         h_all = sum((c := b.to(dev).float()).T @ c for b in x.split(65536)) / x.shape[0]
         x_ref = x[torch.randperm(x.shape[0], generator=torch.Generator().manual_seed(l))[:2048].to(x.device)].to(dev)
     gu_q, dn_q = ex.gate_up_proj.data, ex.down_proj.data
+    n_ff = gu_q.shape[1] // 2
     for e0 in range(0, len(experts), eb):
         es = experts[e0 : e0 + eb]
         gus, dns, hgu, hdn = [], [], [], []
         for e in es:
-            wgu = ex.gate_up_proj[e].float()
+            wgu = ex.gate_up_proj[e].float().clone()
             gus.append(wgu)
-            dns.append(ex.down_proj[e].float())
+            dns.append(ex.down_proj[e].float().clone())
             sel = (idx == e).any(-1).nonzero().squeeze(1)
             h_gu, h_dn, _ = expert_hessians(x[sel.to(x.device)].to(dev), idx[sel], e, wgu, None, tau, h_all, x_ref)
             hgu.append(h_gu)
             hdn.append(h_dn)
-        for e, q in zip(es, quant_batch(gus, hgu, k, [2 * e + 1 for e in es], lut)):
+        for e, q in zip(es, quant_batch(gus, hgu, k, [2 * e + 1 for e in es], lut, mode)):
             gu_q[e] = q.to(gu_q.dtype)
-        for e, q in zip(es, quant_batch(dns, hdn, k, [2 * e + 2 for e in es], lut)):
+        for e, q in zip(es, quant_batch(dns, hdn, k, [2 * e + 2 for e in es], lut, mode)):
             dn_q[e] = q.to(dn_q.dtype)
         del hgu, hdn   # the Hessians are done: free them before the error pass
-        if errs is not None:
+        if errs is not None or errs_proj is not None:
             for e, wgu, wdn in zip(es, gus, dns):
                 sel = (idx == e).any(-1).nonzero().squeeze(1).to(x.device)
-                err = 0.0
+                err = eg = eu = ed = 0.0
+                qg, qd = gu_q[e].float(), dn_q[e].float()
+                if errs_proj is not None:
+                    gu_gate = torch.cat([qg[:n_ff], wgu[n_ff:]], dim=0)
+                    gu_up = torch.cat([wgu[:n_ff], qg[n_ff:]], dim=0)
                 for c in range(0, sel.numel(), 8192):
                     xs = x[sel[c : c + 8192]].to(dev).float()
-                    d = expert_out(xs, gu_q[e].float(), dn_q[e].float()) - expert_out(xs, wgu, wdn)
-                    err += (d * d).sum().item()
-                errs[e] = err
+                    y0 = expert_out(xs, wgu, wdn)
+                    if errs is not None:
+                        d = expert_out(xs, qg, qd) - y0
+                        err += (d * d).sum().item()
+                    if errs_proj is not None:
+                        dg = expert_out(xs, gu_gate, wdn) - y0
+                        du = expert_out(xs, gu_up, wdn) - y0
+                        dd = expert_out(xs, wgu, qd) - y0
+                        eg += (dg * dg).sum().item()
+                        eu += (du * du).sum().item()
+                        ed += (dd * dd).sum().item()
+                if errs is not None:
+                    errs[e] = err
+                if errs_proj is not None:
+                    errs_proj["gate"][e] = eg
+                    errs_proj["up"][e] = eu
+                    errs_proj["down"][e] = ed
         torch.cuda.empty_cache()   # the error pass's blocks back before the next batch's Hessians
         if e0 % 128 == 0:
             print(f"    k {k} experts {e0}: peak alloc {torch.cuda.max_memory_allocated() / 2**30:.1f} "
@@ -258,6 +335,8 @@ def main() -> None:
     p.add_argument("--stop-after", type=int, default=None, help="last layer to scan in this run")
     p.add_argument("--mix", action="store_true", help="with --per-expert: measure the per-expert mixes too")
     p.add_argument("--expert-batch", type=int, default=8, help="experts coded per Viterbi call (fewer: less GPU memory)")
+    p.add_argument("--fp4", action="store_true",
+                   help="also: NVFP4 RTN and GPTQ, and per width the MS output rounded to NVFP4 and the trellis on the E2M1 grid")
     p.add_argument("--per-expert", action="store_true",
                    help="also: each expert's own output error at every width (experts_<layer>.json)")
     args = p.parse_args()
@@ -326,12 +405,20 @@ def main() -> None:
         t_fwd = time.time() - t0 - t_load
         gu_ref, dn_ref = moe.experts.gate_up_proj.data.cpu(), moe.experts.down_proj.data.cpu()   # originals in RAM
 
-        def measure(plan, name):
-            """Code each width's experts, measure on the held-out tokens, put the BF16 weights back."""
+        def measure(plan, name, mode="ms"):
+            """Code each width's experts, measure on the held-out tokens, put the BF16 weights back.
+            k 0: plain NVFP4 round-to-nearest of the BF16 weights."""
             tq = time.time()
             for k, es in plan.items():
-                quantize_experts(moe, x, idx, k, lut, es, eb=args.expert_batch, tau=args.hess_tau, l=l,
-                                 errs=errs.setdefault(k, {}) if name[0] == "C" and args.per_expert else None)
+                if k == 0:
+                    for e in es:
+                        moe.experts.gate_up_proj.data[e] = nvfp4(moe.experts.gate_up_proj[e]).to(gu_ref.dtype)
+                        moe.experts.down_proj.data[e] = nvfp4(moe.experts.down_proj[e]).to(dn_ref.dtype)
+                    continue
+                per_e = name[0] == "C" and args.per_expert and mode == "ms"
+                quantize_experts(moe, x, idx, k, lut, es, eb=args.expert_batch, tau=args.hess_tau, l=l, mode=mode,
+                                 errs=errs.setdefault(k, {}) if per_e else None,
+                                 errs_proj={p: errs_proj[p].setdefault(k, {}) for p in ("gate", "up", "down")} if per_e else None)
             y_q = []
             h_q = run_layer(layer, h_ev, kw_ev, bs, grab_out=y_q)
             y_q = torch.cat(y_q)
@@ -343,16 +430,25 @@ def main() -> None:
                 "out_rel": rel(h_q.float(), h_ref.float()),
                 "seconds": round(time.time() - tq, 1),
             }
-            print(f"  {name}: {rec[name]['seconds']}s, peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
+            print(f"  {name}: out {rec[name]['out_rel']:.5f} moe {rec[name]['moe_rel']:.4f}, {rec[name]['seconds']}s, "
+                  f"peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
 
         errs: dict = {}
+        errs_proj: dict = {"gate": {}, "up": {}, "down": {}}
         print(f"layer {l}: forward done, peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
         for k in args.widths:
             measure({k: sample}, f"C{k}")
+        if args.fp4:
+            measure({0: sample}, "NVFP4")
+            for k in args.widths:
+                measure({k: sample}, f"C{k}fp4", "fp4round")
+                measure({k: sample}, f"C{k}e2m1", "e2m1")
+            measure({4: sample}, "GPTQfp4", "gptqfp4")
         if args.per_expert:
             from ms_plan_solver import layer_bytes, solve
             size = lambda k: layer_bytes(k, n_exp=1)
-            (args.out_dir / f"experts_{l}.json").write_text(json.dumps({"counts": counts.tolist(), "errs": errs}))
+            (args.out_dir / f"experts_{l}.json").write_text(
+                json.dumps({"counts": counts.tolist(), "errs": errs, "errs_proj": errs_proj}))
             for k0 in args.widths[1:-1] if args.mix else []:   # a mix needs a narrower and a wider width than its budget
                 pick = solve({e: {k: errs[k][e] for k in args.widths} for e in sample}, len(sample) * size(k0), size)
                 plan = {k: [e for e in sample if pick[e] == k] for k in args.widths}
@@ -364,7 +460,7 @@ def main() -> None:
         with open(args.out_dir / "scan.jsonl", "a") as f:
             f.write(json.dumps(rec) + "\n")
         torch.save({"next_layer": l + 1, "h_cal": h_cal, "h_ev": h_ev}, state)
-        names = [n for n in rec if n[0] in "Cm" and isinstance(rec[n], dict)]
+        names = [n for n in rec if n[0] in "CmN" and isinstance(rec[n], dict)]
         widths = " | ".join(f"{n} out {rec[n]['out_rel']:.5f} moe {rec[n]['moe_rel']:.4f}" for n in names)
         quant = sum(rec[n]["seconds"] for n in names)
         print(f"layer {l:2d} {rec['type']:>17}: {widths} | zero-token experts "
