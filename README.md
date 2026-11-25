@@ -13,12 +13,9 @@ A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compa
 
 <p align="center"><img src="docs/img/frontend.gif" alt="The web UI while a reply streams" width="720"></p>
 
-**Help wanted:** have some spare compute to lend for testing? See [Contributing](CONTRIBUTING.md#other-ways-to-help).
-
 <p align="center">
-  <a href="https://github.com/sponsors/jesdga95"><img src="assets/donate/github.svg" height="44" alt="Sponsor on GitHub"></a>
-  <a href="https://ko-fi.com/jesdga"><img src="assets/donate/kofi.svg" height="44" alt="Support on Ko-fi"></a>
-  <a href="https://paypal.me/jesdga"><img src="assets/donate/paypal.svg" height="44" alt="Donate on PayPal"></a>
+  <a href="https://github.com/sponsors/artiik373"><img src="assets/donate/github.svg" height="44" alt="Sponsor on GitHub"></a>
+  <a href="https://www.paypal.com/donate/?hosted_button_id=6JDA4WJHY9Y58"><img src="assets/donate/paypal.svg" height="44" alt="Donate on PayPal"></a>
 </p>
 
 ## Requirements
