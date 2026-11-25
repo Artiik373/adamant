@@ -90,9 +90,10 @@ def refit_scales(w: torch.Tensor, states: torch.Tensor, scales: torch.Tensor, h:
 
 def _viterbi_with_scale_passes(w_rot: torch.Tensor, hu: torch.Tensor, h_rot: torch.Tensor, k: int, lut, passes: int,
                                viterbi: tuple[int, int]):
-    scales0, states, _ = viterbi_code_batched_cuda(w_rot, hu, k, lut, *viterbi)
-    scales, q = refit_scales(w_rot, states, scales0, h_rot, lut)
-    if passes >= 2 and bool((scales != scales0).any()):
+    if passes >= 2 and k <= 3:
+        coarse = (min(viterbi[0], 16), min(viterbi[1], 12))
+        scales0, states, _ = viterbi_code_batched_cuda(w_rot, hu, k, lut, *coarse)
+        scales, q = refit_scales(w_rot, states, scales0, h_rot, lut)
         scales2, states2, _ = viterbi_code_batched_cuda(w_rot, hu, k, lut, *viterbi, scales=scales)
         scales2, q2 = refit_scales(w_rot, states2, scales2, h_rot, lut)
         e1 = (torch.bmm(w_rot - q, h_rot) * (w_rot - q)).sum(-1)
@@ -101,6 +102,9 @@ def _viterbi_with_scale_passes(w_rot: torch.Tensor, hu: torch.Tensor, h_rot: tor
         scales = torch.where(better, scales2, scales)
         states = torch.where(better.unsqueeze(-1), states2, states)
         q = torch.where(better.unsqueeze(-1), q2, q)
+        return scales, states, q
+    scales0, states, _ = viterbi_code_batched_cuda(w_rot, hu, k, lut, *viterbi)
+    scales, q = refit_scales(w_rot, states, scales0, h_rot, lut)
     return scales, states, q
 
 
@@ -112,7 +116,10 @@ def code(ws: torch.Tensor, hs: torch.Tensor, k: int, lut, seeds, sign_trials: in
     passes = SCALE_PASSES if scale_passes is None else scale_passes
     vit = VITERBI if viterbi is None else viterbi
     if trials > 1:
-        seeds = [ms.best_sign_seed_joint(w, h, blk, s, trials) for w, h, s in zip(ws, hs, seeds)]
+        if ws.shape[2] <= 1024:
+            seeds = [ms.best_sign_seed_joint(w, h, blk, s, trials) for w, h, s in zip(ws, hs, seeds)]
+        else:
+            seeds = [ms.best_sign_seed(w, blk, s, trials) for w, s in zip(ws, seeds)]
     rot = [ms.rotate_weight_and_hessian(w, h, block_size=blk, seed=s) for w, h, s in zip(ws, hs, seeds)]
     hu = torch.stack([ms.cholesky_inv_upper(r[1]) for r in rot])
     w_rot = torch.stack([r[0] for r in rot])

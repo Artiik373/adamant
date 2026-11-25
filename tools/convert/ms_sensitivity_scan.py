@@ -193,7 +193,7 @@ def gptq_nvfp4(w, hu):
     return q
 
 
-def quant_batch(ws, hs, k, seeds, lut, mode="ms"):
+def quant_batch(ws, hs, k, seeds, lut, mode="ms", viterbi=(32, 8)):
     """mode: ms; fp4round (the MS output rounded to NVFP4); e2m1 (the trellis searches on the E2M1 grid, one FP16
     scale per row); gptqfp4 (GPTQ onto NVFP4, k unused). All in the rotated domain, where a kernel decodes."""
     blk = 512 if ws[0].shape[1] % 512 == 0 else 128
@@ -204,9 +204,9 @@ def quant_batch(ws, hs, k, seeds, lut, mode="ms"):
         q = gptq_nvfp4(w_rot, hu)
     elif mode == "e2m1":
         lut4, c = fp4_lut(lut)
-        _, _, q = viterbi_code_batched_cuda(w_rot, hu, k, lut4, fp4_c=c)
+        _, _, q = viterbi_code_batched_cuda(w_rot, hu, k, lut4, *viterbi, fp4_c=c)
     else:
-        _, _, q = viterbi_code_batched_cuda(w_rot, hu, k, lut)
+        _, _, q = viterbi_code_batched_cuda(w_rot, hu, k, lut, *viterbi)
     if mode == "fp4round":
         q = torch.stack([nvfp4(qi) for qi in q])
     return [ms.fwht_blocks(q[i], block_size=blk) * rot[i][2].unsqueeze(0) for i in range(len(ws))]
@@ -219,7 +219,7 @@ def expert_out(xs, gu, dn):
 
 
 def quantize_experts(moe, x, idx, k, lut, experts, eb: int = 8, tau: float = 0.0, l: int = 0, errs=None, mode="ms",
-                     errs_proj=None):
+                     errs_proj=None, viterbi=(32, 8)):
     """Quantize the listed experts in place; all others keep their BF16 weights. tau > 0: the converter's shrunk
     Hessians. Each expert's Hessians are built before its weights are overwritten. errs (a dict): per expert, the
     squared output error of the coded expert on its own calibration tokens (unweighted by the router). errs_proj:
@@ -244,9 +244,9 @@ def quantize_experts(moe, x, idx, k, lut, experts, eb: int = 8, tau: float = 0.0
             h_gu, h_dn, _ = expert_hessians(x[sel.to(x.device)].to(dev), idx[sel], e, wgu, None, tau, h_all, x_ref)
             hgu.append(h_gu)
             hdn.append(h_dn)
-        for e, q in zip(es, quant_batch(gus, hgu, k, [2 * e + 1 for e in es], lut, mode)):
+        for e, q in zip(es, quant_batch(gus, hgu, k, [2 * e + 1 for e in es], lut, mode, viterbi)):
             gu_q[e] = q.to(gu_q.dtype)
-        for e, q in zip(es, quant_batch(dns, hdn, k, [2 * e + 2 for e in es], lut, mode)):
+        for e, q in zip(es, quant_batch(dns, hdn, k, [2 * e + 2 for e in es], lut, mode, viterbi)):
             dn_q[e] = q.to(dn_q.dtype)
         del hgu, hdn   # the Hessians are done: free them before the error pass
         if errs is not None or errs_proj is not None:
@@ -335,6 +335,8 @@ def main() -> None:
     p.add_argument("--stop-after", type=int, default=None, help="last layer to scan in this run")
     p.add_argument("--mix", action="store_true", help="with --per-expert: measure the per-expert mixes too")
     p.add_argument("--expert-batch", type=int, default=8, help="experts coded per Viterbi call (fewer: less GPU memory)")
+    p.add_argument("--window", type=int, default=24, help="Viterbi search window for scan (default 24)")
+    p.add_argument("--commit", type=int, default=12, help="Viterbi commit length for scan (default 12)")
     p.add_argument("--fp4", action="store_true",
                    help="also: NVFP4 RTN and GPTQ, and per width the MS output rounded to NVFP4 and the trellis on the E2M1 grid")
     p.add_argument("--per-expert", action="store_true",
@@ -418,7 +420,8 @@ def main() -> None:
                 per_e = name[0] == "C" and args.per_expert and mode == "ms"
                 quantize_experts(moe, x, idx, k, lut, es, eb=args.expert_batch, tau=args.hess_tau, l=l, mode=mode,
                                  errs=errs.setdefault(k, {}) if per_e else None,
-                                 errs_proj={p: errs_proj[p].setdefault(k, {}) for p in ("gate", "up", "down")} if per_e else None)
+                                 errs_proj={p: errs_proj[p].setdefault(k, {}) for p in ("gate", "up", "down")} if per_e else None,
+                                 viterbi=(args.window, args.commit))
             y_q = []
             h_q = run_layer(layer, h_ev, kw_ev, bs, grab_out=y_q)
             y_q = torch.cat(y_q)
