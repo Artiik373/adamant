@@ -14,6 +14,7 @@
 #include "basalt/kernels/row_norm.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "basalt/models/inkling2/qsa_kernels.hpp"
 #include "basalt/models/inkling2/prompt_kernels.hpp"
 #include "basalt/prefill/moe_mxfp8.hpp"
 #include "basalt/prefill/q8_gemm.hpp"
@@ -592,6 +593,10 @@ private:
         ap.r = b().r;
         ap.sink = b().sink;
         attn_prepare(ap, rows, strm());
+        if (const QsaVisit* qv = m_.qsa().of(s.visit)) {   // the QSA block keys of the chunk (its attention stays dense)
+            qsa_project(in[1], nullptr, w.k_norm, g_.rms_eps, qv->wk, kQsaDim, rows, c.qsa_scr, strm());
+            qsa_keys(c.qsa_scr, b().pos, rows, qv->k_norm, c.qsa_ring, c.qsa_blocks, strm());
+        }
         AttnPromptArgs aa;
         aa.q = b().q;
         aa.r = b().r;

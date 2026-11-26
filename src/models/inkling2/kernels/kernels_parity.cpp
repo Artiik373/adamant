@@ -11,6 +11,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "basalt/models/inkling2/qsa_kernels.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -578,6 +579,60 @@ void test_attention() {
         const double keys = window ? kExtent : p0 + 3;
         std::printf("  %.1f us a call (1 row, %.0f keys: %.0f GB/s of K and V)\n", us, keys,
                     keys * kKvHeads * kv_bytes(kv) * 2 / us / 1e3);
+        if (!window) {   // a QSA selection: row r reads the listed 4-position blocks (ascending) and its tail only
+            const int K = 200;
+            std::vector<int32_t> sel((size_t) R * K, -1);
+            for (int r = 0; r < R; ++r) {
+                std::vector<int32_t> all((pos[r] + 1) / 4);
+                for (size_t b = 0; b < all.size(); ++b) all[b] = (int32_t) b;
+                std::shuffle(all.begin(), all.end(), rng);
+                std::sort(all.begin(), all.begin() + K);
+                std::copy(all.begin(), all.begin() + K, sel.begin() + (size_t) r * K);
+            }
+            int32_t* dsel = dev(sel);
+            AttnArgs sa = a;
+            sa.sel = dsel;
+            sa.sel_k = K;
+            float* outs = zeros<float>((size_t) R * kHeads * kHeadDim);
+            attention_decode(sa, R, max_keys, scr, outs, nullptr);
+            const std::vector<float> gs = host(outs, (size_t) R * kHeads * kHeadDim);
+            std::vector<double> rs2(gs.size());
+            for (int r = 0; r < R; ++r) {
+                std::vector<int> listed;
+                for (int i = 0; i < K; ++i)
+                    for (int j = 0; j < 4; ++j) listed.push_back(sel[(size_t) r * K + i] * 4 + j);
+                for (int k = (pos[r] + 1) / 4 * 4; k <= pos[r]; ++k) listed.push_back(k);
+                for (int h = 0; h < kHeads; ++h) {
+                    const int g = h / 3;
+                    std::vector<double> sc;
+                    double m = sink[(size_t) r * kHeads + h];
+                    for (const int k : listed) {
+                        double d = 0;
+                        for (int i = 0; i < kHeadDim; ++i) d += (double) q[((size_t) r * kHeads + h) * kHeadDim + i] * kd[((size_t) (k % cap) * kKvHeads + g) * kHeadDim + i];
+                        d *= a.scale;
+                        const int dist = pos[r] - k;
+                        if (dist < kExtent)
+                            for (int i = 0; i < kRel; ++i) d += (double) rs[((size_t) r * kHeads + h) * kRel + i] * table[(size_t) i * kExtent + dist];
+                        sc.push_back(d);
+                        m = std::max(m, d);
+                    }
+                    double den = std::exp(sink[(size_t) r * kHeads + h] - m);
+                    for (double& x : sc) den += (x = std::exp(x - m));
+                    for (int i = 0; i < kHeadDim; ++i) {
+                        double acc = 0;
+                        for (size_t j = 0; j < listed.size(); ++j) acc += sc[j] * vd[((size_t) (listed[j] % cap) * kKvHeads + g) * kHeadDim + i];
+                        rs2[((size_t) r * kHeads + h) * kHeadDim + i] = acc / den;
+                    }
+                }
+            }
+            report("  QSA selection, 200 blocks", gs, rs2, 2e-3);
+            AttnArgs s1 = sa;
+            s1.q = one.q; s1.r = one.r; s1.sink = one.sink; s1.pos = one.pos; s1.sel = dsel + 2 * K;
+            attention_decode(s1, 1, max_keys, scr, out1, nullptr);
+            g1 = host(out1, (size_t) kHeads * kHeadDim);
+            same_bits("  QSA, a row alone", g1.data(), &gs[(size_t) 2 * kHeads * kHeadDim], g1.size() * 4);
+            std::printf("  %.1f us a call (1 row, QSA %d blocks of %d keys)\n", time_us([&] { attention_decode(s1, 1, max_keys, scr, out1, nullptr); }), K, p0 + 3);
+        }
         if (mode == 1) {   // a short context: the latency a decode token sees early on
             std::vector<int> p1 = {40};
             int* dp1 = dev(p1);
@@ -810,8 +865,7 @@ void test_loopcd_logits() {   // a decode window's head rows over a vocabulary-s
                 ref[i] = kept[i] = 0;
             }
         failures += !mask_ok;
-        if (!mask_ok) std::printf("loopcd logits: plausibility mask differs  FAIL
-");
+        if (!mask_ok) std::printf("loopcd logits: plausibility mask differs  FAIL\n");
         report(adaptive ? "loopcd logits (adaptive)" : "loopcd logits (fixed)", kept, ref, 1e-4);
     }
 }
@@ -2115,6 +2169,172 @@ void test_attention_window_boundary() {
 
 }  // namespace
 
+// ---- the QSA indexer ---------------------------------------------------------------------------------------------------
+
+void test_qsa() {
+    // the projections: fp32 rows normed in the kernel, and q8_1 rows
+    {
+        const int R = 5, N = kQsaHeads * kQsaDim;
+        const std::vector<float> x = randn((size_t) R * E, 1.3f), nw = randn(E, 0.2f, 1.f), wf = randn((size_t) N * E, 0.02f);
+        std::vector<uint16_t> w(wf.size());
+        for (size_t i = 0; i < w.size(); ++i) w[i] = f2h(wf[i]);
+        std::vector<uint8_t> x8((size_t) R * E / 32 * 36);
+        std::vector<double> xd8((size_t) R * E);
+        for (size_t b = 0; b < (size_t) R * E / 32; ++b) {
+            float m = 0.f;
+            for (int i = 0; i < 32; ++i) m = std::max(m, std::fabs(x[b * 32 + i]));
+            const uint16_t dh = f2h(m / 127.f);
+            const double d = h2d(dh);
+            std::memcpy(&x8[b * 36], &dh, 2);
+            for (int i = 0; i < 32; ++i) {
+                const int c = (int) std::lrint(x[b * 32 + i] / d);
+                x8[b * 36 + 4 + i] = (uint8_t) (int8_t) std::clamp(c, -127, 127);
+                xd8[b * 32 + i] = d * (int8_t) x8[b * 36 + 4 + i];
+            }
+        }
+        float *dx = dev(x), *dn = dev(nw), *out = zeros<float>((size_t) R * N);
+        uint16_t* dw = dev(w);
+        uint8_t* dx8 = dev(x8);
+        for (int q8 = 0; q8 < 2; ++q8) {
+            qsa_project(dx, q8 ? dx8 : nullptr, dn, 1e-6f, dw, N, R, out, nullptr);
+            const std::vector<float> got = host(out, (size_t) R * N);
+            std::vector<double> ref(got.size());
+            for (int r = 0; r < R; ++r) {
+                std::vector<double> xn(E);
+                double ss = 0;
+                for (int i = 0; i < E; ++i) ss += (double) x[(size_t) r * E + i] * x[(size_t) r * E + i];
+                const double inv = 1.0 / std::sqrt(ss / E + 1e-6);
+                for (int i = 0; i < E; ++i) xn[i] = q8 ? xd8[(size_t) r * E + i] : x[(size_t) r * E + i] * inv * nw[i];
+                for (int n = 0; n < N; ++n) {
+                    double acc = 0;
+                    for (int i = 0; i < E; ++i) acc += h2d(w[(size_t) n * E + i]) * xn[i];
+                    ref[(size_t) r * N + n] = acc;
+                }
+            }
+            report(q8 ? "qsa_project (q8_1 rows)" : "qsa_project (fp32, normed)", got, ref, 2e-5);
+        }
+        qsa_project(dx, dx8, dn, 1e-6f, dw, N, R, out, nullptr);
+        const std::vector<float> all = host(out, (size_t) R * N);
+        qsa_project(dx + 3 * E, dx8 + 3 * E / 32 * 36, dn, 1e-6f, dw, N, 1, out, nullptr);
+        const std::vector<float> one = host(out, N);
+        same_bits("  a row alone", one.data(), &all[(size_t) 3 * N], (size_t) N * 4);
+        std::printf("  %.1f us a call (1 row, %d outputs)\n", time_us([&] { qsa_project(dx, dx8, dn, 1e-6f, dw, N, 1, out, nullptr); }), N);
+        std::printf("  %.1f us a call (1 row, %d outputs)\n", time_us([&] { qsa_project(dx, dx8, dn, 1e-6f, dw, kQsaDim, 1, out, nullptr); }), kQsaDim);
+        float *big = dev(randn((size_t) 512 * E, 1.f)), *big_out = zeros<float>((size_t) 512 * kQsaDim);
+        std::printf("  %.1f us a call (512 rows, %d outputs, fp32)\n",
+                    time_us([&] { qsa_project(big, nullptr, dn, 1e-6f, dw, kQsaDim, 512, big_out, nullptr); }, 5), kQsaDim);
+    }
+    // the block keys: a prompt chunk, then decode windows reading the positions before them from the ring
+    const int PR = 3001;   // the chunk's rows; windows of 1, 3, 5, 7 rows follow
+    const int64_t n_blk = 1024;
+    const std::vector<float> knw = randn(kQsaDim, 0.2f, 1.f);
+    const std::vector<float> raw_all = randn((size_t) (PR + 16) * kQsaDim, 0.7f);
+    float* dknw = dev(knw);
+    float* ring = zeros<float>((size_t) kQsaRing * kQsaDim);
+    uint16_t* blocks = zeros<uint16_t>((size_t) n_blk * kQsaDim);
+    {
+        float* draw = dev(raw_all);
+        int* dp = dev(std::vector<int>{0});
+        qsa_keys(draw, dp, PR, dknw, ring, blocks, nullptr);
+        for (int w0 = PR, i = 0; w0 < PR + 16; ++i) {
+            const int n = std::min(1 + 2 * (i % 4), PR + 16 - w0);
+            int* dpw = dev(std::vector<int>{w0});
+            qsa_keys(draw + (size_t) w0 * kQsaDim, dpw, n, dknw, ring, blocks, nullptr);
+            w0 += n;
+        }
+        const int whole = (PR + 16) / 4;
+        const std::vector<uint16_t> gb = host(blocks, (size_t) whole * kQsaDim);
+        std::vector<float> got(gb.size());
+        std::vector<double> ref(gb.size());
+        for (size_t i = 0; i < gb.size(); ++i) got[i] = (float) h2d(gb[i]);
+        for (int b = 0; b < whole; ++b) {
+            std::vector<double> m(kQsaDim, 0.0);
+            double ss = 0;
+            for (int d = 0; d < kQsaDim; ++d) {
+                for (int j = 0; j < 4; ++j) m[d] += raw_all[(size_t) (b * 4 + j) * kQsaDim + d];
+                m[d] *= 0.25;
+                ss += m[d] * m[d];
+            }
+            const double inv = 1.0 / std::sqrt(ss / kQsaDim + 1e-6);
+            for (int d = 0; d < kQsaDim; ++d) ref[(size_t) b * kQsaDim + d] = m[d] * inv * knw[d];
+        }
+        report("qsa_keys (chunk, then windows)", got, ref, 1e-3);
+        const std::vector<float> gr = host(ring, (size_t) kQsaRing * kQsaDim);
+        bool ring_ok = true;
+        for (int q = PR + 16 - kQsaRing; q < PR + 16; ++q)
+            ring_ok = ring_ok && !std::memcmp(&gr[(size_t) (q % kQsaRing) * kQsaDim], &raw_all[(size_t) q * kQsaDim], kQsaDim * 4);
+        std::printf("%-34s %s\n", "  the ring", ring_ok ? "ok" : "FAIL");
+        failures += !ring_ok;
+        // timed on scratch copies: the checked state stays as it is
+        float* ring2 = zeros<float>((size_t) kQsaRing * kQsaDim);
+        uint16_t* blocks2 = zeros<uint16_t>((size_t) n_blk * kQsaDim);
+        int* dp3 = dev(std::vector<int>{PR + 3});
+        std::printf("  %.1f us a call (1 row)\n", time_us([&] { qsa_keys(draw, dp3, 1, dknw, ring2, blocks2, nullptr); }));
+    }
+    // the selection over those keys: scores against a CPU reference, the blocks against the rule applied to the scores
+    {
+        const int R = 4, sink = 4, local = 64;
+        std::vector<int> pos(R);
+        for (int r = 0; r < R; ++r) pos[r] = PR + 11 + r;
+        const std::vector<float> q = randn((size_t) R * kQsaHeads * kQsaDim, 1.f), qnw = randn(kQsaDim, 0.2f, 1.f);
+        const std::vector<float> wh = {0.9f, 1.3f, 0.6f, 1.1f};
+        float *dq = zeros<float>(q.size()), *dqn = dev(qnw), *dwh = dev(wh), *scores = zeros<float>((size_t) R * n_blk);
+        int* dpos = dev(pos);
+        const std::vector<uint16_t> gb = host(blocks, (size_t) n_blk * kQsaDim);
+        for (const int K : {256, 700}) {   // 700: the threshold falls among the zero scores
+            int32_t* sel = zeros<int32_t>((size_t) R * K);
+            basalt::core::device_copy(dq, q.data(), q.size() * 4, cudaMemcpyHostToDevice);
+            qsa_select(dq, dqn, dwh, blocks, dpos, R, sink, local, K, n_blk, scores, sel, nullptr);
+            const std::vector<float> gs = host(scores, (size_t) R * n_blk);
+            const std::vector<int32_t> gsel = host(sel, (size_t) R * K);
+            std::vector<float> got;
+            std::vector<double> ref;
+            bool sel_ok = true;
+            int zeros_at_cut = 0;
+            for (int r = 0; r < R; ++r) {
+                const int nb = (pos[r] + 1) / 4;
+                std::vector<double> qn((size_t) kQsaHeads * kQsaDim);
+                for (int h = 0; h < kQsaHeads; ++h) {
+                    double ss = 0;
+                    for (int d = 0; d < kQsaDim; ++d) ss += (double) q[((size_t) r * kQsaHeads + h) * kQsaDim + d] * q[((size_t) r * kQsaHeads + h) * kQsaDim + d];
+                    const double inv = 1.0 / std::sqrt(ss / kQsaDim + 1e-6);
+                    for (int d = 0; d < kQsaDim; ++d) qn[(size_t) h * kQsaDim + d] = q[((size_t) r * kQsaHeads + h) * kQsaDim + d] * inv * qnw[d];
+                }
+                for (int b = sink; b < nb - local; ++b) {
+                    double sc = 0;
+                    for (int h = 0; h < kQsaHeads; ++h) {
+                        double dot = 0;
+                        for (int d = 0; d < kQsaDim; ++d) dot += qn[(size_t) h * kQsaDim + d] * h2d(gb[(size_t) b * kQsaDim + d]);
+                        sc += wh[h] * std::max(dot, 0.0);
+                    }
+                    got.push_back(gs[(size_t) r * n_blk + b]);
+                    ref.push_back(sc / std::sqrt(128.0));
+                }
+                // the rule on the kernel's own scores: the k largest, ties to the lowest index, listed ascending
+                std::vector<int> idx(nb);
+                for (int b = 0; b < nb; ++b) idx[b] = b;
+                const auto key = [&](int b) { return std::max(gs[(size_t) r * n_blk + b], 0.f); };
+                std::stable_sort(idx.begin(), idx.end(), [&](int x, int y) { return key(x) > key(y); });
+                const int take = std::min(K, nb);
+                zeros_at_cut += take < nb && key(idx[take - 1]) == 0.f;
+                std::vector<int> want(idx.begin(), idx.begin() + take);
+                std::sort(want.begin(), want.end());
+                for (int i = 0; i < K; ++i) sel_ok = sel_ok && gsel[(size_t) r * K + i] == (i < take ? want[i] : -1);
+                for (int b = 0; b < sink; ++b) sel_ok = sel_ok && std::binary_search(want.begin(), want.end(), b);
+                for (int b = nb - local; b < nb; ++b) sel_ok = sel_ok && std::binary_search(want.begin(), want.end(), b);
+            }
+            char tag[64];
+            std::snprintf(tag, sizeof tag, "qsa_select scores (k %d)", K);
+            report(tag, got, ref, 1e-5);
+            std::printf("%-34s %s (%d rows cut among zero scores)\n", "  the blocks", sel_ok ? "ok" : "FAIL", zeros_at_cut);
+            failures += !sel_ok;
+            std::printf("  %.1f us a call (1 row, %d blocks, k %d)\n",
+                        time_us([&] { qsa_select(dq, dqn, dwh, blocks, dpos, 1, sink, local, K, n_blk, scores, sel, nullptr); }),
+                        (pos[0] + 1) / 4, K);
+        }
+    }
+}
+
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
@@ -2144,6 +2364,7 @@ int main() {
     test_heat_fold();
     test_batch_window();
     test_attention_window_boundary();
+    test_qsa();
     std::printf("inkling2_kernels_parity: %d failures\n", failures);
     return failures ? 1 : 0;
 }

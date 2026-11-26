@@ -124,7 +124,9 @@ Development checks, one RTX 3090 at its 294 W power limit, the `NVFP4-MX8` pack,
 
 After the Basalt 0.5.7 merge (INT8 caches, shared-KV MMA attention, peer and split modes, staging changes) none of the checks
 above has run again: the merge was built and tested on no machine yet. They, the frozen hashes in `inkling2_kernels_parity`
-and `inkling2_kv_int8_parity`, and LoopCD on the new decode path are open.
+and `inkling2_kv_int8_parity`, and LoopCD on the new decode path are open. In `inkling2_kernels_parity` the three frozen
+FP16/FP8 attention hashes do not match on sm_86. All other checks pass, and so do the QSA indexer kernels
+([QSA indexer](inkling2.md#qsa-indexer)).
 
 Open: decode-path PPL/KLD against the BF16 reference (`basalt-bench --quality`; no Inkling 2 base is built locally), the
 `NVFP4-DQ8` pack, experts in RAM, and two cards.

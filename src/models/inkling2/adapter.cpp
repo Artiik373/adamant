@@ -50,7 +50,7 @@ public:
     const char* model_name() const override { return "Inkling-2-Mini"; }
     const char* community_quant() const override { return "NVFP4"; }   // NVFP4 experts, Q8_0 dense
 
-    // --kv: attention caches as fp16 (default), fp8 or scaled int8; --spec, --draft-log: drafter windows
+    // --kv: attention caches as fp16 (default), fp8 or scaled int8; --qsa-*: the QSA indexer; --spec, --draft-log: drafter windows
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int&) const override {
         if (a == "--kv") {
             o.kv = args.next("--kv");
@@ -64,6 +64,15 @@ public:
             o.loopcd_w = c == std::string::npos ? -1.f : (float) std::atof(v.c_str() + c + 1);
             return true;
         }
+        if (a == "--qsa-indexer") {
+            o.qsa_indexer = args.next("--qsa-indexer");
+            return true;
+        }
+        if (a == "--qsa-budget" || a == "--qsa-local" || a == "--qsa-sink") {
+            int& v = a == "--qsa-budget" ? o.qsa_budget : a == "--qsa-local" ? o.qsa_local : o.qsa_sink;
+            v = std::atoi(args.next(a.c_str()));
+            return true;
+        }
         return dspark_parse_flag(a, args, o);   // DSPARK HOOK
     }
 
@@ -74,6 +83,12 @@ public:
         }
         if (!o.kv.empty() && o.kv != "fp16" && o.kv != "fp8" && o.kv != "int8") {
             basalt::log::error("basalt inkling2", "--kv %s: the attention caches are fp16 (the default), fp8 or int8", o.kv.c_str());
+            return 2;
+        }
+        if (!o.qsa_indexer.empty() && (o.qsa_sink < 0 || o.qsa_local < 0 || o.qsa_budget % 4 || o.qsa_sink % 4 || o.qsa_local % 4 ||
+                                       o.qsa_budget <= o.qsa_sink + o.qsa_local)) {
+            basalt::log::error("basalt inkling2", "--qsa-budget %d, --qsa-local %d, --qsa-sink %d: multiples of 4, the budget above the other two",
+                               o.qsa_budget, o.qsa_local, o.qsa_sink);
             return 2;
         }
         dspark_finish_flags(o);   // DSPARK HOOK

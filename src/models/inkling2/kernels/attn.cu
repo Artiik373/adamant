@@ -71,6 +71,17 @@ __device__ __forceinline__ void row_keys(const AttnArgs& a, int r, int& p, int& 
     p = a.pos[r];
     lo = a.window > 0 ? max(0, p - a.window + 1) : 0;
     n = p + 1 - lo;
+    if (a.sel) {   // the selected blocks' positions, then the tail past the last whole block
+        const int whole = (p + 1) >> 2;
+        n = min(a.sel_k, whole) * 4 + (p + 1 - whole * 4);
+    }
+}
+
+// The position of a row's i-th key (i counted from lo): itself, or with a selection the i-th of its listed positions.
+__device__ __forceinline__ int key_pos(const AttnArgs& a, int r, int p, int i) {
+    if (!a.sel) return i;
+    const int whole = (p + 1) >> 2, listed = min(a.sel_k, whole) * 4;
+    return i < listed ? a.sel[(size_t) r * a.sel_k + (i >> 2)] * 4 + (i & 3) : whole * 4 + (i - listed);
 }
 
 __device__ __forceinline__ int wrap_cap(int key, int cap, bool pow2) {
@@ -183,7 +194,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, 
     }
     const int span = span_of(n);
     if (s * span >= n) return;   // past this row's slices
-    const int s_lo = lo + s * span, s_hi = min(p + 1, s_lo + span);
+    const int s_lo = lo + s * span, s_hi = min(lo + n, s_lo + span);
     constexpr int kRowBytes = FP8 ? kHeadDim : INT8 ? kKvInt8RowBytes : kHeadDim * 2;
     constexpr int kLoads = (FP8 || INT8) ? kHeadDim / 16 : kHeadDim / 8;
     const bk::WindowSegs& at = seg_table(a.seg);
@@ -197,7 +208,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, 
         const int key = t0 + lane;
         const bool valid = key < s_hi;
         ks[0] = ks[1] = vs[0] = vs[1] = 1.f;
-        const size_t cell = valid ? (size_t) wrap_cap(key, a.cap, cap_pow2) * kKvHeads * kRowBytes : 0;
+        const size_t cell = valid ? (size_t) wrap_cap(key_pos(a, r, p, key), a.cap, cap_pow2) * kKvHeads * kRowBytes : 0;
         const uint4* kp = reinterpret_cast<const uint4*>(kbase + cell);
         const uint4* vp = reinterpret_cast<const uint4*>(vbase + cell);
         if (valid) {
@@ -270,7 +281,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) attn_split_kernel(AttnArgs a, 
                     for (int h = 0; h < kGroup; ++h) sc[h] = fmaf(sm.q[h][8 * i + d], f[d], sc[h]);
             }
         }
-        const int dist = p - key;
+        const int dist = p - key_pos(a, r, p, key);
         const bool has_rel = valid && dist < kExtent;
         float b_acc[kGroup] = {0.f, 0.f, 0.f};
         if (has_rel) {
@@ -1384,7 +1395,7 @@ static bool launch_attention_decode(const AttnArgs& a, int rows, int64_t max_key
 
     }
     const bool seg_mode = a.seg.at.n > 0 || a.seg.at_d != nullptr;
-    const bool use_mma = !a.int8;
+    const bool use_mma = !a.int8 && !a.sel;   // a selection runs the scalar reader
     const int mma_z = a.window > 0 ? kWindowMmaSplits : z;
     if (use_mma) {
         const int nseg = a.seg.at.n > 0 ? a.seg.at.n : (a.seg.at_d ? std::min(rows, (int) bk::kWindowSegsMax) : 1);
@@ -1436,7 +1447,7 @@ static bool launch_attention_decode(const AttnArgs& a, int rows, int64_t max_key
 }
 
 void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scratch, float* out, void* stream) {
-    launch_attention_decode(a, rows, max_keys, scratch, out, stream, mma_decode(a, rows, max_keys), kMmaMinKeys,
+    launch_attention_decode(a, rows, max_keys, scratch, out, stream, !a.sel && mma_decode(a, rows, max_keys), kMmaMinKeys,
                             a.min_full_keys < kMmaMinKeys);
 }
 

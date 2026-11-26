@@ -135,6 +135,10 @@ struct AttnArgs {
     void* q8 = nullptr;                ///< set: the (gated) output also as q8_1 blocks, [rows][kHeads * kHeadDim / 32]
     Segments seg;                      ///< a batch window's: each segment's caches
     int64_t min_full_keys = 0;          ///< proven lower bound for all rows, or zero; skips the shallow split launch
+    /// set (full cache, one conversation): row r reads only the 4-position key blocks sel[r * sel_k ..] lists (the first
+    /// min(sel_k, (pos + 1) / 4) entries) and its positions past its last whole block (qsa_kernels.hpp)
+    const int32_t* sel = nullptr;
+    int sel_k = 0;
 };
 /// The kernels' shared-memory opt-ins are per device (a layer split runs them on two cards): the current device's index
 /// into their flags, below kOptInDevices.

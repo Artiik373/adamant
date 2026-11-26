@@ -11,6 +11,7 @@
 #include "basalt/core/vmm.hpp"
 #include "basalt/log.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "basalt/models/inkling2/qsa_kernels.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/platform/system.hpp"
@@ -93,6 +94,11 @@ uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, 
     for (const Visit& v : g.visits)
         if ((cut > 0 && v.layer >= cut ? 1 : 0) == card) caches += visit_cache_bytes(g, v.layer, context, fp8, int8);
     return caches + kSessionFixed + (uint64_t) kDecodeRows * (uint64_t) g.n_vocab * 4;
+}
+
+uint64_t qsa_session_bytes(const QsaIndexer& q, int64_t context) {
+    return q.visits.size() * ((uint64_t) (context / kQsaBlock + 1) * kQsaDim * 2 + (uint64_t) kQsaRing * kQsaDim * 4 +
+                              (uint64_t) std::max(kPromptChunk, kDecodeRows) * kQsaDim * 4);
 }
 
 uint64_t shared_bytes(const Geometry& g, bool drafter, bool loopcd) {
@@ -377,6 +383,24 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
     // DSPARK HOOK: the drafter's weights (none with --spec 1), before the context is sized from what the weights leave
     if (req.spec >= 2)
         if (model::Result r = dspark_plan(pack_, reads, file, device_, dspark_); !r.ok()) return r;
+    if (!req.qsa_indexer.empty()) {   // the QSA indexer: each visit's weights on its layer's card
+        const auto qalloc = [&](int visit, size_t bytes) -> void* {
+            const int card = card_of(g.visits[(size_t) visit].layer);
+            void* p = nullptr;
+            cudaSetDevice(card_device(card));
+            if (cudaMalloc(&p, bytes) != cudaSuccess) p = nullptr;
+            else if (card == 0) dev_.push_back(p);
+            else peer_bufs_.emplace_back(card_device(card), p);
+            cudaSetDevice(device_);
+            return p;
+        };
+        if (!qsa_load(req.qsa_indexer, g, qalloc, qsa_, err)) return fail("--qsa-indexer: " + err);
+        qsa_.budget = req.qsa_budget;
+        qsa_.local = req.qsa_local;
+        qsa_.sink = req.qsa_sink;
+        basalt::log::info("basalt inkling2", "qsa indexer: %d full-attention visits, budget %d, local %d, sink %d", (int) qsa_.visits.size(),
+                          qsa_.budget, qsa_.local, qsa_.sink);
+    }
 
     // [vision] the image encoder staged before the context is sized; it keeps none of the card: a request's pictures borrow
     // their region from the experts (lend_room) and give it back (refill). What staging leaves on the card (the encoder's
@@ -407,7 +431,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
         const uint64_t spare = spare_base > vision_modules ? spare_base - vision_modules : 0;   // [vision]
         const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
         const auto bytes_at = [&](int64_t c) {   // DSPARK HOOK: a session's drafter beside its caches
-            return session_bytes(g, c, fp8_, int8_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0);
+            return session_bytes(g, c, fp8_, int8_) + (dspark_ ? dspark_session_bytes(pack_, c) : 0) + qsa_session_bytes(qsa_, c);
         };
         const uint64_t shared = shared_bytes(g, dspark_ != nullptr, req.loopcd > 0);
         if (cut_ > 0) {   // the layer split: each card holds its layers' experts (no spill), checked once they are placed
@@ -417,7 +441,7 @@ model::Result InklingModel::plan(const model::LoadRequest& req, core::LoadPlan& 
                 cudaSetDevice(card_device(c));
                 size_t fb = 0, tb = 0;
                 basalt::core::gpu_mem_info(&fb, &tb);
-                const uint64_t need = (session_bytes(g, want, fp8_, int8_, cut_, c) +
+                const uint64_t need = (session_bytes(g, want, fp8_, int8_, cut_, c) + qsa_session_bytes(qsa_, want) +
                                        (c == 0 && dspark_ ? dspark_session_bytes(pack_, want) : 0)) * n_sess +
                                       (c == 0 ? shared + spare : shared_bytes(g, false, req.loopcd > 0) + kCardSpare);
                 if (need > fb) {

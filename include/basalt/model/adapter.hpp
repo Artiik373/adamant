@@ -112,6 +112,8 @@ struct LoadRequest {
     int diag_rows = 0;                ///< diagnostic: rows of one forward call of a prompt (0: the model's own chunk)
     int loopcd = 0;                   ///< LoopCD for a looped model: 0 off, 1 hidden, 2 logits, 3 adaptive logits
     float loopcd_w = 0;               ///< its strength (adaptive: the most)
+    std::string qsa_indexer;          ///< --qsa-indexer: the QSA indexer file, for a model that takes one (empty: dense attention)
+    int qsa_budget = 2048, qsa_local = 256, qsa_sink = 16;   ///< its keys a row reads, local window and first keys (tokens)
 };
 
 struct DecodeRequest {

@@ -224,6 +224,16 @@ checkerboard (8 x 8 squares of 204 and 153), as the model saw in training; the m
   request, stay text. A call cut off by `max_tokens` is not a call (the finish is `length`), but the arguments it streamed
   are closed into valid JSON.
 
+## Sparse attention (QSA)
+
+`--qsa-indexer FILE` loads a QSA indexer (`inkling2-qsa-indexer-v3.bin` from `tamanekokoro/Inkling-2-Mini-QSA-Indexer`, read
+as it is). Each of the eight full-attention visits then keeps one key per block of 4 positions. A decode row scores those
+blocks and reads only the best ones, the first `--qsa-sink` keys, the last `--qsa-local` keys and the keys after the last
+whole block. `--qsa-budget` (default 2048), `--qsa-local` (256) and `--qsa-sink` (16) count tokens and are multiples of 4.
+A row whose visit holds at most the budget reads all its keys. Prompt chunks read all their keys and only write the block keys.
+With the indexer, the slots do not batch. The block keys take space for the full context. Numerics:
+[precision](../precision/inkling2.md#qsa-indexer).
+
 ## Limits
 
 - Two cards: peer (the spilled experts on the second card) or split (never with experts in RAM), no third card. Experts in RAM run on the CPU,

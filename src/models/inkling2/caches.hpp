@@ -16,6 +16,11 @@ struct VisitCache {
     float* v_ring = nullptr;
     float* a_ring = nullptr;             ///< the attention output's, before its convolution [kConvRing][n_embd]
     float* m_ring = nullptr;             ///< the experts' sum's [kConvRing][n_embd]
+    /// a visit the QSA indexer covers (qsa_kernels.hpp): its block keys [context / 4][128] fp16, the k projections of its
+    /// last kQsaRing positions, and its card's call scratch (shared by the card's visits)
+    uint16_t* qsa_blocks = nullptr;
+    float* qsa_ring = nullptr;
+    float* qsa_scr = nullptr;
 };
 
 }  // namespace basalt::models::inkling2

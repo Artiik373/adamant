@@ -29,6 +29,7 @@
 #include "basalt/log.hpp"
 #include "basalt/model/batch_driver.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
+#include "basalt/models/inkling2/qsa_kernels.hpp"
 #include "basalt/program/expert_spill.hpp"
 #include "models/inkling2/caches.hpp"
 #include "models/inkling2/cpu_experts.hpp"
@@ -346,6 +347,14 @@ public:
             c.v_ring = f((int64_t) kConvRing * kKvHeads * kHeadDim);
             c.a_ring = f((int64_t) kConvRing * E);
             c.m_ring = f((int64_t) kConvRing * E);
+            if (m_.qsa().of((int) (&v - g_.visits.data()))) {
+                const int card = m_.card_of(v.layer);
+                if (!qsa_scr_[card]) qsa_scr_[card] = f(qsa_scr_floats(call_rows));
+                c.qsa_blocks = (uint16_t*) alloc((size_t) (ctx / kQsaBlock + 1) * kQsaDim * 2, ok);
+                c.qsa_ring = f((int64_t) kQsaRing * kQsaDim);
+                c.qsa_scr = qsa_scr_[card];
+                if (ok) cudaMemset(c.qsa_ring, 0, (size_t) kQsaRing * kQsaDim * 4);
+            }
         }
         if (Lane& k = lane_[1]; k.stream) {   // the second card's running counts
             cudaSetDevice(k.device);
@@ -504,7 +513,7 @@ public:
     // ---- batch windows (docs/design/batching.md): several sessions' windows in one pass through the weights, on this
     // session's scratch and stream. Each conversation keeps its caches and rings (the kernels take them per segment), its
     // drafter's context, its logits and its draws; a row gives the bits it gives in its own window.
-    int batch_rows() const override { return sh_->max_rows; }
+    int batch_rows() const override { return m_.qsa().on() ? 0 : sh_->max_rows; }   // a QSA conversation runs its own windows
 
 protected:
     // the hooks of the shared driver (model/batch_driver.hpp)
@@ -1017,11 +1026,17 @@ public:
         return !m_.wedged();
     }
     size_t kv_bytes_of(const VisitCache& c) const { return (size_t) kKvHeads * (size_t) c.cap * row_bytes(); }
+    // a card's QSA call scratch: a prompt chunk's k projections, or a window's projections, scores and blocks
+    size_t qsa_scr_floats(int rows) const {
+        const size_t blocks = (size_t) m_.context() / kQsaBlock + 1;
+        return std::max((size_t) kPromptChunk * kQsaDim,
+                        (size_t) rows * ((kQsaHeads + 1) * kQsaDim + blocks + (size_t) m_.qsa().k_blocks()));
+    }
     size_t conv_ring_bytes() const { return (size_t) kConvRing * (2 * kKvHeads * kHeadDim + 2 * (size_t) g_.n_embd) * 4; }
 
     size_t running_bytes() const override {
         size_t n = 0;
-        for (const VisitCache& c : vc_) n += (c.ring ? 2 * kv_bytes_of(c) : 0) + conv_ring_bytes();
+        for (const VisitCache& c : vc_) n += (c.ring ? 2 * kv_bytes_of(c) : 0) + conv_ring_bytes() + (c.qsa_ring ? (size_t) kQsaRing * kQsaDim * 4 : 0);
         return n + dspark_.running_bytes();   // DSPARK HOOK
     }
 
@@ -1042,6 +1057,7 @@ public:
             to.push_back({c.v_ring, kv_ring});
             to.push_back({c.a_ring, e_ring});
             to.push_back({c.m_ring, e_ring});
+            if (c.qsa_ring) to.push_back({c.qsa_ring, (size_t) kQsaRing * kQsaDim * 4});
         }
         dspark_.running_regions(st);   // DSPARK HOOK
         st.stream = stream_;
@@ -1063,7 +1079,7 @@ public:
     size_t cells_bytes(int64_t positions) const override {
         size_t n = 0;
         for (const VisitCache& c : vc_)
-            if (!c.ring) n += 2 * (size_t) positions * cell_bytes();
+            if (!c.ring) n += 2 * (size_t) positions * cell_bytes() + (c.qsa_blocks ? (size_t) (positions / kQsaBlock) * kQsaDim * 2 : 0);
         return n + dspark_.cells_bytes(positions);   // DSPARK HOOK
     }
 
@@ -1091,6 +1107,12 @@ public:
                 });
             };
             if (!down(c.k, k.k) || !down(c.v, k.v)) return {model::Status::Error, "inkling2: reading a cache back failed"};
+            if (c.qsa_blocks) {   // the QSA block keys of the whole blocks
+                k.pooled_rows = positions / kQsaBlock;
+                k.idx_dim = kQsaDim;
+                k.pooled.resize_for_overwrite((size_t) k.pooled_rows * kQsaDim * 2);
+                if (!down(c.qsa_blocks, k.pooled)) return {model::Status::Error, "inkling2: reading the QSA keys back failed"};
+            }
             kv.push_back(std::move(k));
         }
         if (!dspark_.save_cells(kv, positions, stream_)) return {model::Status::Error, "inkling2: reading the drafter's cache back failed"};   // DSPARK HOOK
@@ -1115,6 +1137,15 @@ public:
                 });
             };
             if (!up(c.k, kv[i].k) || !up(c.v, kv[i].v)) return {model::Status::Error, "inkling2: writing a cache back failed"};
+            if (c.qsa_blocks) {
+                const size_t qb = (size_t) (positions / kQsaBlock) * kQsaDim * 2;
+                if (kv[i].idx_dim != kQsaDim || kv[i].pooled.size() < qb)
+                    return {model::Status::Error, "inkling2: a parked conversation has no QSA keys"};
+                const bool qok = kv[i].pooled.visit(0, qb, [&](const uint8_t* p, size_t n, size_t at) {
+                    return basalt::core::device_copy((uint8_t*) c.qsa_blocks + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
+                });
+                if (!qok) return {model::Status::Error, "inkling2: writing the QSA keys back failed"};
+            }
             ++i;
         }
         if (dspark_.on() && !dspark_.restore_cells(kv, i, positions, stream_))   // DSPARK HOOK
@@ -1334,6 +1365,23 @@ private:
             if (rows == 1 && m_.cache_int8() && full_keys == 2 * kMmaDeepMinKeys)
                 previous = kMmaDeepMinKeys - 1;
             aa.min_full_keys = previous + 2 - rows;
+        }
+        // the QSA indexer: this window's block keys, then each row's blocks once the keys pass the budget
+        if (const QsaVisit* qv = seg.at.n == 0 && seg.at_d == nullptr ? m_.qsa().of(vi) : nullptr) {
+            const QsaIndexer& qi = m_.qsa();
+            float* kraw = c.qsa_scr;
+            float* qq = kraw + (size_t) rows * kQsaDim;
+            float* sc = qq + (size_t) rows * kQsaHeads * kQsaDim;
+            int32_t* sel = reinterpret_cast<int32_t*>(sc + (size_t) rows * (m_.context() / kQsaBlock + 1));
+            qsa_project(nullptr, x.xq_[1], nullptr, 0.f, qv->wk, kQsaDim, rows, kraw, k.stream);
+            qsa_keys(kraw, x.pos_d_, rows, qv->k_norm, c.qsa_ring, c.qsa_blocks, k.stream);
+            if (full_keys > qi.budget) {
+                qsa_project(nullptr, x.xq_[0], nullptr, 0.f, qv->wq, kQsaHeads * kQsaDim, rows, qq, k.stream);
+                qsa_select(qq, qv->q_norm, qv->w_head, c.qsa_blocks, x.pos_d_, rows, qi.sink / kQsaBlock, qi.local / kQsaBlock,
+                           qi.k_blocks(), full_keys / kQsaBlock, sc, sel, k.stream);
+                aa.sel = sel;
+                aa.sel_k = qi.k_blocks();
+            }
         }
         attention_window(ap, aa, rows, c.ring ? (int64_t) g_.window : full_keys, x.att_scr_, k.stream);
         bk::native_q8_planes_mmvq(w.out, x.xo_, x.o_, kOutRows, E, rows, k.stream);
@@ -1835,6 +1883,7 @@ private:
     std::vector<int> slot_card_;             // [cache slot] the card of its visits
     cudaEvent_t hand0_ = nullptr, io_ev0_ = nullptr, io_ev1_ = nullptr;   // the first card's crossing; the second card's positions
     std::vector<VisitCache> vc_;
+    float* qsa_scr_[2] = {};   // each card's QSA call scratch (qsa_scr_floats)
     std::shared_ptr<Shared> sh_;             // the scratch, the prompt path and the batch graphs every session shares
     DsparkHook dspark_;                      // DSPARK HOOK
     Walk walk_;

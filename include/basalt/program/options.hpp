@@ -57,6 +57,10 @@ struct CommonOptions {
     /// --loopcd MODE:W: LoopCD for a looped model (0 off, 1 hidden, 2 logits, 3 adaptive logits) and its strength W
     int loopcd = 0;
     float loopcd_w = 0;
+    /// --qsa-indexer PATH: Inkling 2's block-sparse key selector for its full-attention visits; --qsa-budget, --qsa-local
+    /// and --qsa-sink: the keys a decode row reads in all, its local window and its first keys (tokens)
+    std::string qsa_indexer;
+    int qsa_budget = 2048, qsa_local = 256, qsa_sink = 16;
     /// --diag-gpu-cut N: diagnostic, a two-card split's second card from layer N on, whatever the shares give (0: off)
     int diag_gpu_cut = 0;
     /// The engine's expert profile for the model (--expert-profile, else data/profiles/<key>.prof, cli::profile_key),

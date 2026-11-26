@@ -230,3 +230,23 @@ reference is the first loop pass. The strong state is the last pass.
 
 The arithmetic is FP32 in the decode path. The prompt path fills the weak coda's caches and runs no head. Off, the walk, the
 buffers, the caches and the output do not change. The quality against the BF16 reference is not measured with LoopCD on.
+
+## QSA indexer
+
+With `--qsa-indexer`, decode attention of the full-attention visits reads a selected set of keys (see
+[the model page](../models/inkling2.md#sparse-attention-qsa)). The projections take the q8_1 rows that decode attention
+reads (the fp32 rows on the prompt path). They use fp16 weights and fp32 sums. A block key is the fp32 mean of 4 key
+projections, normed, then stored as fp16. The scores are fp32. The selection is exact: ties go to the lower block, and the
+blocks are listed in ascending order, so a row selects the same blocks in any window. The selected keys go through the scalar
+split reader, not the MMA reader. With the indexer off, nothing changes.
+
+Development A/B, one RTX 3090 at its 294 W power limit, the `NVFP4-MX8` pack, `basalt-bench --quality 20` on wikitext-2
+(512-token chunks, rows 256 to 510). There is no BF16 base, so the table compares each run with the dense run, row by row:
+
+| Run | PPL | Mean abs. NLL change | Same top-1 as dense |
+|---|---|---|---|
+| Dense | 8.2899 | - | - |
+| Budget 256, local 64, sink 16 | 8.2906 | 0.046 | 97.6 % |
+| Budget 128, local 32, sink 16 | 8.3317 | 0.085 | 95.5 % |
+
+The chunks are short, so a small budget is needed to make the selection active. The default budget (2048) is not measured.

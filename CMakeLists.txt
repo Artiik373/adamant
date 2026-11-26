@@ -274,13 +274,13 @@ target_include_directories(prefill_q8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
 target_link_libraries(prefill_q8 PUBLIC core ${_gpu_runtime_target})
 add_library(inkling2_kernels STATIC src/models/inkling2/kernels/ops.cu src/models/inkling2/kernels/attn.cu
   src/models/inkling2/kernels/glue.cu src/models/inkling2/kernels/dspark.cu src/models/inkling2/kernels/attn_prompt.cu
-  src/models/inkling2/kernels/prompt_ops.cu)
+  src/models/inkling2/kernels/prompt_ops.cu src/models/inkling2/kernels/qsa.cu)
 target_include_directories(inkling2_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(inkling2_kernels PUBLIC ${_gpu_runtime_target})
 add_library(model_inkling2 STATIC src/models/inkling2/adapter.cpp src/models/inkling2/pretok_inkling2.cpp
   src/models/inkling2/pack.cpp src/models/inkling2/model.cpp src/models/inkling2/session.cpp src/models/inkling2/walk.cpp
   src/models/inkling2/prompt.cpp src/models/inkling2/vision.cpp src/models/inkling2/vision_encoder.cpp
-  src/models/inkling2/dspark.cpp src/models/inkling2/spill.cpp src/models/inkling2/cpu_experts.cpp)
+  src/models/inkling2/dspark.cpp src/models/inkling2/spill.cpp src/models/inkling2/cpu_experts.cpp src/models/inkling2/qsa.cpp)
 target_include_directories(model_inkling2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
 target_link_libraries(model_inkling2 PUBLIC model tokenizer engine_session inkling2_kernels tiers kernels kernels_cpu window_gemm mmq prefill_mxfp8 prefill_q8 core vision_cuda ${_gpu_runtime_target})
 if(BUILD_TESTING)

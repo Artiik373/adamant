@@ -411,6 +411,10 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.kv_resident = o.kv_resident;
         lreq.loopcd = o.loopcd;
         lreq.loopcd_w = o.loopcd_w;
+        lreq.qsa_indexer = o.qsa_indexer;
+        lreq.qsa_budget = o.qsa_budget;
+        lreq.qsa_local = o.qsa_local;
+        lreq.qsa_sink = o.qsa_sink;
         lreq.diag_rows = o.diag_rows;
         const basalt::model::Result r = adapter->start(lreq, started);
         if (!r.ok() || started.sessions.empty()) return fatal_start_error(r.message);
