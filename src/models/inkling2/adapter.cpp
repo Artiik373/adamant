@@ -6,6 +6,7 @@
 #include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/program/options.hpp"
+#include "basalt/program/pretok_o200k.hpp"
 #include "models/inkling2/dspark.hpp"   // DSPARK HOOK
 #include "models/inkling2/meta.hpp"
 #include "models/inkling2/model.hpp"
@@ -44,7 +45,7 @@ public:
         f.answer_open = "<|content_text|>";
         return f;
     }
-    PreTokenizer pretokenizer() const override { return {"inkling2", pretok_inkling2, kIgnoreMerges}; }
+    PreTokenizer pretokenizer() const override { return {"inkling2", program::tokenizer::pretok_o200k, kIgnoreMerges}; }
     // peer: the second card holds and computes experts the main card cannot (model.hpp peer_held); split: it runs the later layers (card_of)
     program::GpuModes gpu_modes() const override { return {2, 2, 0}; }
     const char* model_name() const override { return "Inkling-2-Mini"; }

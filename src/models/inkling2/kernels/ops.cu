@@ -913,15 +913,133 @@ router_select_plan_kernel(const float* __restrict__ logits, const float* __restr
     }
 }
 
+__global__ void __launch_bounds__(256)
+router_select_plan_batch_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int rows, int k,
+                                float weight_scale, int32_t* __restrict__ ids, float* __restrict__ weights,
+                                const unsigned long long* __restrict__ blobs, unsigned long long* __restrict__ ptr,
+                                int32_t* __restrict__ start, int32_t* __restrict__ n_groups, int32_t* __restrict__ dst,
+                                int32_t* __restrict__ tok, uint32_t* __restrict__ tally,
+                                unsigned long long* __restrict__ rec_blobs, int32_t* __restrict__ rec_n) {
+    constexpr int NE = 128;
+    __shared__ unsigned long long blob[NE];
+    __shared__ unsigned long long gblob[NE];
+    __shared__ float sb[kDecodeRows][NE];
+    __shared__ float sel[kDecodeRows][16];
+    __shared__ uint32_t row_mask[NE];
+    __shared__ int32_t first[NE];
+    __shared__ int32_t sid[kDecodeRows * 16];
+    __shared__ int wsum[4][2];
+    __shared__ int groups;
+    const int tid = threadIdx.x, e = tid & 127, slot = tid >> 7;
+    if (tid < NE) {
+        blob[e] = blobs[e];
+        row_mask[e] = 0u;
+    }
+    const float my_bias = bias[e];
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
+    for (int r0 = 0; r0 < rows; r0 += 2) {
+        const int r = r0 + slot;
+        float sc = 0.f, b = 0.f;
+        if (r < rows) {
+            sc = 1.f / (1.f + expf(-logits[(size_t) r * NE + e]));
+            b = sc + my_bias;
+            sb[r][e] = b;
+        }
+        __syncthreads();
+        if (r < rows) {
+            int rank = 0;
+#pragma unroll 8
+            for (int j = 0; j < NE; ++j) {
+                const float bj = sb[r][j];
+                rank += (bj > b) | ((bj == b) & (j < e));
+            }
+            if (rank < k) {
+                sel[r][rank] = sc;
+                ids[(size_t) r * k + rank] = e;
+                sid[r * k + rank] = e;
+                if (blob[e]) atomicOr(&row_mask[e], 1u << r);
+            }
+        }
+        __syncthreads();
+    }
+    if (tid < rows) {
+        float sum = 0.f;
+        for (int rk = 0; rk < k; ++rk) sum += sel[tid][rk];
+        const float denom = sum + 1e-20f;
+        for (int rk = 0; rk < k; ++rk) weights[(size_t) tid * k + rk] = sel[tid][rk] / denom * weight_scale;
+    }
+    if (tid < NE) {
+        const int w = e >> 5, lane = e & 31;
+        const uint32_t m = row_mask[e];
+        const int c = __popc(m);
+        int sv = c, used = c > 0;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int tv = __shfl_up_sync(0xffffffffu, sv, o), tu = __shfl_up_sync(0xffffffffu, used, o);
+            if (lane >= o) {
+                sv += tv;
+                used += tu;
+            }
+        }
+        if (lane == 31) {
+            wsum[w][0] = sv;
+            wsum[w][1] = used;
+        }
+        __syncthreads();
+        int at = 0, g = 0;
+        for (int j = 0; j < w; ++j) {
+            at += wsum[j][0];
+            g += wsum[j][1];
+        }
+        first[e] = at + sv - c;
+        if (c > 0) {
+            const unsigned long long bptr = blob[e];
+            gblob[g + used - 1] = bptr;
+            ptr[g + used - 1] = bptr;
+            start[g + used - 1] = at + sv - c;
+        }
+        if (e == NE - 1) {
+            start[g + used] = at + sv;
+            start[g + used + 1] = at + sv;
+            *n_groups = g + used;
+            groups = g + used;
+        }
+        if (tally && c) atomicAdd(&tally[e], (uint32_t) c);
+    }
+    __syncthreads();
+    if (rec_blobs && tid < kAheadExperts) {
+        const int ng = groups;
+        rec_blobs[tid] = tid < ng ? gblob[tid] : 0ull;
+        if (tid == 0) *rec_n = ng < kAheadExperts ? ng : kAheadExperts;
+    }
+    const int n_pairs = rows * k;
+    for (int i = tid; i < n_pairs; i += 256) {
+        const int x = sid[i];
+        if (blob[x]) {
+            const int r = i / k;
+            const int before = __popc(row_mask[x] & ((1u << r) - 1u));
+            const int pos = first[x] + before;
+            dst[pos] = i;
+            tok[pos] = r;
+        }
+    }
+}
+
 void router_select_plan(const float* logits, const float* bias, int rows, int k, int n_expert, float weight_scale,
                         int32_t* ids, float* weights, const unsigned long long* blobs, unsigned long long* ptr,
                         int32_t* start, int32_t* n_groups, int32_t* dst, int32_t* tok, void* stream,
                         uint32_t* tally, unsigned long long* rec_blobs, int32_t* rec_n) {
     if (rows <= 0) return;
-    if (n_expert != 128 || rows != 1 || k > 16)
+    if (n_expert != 128 || rows > kDecodeRows || k > 16)
         throw std::runtime_error("inkling2 router_select_plan: unsupported geometry");
-    bk::launch_pdl(router_select_plan_kernel, dim3(1), dim3(128), 0, (cudaStream_t) stream, logits, bias, k,
-                   weight_scale, ids, weights, blobs, ptr, start, n_groups, dst, tok, tally, rec_blobs, rec_n);
+    if (rows == 1) {
+        bk::launch_pdl(router_select_plan_kernel, dim3(1), dim3(128), 0, (cudaStream_t) stream, logits, bias, k,
+                       weight_scale, ids, weights, blobs, ptr, start, n_groups, dst, tok, tally, rec_blobs, rec_n);
+    } else {
+        bk::launch_pdl(router_select_plan_batch_kernel, dim3(1), dim3(256), 0, (cudaStream_t) stream, logits, bias, rows, k,
+                       weight_scale, ids, weights, blobs, ptr, start, n_groups, dst, tok, tally, rec_blobs, rec_n);
+    }
     check("router_select_plan");
 }
 

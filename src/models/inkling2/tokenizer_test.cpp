@@ -3,7 +3,7 @@
 // token) and two sentences that use them, with the ids Hugging Face tokenizers gives (tests/data/inkling2/).
 //
 //   inkling2_tokenizer_test <ignore_merges.tsv> <Inkling-2-Mini pack>      exit 77 when the pack is not there
-#include "models/inkling2/adapter.hpp"
+#include "basalt/program/pretok_o200k.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
         if (!mf.read(names[i], files[i], err)) { std::fprintf(stderr, "%s: %s\n", names[i], err.c_str()); return 1; }
     const auto view = [](const std::vector<uint8_t>& b) { return std::string_view((const char*) b.data(), b.size()); };
     basalt::program::Tokenizer t;
-    t.set_pretokenize(basalt::models::inkling2::pretok_inkling2);
+    t.set_pretokenize(basalt::program::tokenizer::pretok_o200k);
     t.set_ignore_merges(basalt::models::inkling2::kIgnoreMerges);
     if (!t.load(view(files[0]), view(files[1]), view(files[2]), err)) { std::fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
 

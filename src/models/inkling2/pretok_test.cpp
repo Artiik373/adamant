@@ -1,6 +1,6 @@
 // src/models/inkling2/pretok_test.cpp - the inkling2 pre-tokenizer on strings whose pieces the expression fixes (the
 // expected piece ends come from Python's `regex` module running the checkpoint's own expression).
-#include "models/inkling2/adapter.hpp"
+#include "basalt/program/pretok_o200k.hpp"
 
 #include <cstdio>
 #include <string>
@@ -35,7 +35,7 @@ int main() {
     for (const Case& c : cases) {
         std::vector<size_t> ends;
         const std::string s(c.text);
-        basalt::models::inkling2::pretok_inkling2(s.data(), s.size(), ends);
+        basalt::program::tokenizer::pretok_o200k(s.data(), s.size(), ends);
         if (ends != c.ends) {
             ++failures;
             std::printf("FAIL %s:", c.text);

@@ -582,45 +582,42 @@ __global__ void __launch_bounds__(kThreads) post_attn_kernel(PostAttn a) {
 // Block (row, 256 channels), a thread a channel: the experts' weighted sums of this row and the rows before it in the
 // window that its convolution reads, the ring for the positions before the window, plus the residual; the ring takes this
 // row's sum.
-__global__ void __launch_bounds__(256) moe_finish_kernel(MoeFinish a) {
-    const int r = blockIdx.x;
-    const int c = blockIdx.y * 256 + threadIdx.x;
-    // a batch window's row: its conversation's ring, and its rows of the window from its segment's first
+constexpr int kMoeFinishThreads = 64;
+__global__ void __launch_bounds__(kMoeFinishThreads) moe_finish_kernel(MoeFinish a, int total_rows) {
+    const int sk = blockIdx.x;
+    const int c = blockIdx.y * kMoeFinishThreads + threadIdx.x;
+    // a batch window's segment: its conversation's ring, and its rows of the window
     const bk::WindowSegs& at = seg_table(a.seg);
-    const int sk = bk::seg_of(at, r), first = at.n > 0 ? at.row0[sk] : 0;
+    const int n_seg = at.n > 0 ? at.n : 1;
+    if (sk >= n_seg) return;
+    const int first = at.n > 0 ? at.row0[sk] : 0;
+    const int end = (at.n > 0 && sk + 1 < at.n) ? at.row0[sk + 1] : total_rows;
+    if (first >= end) return;
     float* const ring = at.n > 0 ? a.seg.c[sk].m_ring : a.ring;
     float taps[kConv];   // read while the kernel before finishes
 #pragma unroll
     for (int j = 0; j < kConv; ++j) taps[j] = a.taps[c * kConv + (kConv - 1 - j)];
-    if (threadIdx.x < kConv - 1) {   // the block's ring entries of the three positions before this row into L2
-        const int pj = a.pos[r] - 1 - (int) threadIdx.x;
-        if (pj >= 0) {
-            const char* e = (const char*) (ring + (size_t) (pj % kConvRing) * kWidth + blockIdx.y * 256);
-            for (int k = 0; k < 256 * 4; k += 128) asm volatile("prefetch.global.L2 [%0];" ::"l"(e + k));
-        }
-    }
+    const int p0 = a.pos[first];
+    float x1 = p0 - 1 < 0 ? 0.f : ring[(size_t) ((p0 - 1) % kConvRing) * kWidth + c];
+    float x2 = p0 - 2 < 0 ? 0.f : ring[(size_t) ((p0 - 2) % kConvRing) * kWidth + c];
+    float x3 = p0 - 3 < 0 ? 0.f : ring[(size_t) ((p0 - 3) % kConvRing) * kWidth + c];
     bk::pdl_wait();
     bk::pdl_launch_dependents();
-    {
-        float acc = 0.f, x0 = 0.f;
-#pragma unroll
-        for (int j = 0; j < kConv; ++j) {
-            float x;
-            if (r - j >= first) {
-                x = 0.f;
-                for (int s = 0; s < a.k; ++s) x = fmaf(a.w[(r - j) * a.k + s], a.rows[((size_t) (r - j) * a.k + s) * kWidth + c], x);
-            } else {
-                const int p = a.pos[r] - j;
-                x = p < 0 ? 0.f : ring[(size_t) (p % kConvRing) * kWidth + c];
-            }
-            if (j == 0) x0 = x;
-            acc = fmaf(taps[j], x, acc);
-        }
+    for (int r = first; r < end; ++r) {
+        float x0 = 0.f;
+        for (int s = 0; s < a.k; ++s) x0 = fmaf(a.w[r * a.k + s], a.rows[((size_t) r * a.k + s) * kWidth + c], x0);
+        float acc = fmaf(taps[0], x0, 0.f);
+        acc = fmaf(taps[1], x1, acc);
+        acc = fmaf(taps[2], x2, acc);
+        acc = fmaf(taps[3], x3, acc);
         const size_t i = (size_t) r * kWidth + c;
         const float y = __fmul_rn(acc + x0, rsqrtf((float) kConv + 1.f)) + a.resid[i];
         a.out[i] = y;
         if (a.tap) a.tap[i] = y;
         ring[(size_t) (a.pos[r] % kConvRing) * kWidth + c] = x0;
+        x3 = x2;
+        x2 = x1;
+        x1 = x0;
     }
 }
 
@@ -682,7 +679,8 @@ void post_attn(const PostAttn& a, int rows, void* stream) {
 void moe_finish(const MoeFinish& a, int rows, void* stream) {
     if (rows <= 0) return;
     check_rows(rows, "moe_finish");
-    bk::launch_pdl(moe_finish_kernel, dim3((unsigned) rows, kWidth / 256), dim3(256), 0, (cudaStream_t) stream, a);
+    const unsigned segs = (unsigned) (a.seg.at_d ? rows : (a.seg.at.n > 0 ? a.seg.at.n : 1));
+    bk::launch_pdl(moe_finish_kernel, dim3(segs, kWidth / kMoeFinishThreads), dim3(kMoeFinishThreads), 0, (cudaStream_t) stream, a, rows);
     check("moe_finish");
 }
 

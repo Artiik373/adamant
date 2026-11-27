@@ -920,13 +920,13 @@ __global__ void __launch_bounds__(32 * kTilesPerBlock) head_step_batch_kernel(co
                                                                               const float* approx,
                                                                               const float* __restrict__ fold_bp, float cap,
                                                                               int64_t n_rows, int n_tiles, int step_i,
-                                                                              int n_max, int64_t n_pad,
+                                                                              int count, int n_max, int64_t n_pad,
                                                                               uint8_t* __restrict__ scratch,
                                                                               size_t scratch_stride) {
     constexpr int kNw4 = kDsRank / 64;
     __shared__ __align__(16) int xi[kDsRank / 4];
     __shared__ float xs[kFoldNb], xdd[kFoldNb];
-    const int tid = threadIdx.x, lane = tid & 31, b = (int) blockIdx.y;
+    const int tid = threadIdx.x, lane = tid & 31;
     const int tile = (int) blockIdx.x * kTilesPerBlock + (tid >> 5);
     const int64_t row = (int64_t) tile * 32 + lane;
     const bool live = tile < n_tiles, real = live && token_of(row, n_tiles) < n_rows;
@@ -942,33 +942,36 @@ __global__ void __launch_bounds__(32 * kTilesPerBlock) head_step_batch_kernel(co
     if (live) fb = __ldg(fold_bp + row);
     pdl_wait();
     pdl_launch_dependents();
-    screen_x(lat_step + (size_t) b * kFoldNb, kFoldNb, xi, xs, xdd, tid, 32 * kTilesPerBlock);
-    __syncthreads();
-    if (!live) return;
-    float2* cand = reinterpret_cast<float2*>(scratch + (size_t) b * scratch_stride);
-    float2* part = cand + (size_t) n_tiles * px::kPer;
-    const float* ap = approx + ((size_t) b * n_max + step_i) * n_pad;
     const float ninf = __int_as_float(0xff800000);
-    float v = ninf;
-    if (real) v = capf(ap[row] + screen_acc<kNw4>(w, s, 0, xi, xs, xdd) + fb, cap);
-    float m = v;
+    for (int b = 0; b < count; ++b) {
+        if (b > 0) __syncthreads();
+        screen_x(lat_step + (size_t) b * kFoldNb, kFoldNb, xi, xs, xdd, tid, 32 * kTilesPerBlock);
+        __syncthreads();
+        if (!live) continue;
+        float2* cand = reinterpret_cast<float2*>(scratch + (size_t) b * scratch_stride);
+        float2* part = cand + (size_t) n_tiles * px::kPer;
+        const float* ap = approx + ((size_t) b * n_max + step_i) * n_pad;
+        float v = ninf;
+        if (real) v = capf(ap[row] + screen_acc<kNw4>(w, s, 0, xi, xs, xdd) + fb, cap);
+        float m = v;
 #pragma unroll
-    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
-    float e = v > ninf ? __expf(v - m) : 0.0f;
+        for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        float e = v > ninf ? __expf(v - m) : 0.0f;
 #pragma unroll
-    for (int o = 16; o; o >>= 1) e += __shfl_xor_sync(0xffffffffu, e, o);
-    if (lane == 0) part[tile] = make_float2(m, e);
-    for (int k = 0; k < px::kPer; ++k) {
-        float bv = v;
-        int bi = lane;
+        for (int o = 16; o; o >>= 1) e += __shfl_xor_sync(0xffffffffu, e, o);
+        if (lane == 0) part[tile] = make_float2(m, e);
+        for (int k = 0; k < px::kPer; ++k) {
+            float bv = v;
+            int bi = lane;
 #pragma unroll
-        for (int o = 16; o; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+            for (int o = 16; o; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+                const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+            }
+            if (lane == 0) cand[tile * px::kPer + k] = make_float2(bv, __int_as_float(tile * 32 + bi));
+            if (lane == bi) v = ninf;
         }
-        if (lane == 0) cand[tile * px::kPer + k] = make_float2(bv, __int_as_float(tile * 32 + bi));
-        if (lane == bi) v = ninf;
     }
 }
 
@@ -1088,10 +1091,10 @@ void dspark_head_pick_batch(const DsHead& h, const void* hq, const void* latq_st
     const cudaStream_t s = (cudaStream_t) stream;
     const int tiles = (int) px::tiles(h.n_vocab);
     const int64_t n_pad = dspark_screen_rows(h.n_vocab);
-    launch_pdl(head_step_batch_kernel, dim3((unsigned) ((tiles + kTilesPerBlock - 1) / kTilesPerBlock), (unsigned) count),
+    launch_pdl(head_step_batch_kernel, dim3((unsigned) ((tiles + kTilesPerBlock - 1) / kTilesPerBlock)),
                dim3(32 * kTilesPerBlock), 0, s, (const uint4*) h.fold_sc,
                (const uint32_t*) px::scales(const_cast<void*>(h.fold_sc), h.n_vocab, kDsRank), (const Q81*) latq_step,
-               approx, h.fold_bp, h.cap, h.n_vocab, tiles, step_i, n_max, n_pad, (uint8_t*) scratch, scratch_stride);
+               approx, h.fold_bp, h.cap, h.n_vocab, tiles, step_i, count, n_max, n_pad, (uint8_t*) scratch, scratch_stride);
     launch_pdl(head_final_batch_kernel, dim3((unsigned) count), dim3(512), 0, s, h, (const Q81*) hq, (const Q81*) latq_step,
                tiles, step_i, n_max, (const uint8_t*) scratch, scratch_stride, prev, ids, conf, w1, w1_row);
     check("head pick batch");

@@ -156,11 +156,13 @@ public:
     uint64_t held_free(uint64_t base) const { return std::max(spare_ ? spare_ : base, reserve_); }
     /// The card's free bytes as placement counts them: read when the copies are first placed, at a VRAM resize and at a
     /// wake, and moved by every map and release of the copies and the sessions' caches (account). What else allocates
-    /// (kernels, graphs) is left to the spare and the late room. Placement reads this, never a fresh query, so it follows
-    /// the requests alone unless a map lacks the memory: then it reads the card again and a warning says so.
+    /// (kernels, graphs) is left to the spare and the late room. Placement follows the count; before a grow or a promote,
+    /// clamp_room lowers it to the card's free bytes when other allocations took more (a warning says so), since an
+    /// oversubscribed map can succeed by paging instead of failing.
     uint64_t room() const { return room_ > 0 ? (uint64_t) room_ : 0; }
     void account(int64_t mapped) { room_ -= mapped; }
     void sync_room();
+    void clamp_room();
     /// Resizes the card's copies so that `free_bytes` are free: copies go back to RAM when short, return while there is
     /// room. False, with nothing moved, when even no copy at all leaves that much; false when the copies could not go back.
     bool resize_reserve(uint64_t free_bytes);

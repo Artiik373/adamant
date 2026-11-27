@@ -993,6 +993,14 @@ void InklingModel::sync_room() {
     room_ = basalt::core::gpu_mem_info(&free_b, &total_b) == cudaSuccess ? (int64_t) free_b : 0;
 }
 
+void InklingModel::clamp_room() {
+    size_t free_b = 0, total_b = 0;
+    if (basalt::core::gpu_mem_info(&free_b, &total_b) != cudaSuccess || (int64_t) free_b >= room_) return;
+    basalt::log::warn("basalt inkling2", "elastic spill: counted room %.0f MiB, card free %.0f MiB: placement follows the card",
+                      (double) room_ / kMiB, (double) free_b / kMiB);
+    room_ = (int64_t) free_b;
+}
+
 std::vector<size_t> InklingModel::copy_candidates() const {
     const size_t ne = geo().n_expert;
     std::vector<size_t> pairs;

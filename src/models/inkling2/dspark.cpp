@@ -834,6 +834,8 @@ bool DsparkHook::restore_cells(const std::vector<core::ConversationKv>& kv, size
 // ---- multi-session batched DSpark commit & draft --------------------------------------------------------------------------
 
 DsparkBatch::~DsparkBatch() {
+    for (cudaGraphExec_t g : head_graphs_)
+        if (g) cudaGraphExecDestroy(g);
     for (void* p : allocs_) cudaFree(p);
     for (void* p : pinned_) cudaFreeHost(p);
 }
@@ -915,6 +917,7 @@ bool DsparkBatch::init(const DsparkWeights* w, int max_sessions, int max_rows, i
         err = "out of device memory for the batched drafter";
         return false;
     }
+    head_graphs_.assign((size_t) (S - 1) * kDsDrafts, nullptr);
     w_ = w;
     return true;
 }
@@ -1058,21 +1061,57 @@ model::Result DsparkBatch::draft(DsparkHook* const* hooks, const int32_t* anchor
             bk::rms_norm_rows(x_, w.norm, R, kE, d.rms_eps, h_, st);
             dspark_pack_draft_rows(h_, kDsBlock, cn, s0, n_max, hd_, st);
         }
-        const DsHead head = w.head_args();
-        bk::native_quantize_q8_1(hd_, hq_, kE, B * n_max, st);
-        dspark_head_base_batch(head, hq_, B, n_max, approx_, st);
-        bk::bf16_gemv_fp32_mmvf_cols(hd_, w.w_h, ctx_h_, kE, kDsRnn, B * n_max, st);
-        bk::bf16_gemv_fp32_mmvf_cols(frc_, w.w_f, ctx_f_, kE, kDsRnn, B, st);
-        const size_t lq_step_bytes = (size_t) B * bk::native_q8_1_bytes(kDsRank, 1);
-        for (int i = 0; i < n_max; ++i) {
-            dspark_markov_step_batch(ctx_h_, ctx_f_, w.rnn_b, w.w_sp, w1_row_, state_, i, n_max, B, latent_, st);
-            void* lq_step = static_cast<char*>(lat_q_) + (size_t) i * lq_step_bytes;
-            bk::native_quantize_q8_1(latent_, lq_step, kDsRank, B, st);
-            dspark_head_pick_batch(head, hq_, lq_step, approx_, i, n_max, B, head_scr_, head_scr_stride_, prev_, ids_d_,
-                                   conf_d_, w.w1, w1_row_, st);
+        auto run_head = [&] {
+            const DsHead head = w.head_args();
+            bk::native_quantize_q8_1(hd_, hq_, kE, B * n_max, st);
+            dspark_head_base_batch(head, hq_, B, n_max, approx_, st);
+            bk::bf16_gemv_fp32_mmvf_cols(hd_, w.w_h, ctx_h_, kE, kDsRnn, B * n_max, st);
+            bk::bf16_gemv_fp32_mmvf_cols(frc_, w.w_f, ctx_f_, kE, kDsRnn, B, st);
+            const size_t lq_step_bytes = (size_t) B * bk::native_q8_1_bytes(kDsRank, 1);
+            for (int i = 0; i < n_max; ++i) {
+                dspark_markov_step_batch(ctx_h_, ctx_f_, w.rnn_b, w.w_sp, w1_row_, state_, i, n_max, B, latent_, st);
+                void* lq_step = static_cast<char*>(lat_q_) + (size_t) i * lq_step_bytes;
+                bk::native_quantize_q8_1(latent_, lq_step, kDsRank, B, st);
+                dspark_head_pick_batch(head, hq_, lq_step, approx_, i, n_max, B, head_scr_, head_scr_stride_, prev_, ids_d_,
+                                       conf_d_, w.w1, w1_row_, st);
+            }
+            cudaMemcpyAsync(ids_h_, ids_d_, (size_t) B * kDsBlock * 4, cudaMemcpyDeviceToHost, st);
+            cudaMemcpyAsync(conf_h_, conf_d_, (size_t) B * kDsBlock * 4, cudaMemcpyDeviceToHost, st);
+        };
+        const size_t gidx = (size_t) (B - 2) * kDsDrafts + (size_t) (n_max - 1);
+        if (head_graphs_on_ && st && gidx < head_graphs_.size()) {
+            cudaGraphExec_t& g = head_graphs_[gidx];
+            if (!g) {
+                cudaGraph_t graph = nullptr;
+                if (cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed) == cudaSuccess) {
+                    run_head();
+                    const cudaError_t ce = cudaStreamEndCapture(st, &graph);
+                    const cudaError_t ci = ce == cudaSuccess ? cudaGraphInstantiateWithFlags(&g, graph, 0) : ce;
+                    if (graph) cudaGraphDestroy(graph);
+                    if (ci != cudaSuccess) {
+                        (void) cudaGetLastError();
+                        g = nullptr;
+                        head_graphs_on_ = false;
+                        basalt::log::warn("basalt inkling2", "batched drafter: head graph failed (%s); running without graphs",
+                                          cudaGetErrorString(ci));
+                    }
+                } else {
+                    (void) cudaGetLastError();
+                    head_graphs_on_ = false;
+                }
+            }
+            if (head_graphs_on_ && g) {
+                if (cudaGraphLaunch(g, st) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    head_graphs_on_ = false;
+                    run_head();
+                }
+            } else if (!head_graphs_on_) {
+                run_head();
+            }
+        } else {
+            run_head();
         }
-        cudaMemcpyAsync(ids_h_, ids_d_, (size_t) B * kDsBlock * 4, cudaMemcpyDeviceToHost, st);
-        cudaMemcpyAsync(conf_h_, conf_d_, (size_t) B * kDsBlock * 4, cudaMemcpyDeviceToHost, st);
     } catch (const std::exception& e) {
         return {model::Status::Error, std::string("inkling2: the drafter: ") + e.what()};
     }

@@ -834,6 +834,7 @@ public:
         if (elastic_.empty() || positions <= backed_) return true;
         const int64_t target = std::min<int64_t>(m_.context(), (positions + kElasticKvStep - 1) / kElasticKvStep * kElasticKvStep);
         const uint64_t bytes = cell_bytes() * (uint64_t) target;
+        m_.clamp_room();
         uint64_t grow = grow_bytes(target);
         const uint64_t keep_free = m_.held_free(kElasticKeep);
         const int64_t at = backed_;
@@ -1019,6 +1020,7 @@ public:
         if (m_.promoted() < m_.spill().spilled && !m_.lent()) {
             const int64_t before = m_.card_copies();
             const uint64_t grow = grow_bytes(keep);
+            m_.clamp_room();
             m_.promote(m_.held_free(kElasticKeep) + grow);
             m_.note_shortage("position " + std::to_string(at));
             m_.log_copy_change(at == 0 ? "new conversation" : ("resume at " + std::to_string(at)).c_str(), before, grow);
@@ -1438,7 +1440,7 @@ private:
         if (guess_next) cudaEventRecord(k.ra_ev, k.stream);   // the MLP input is in
         // the routed ids: a visit's own slot when the session ranks its copies by kept rows (decode_kept), else the scratch
         int32_t* const ids = k.win_ids ? k.win_ids + (size_t) vi * sh_->max_rows * g_.n_used : x.ids_;
-        if (g_.n_expert == 128 && rows == 1) {
+        if (g_.n_expert == 128 && rows <= kDecodeRows) {
             bk::router_logits(nrm, w.router, rows, ra, x.rlog_, k.stream);
         } else {
             bk::router(nrm, w.router, w.router_bias, rows, ra, x.rlog_, ids, x.rw_, k.stream);
@@ -1452,7 +1454,7 @@ private:
             cudaEventRecord(k.gs_ev, k.ra_st);
             k.ra_on = true;
         }
-        if (g_.n_expert == 128 && rows == 1) {
+        if (g_.n_expert == 128 && rows <= kDecodeRows) {
             router_select_plan(x.rlog_, w.router_bias, rows, g_.n_used, g_.n_expert, g_.expert_scale, ids, x.rw_,
                                w.blob_table, x.ex_ptr_, x.ex_start_, x.ex_ng_, x.ex_dst_, x.ex_tok_, k.stream,
                                k.ex_tally + (size_t) l * g_.n_expert, k.rec_blobs + (size_t) vi * kAheadExperts, k.rec_n + vi);
