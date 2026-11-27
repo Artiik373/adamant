@@ -244,6 +244,8 @@ class MsPackTest(unittest.TestCase):
             self.assertTrue(ex.mixed)
             txt = ex.layout_text().decode("utf-8").splitlines()
             self.assertTrue(txt[1].endswith("425352"), txt[1])
+            slot = ms_pack.MIX_HEAD + 2 * ms_pack.payload_bytes(hid, ff, 5) + ms_pack.payload_bytes(ff, hid, 5)
+            self.assertEqual(int(txt[1].split()[4]), slot)   # the engine's slot: all at the widest K
             chunks = list(ex.chunks(group=2))
             self.assertEqual(chunks[0][:3], bytes([4, 2, 5]))
 

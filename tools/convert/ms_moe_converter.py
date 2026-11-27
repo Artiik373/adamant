@@ -90,14 +90,14 @@ def rotate_weight_and_hessian(
 def best_sign_seed(w: torch.Tensor, block_size: int, seed: int, trials: int) -> int:
     """Of `trials` seeds (seed, seed + 1, ...), the one whose rotated weights have the smallest fourth moment
     sum(w^4) / sum(w^2)^2: the fewest outliers for the trellis (OptRot's objective over the sign vectors only)."""
-    best, best_m = seed, None
-    for t in range(max(trials, 1)):
-        sd = seed + t
-        wr = fwht_blocks(w * random_hadamard_signs(w.shape[1], sd, w.device).unsqueeze(0), block_size)
-        m = (wr.pow(4).sum() / wr.pow(2).sum().pow(2)).item()
-        if best_m is None or m < best_m:
-            best, best_m = sd, m
-    return best
+    if trials <= 1:
+        return seed
+    signs = torch.stack(
+        [random_hadamard_signs(w.shape[1], seed + t, torch.device("cpu")) for t in range(trials)]
+    ).to(device=w.device, dtype=w.dtype)
+    wr = fwht_blocks(w.unsqueeze(0) * signs.unsqueeze(1), block_size)
+    m = wr.pow(4).sum(dim=(1, 2)) / wr.pow(2).sum(dim=(1, 2)).pow(2)
+    return seed + int(torch.argmin(m).item())
 
 
 def _damped_hessian_for_pivots(h: torch.Tensor) -> torch.Tensor:
@@ -134,20 +134,17 @@ def best_sign_seed_joint(
         return seed
     w_f = w.detach().float()
     h_d = _damped_hessian_for_pivots(h)
-    best, best_m = seed, None
-    for t in range(trials):
-        sd = seed + t
-        signs = random_hadamard_signs(w_f.shape[1], sd, w_f.device)
-        wr = fwht_blocks(w_f * signs.unsqueeze(0), block_size)
-        kurt = (wr.pow(4).sum() / wr.pow(2).sum().pow(2).clamp(min=1e-12)).item()
-        hs = signs.to(h_d.dtype)
-        h_rot = fwht_blocks(h_d * hs.unsqueeze(0), block_size)
-        h_rot = fwht_blocks(h_rot.T * hs.unsqueeze(0), block_size).T
-        piv = (torch.linalg.cholesky(h_rot.flip(0, 1)).diagonal() ** 2).sum().item()
-        score = kurt * piv
-        if best_m is None or score < best_m:
-            best, best_m = sd, score
-    return best
+    signs = torch.stack(
+        [random_hadamard_signs(w_f.shape[1], seed + t, torch.device("cpu")) for t in range(trials)]
+    ).to(device=w_f.device, dtype=torch.float32)
+    wr = fwht_blocks(w_f.unsqueeze(0) * signs.unsqueeze(1), block_size)
+    kurt = wr.pow(4).sum(dim=(1, 2)) / wr.pow(2).sum(dim=(1, 2)).pow(2).clamp(min=1e-12)
+    hs = signs.to(h_d.dtype)
+    h_rot = fwht_blocks(
+        fwht_blocks(h_d.unsqueeze(0) * hs.unsqueeze(1), block_size).transpose(-1, -2) * hs.unsqueeze(1), block_size
+    ).transpose(-1, -2)
+    piv = (torch.linalg.cholesky(h_rot.flip(1, 2)).diagonal(dim1=-2, dim2=-1) ** 2).sum(dim=-1).to(kurt.dtype)
+    return seed + int(torch.argmin(kurt * piv).item())
 
 
 def denoise_hessian_rmt(h: torch.Tensor, n_samples: int, base_damp: float = 0.01) -> torch.Tensor:
@@ -180,6 +177,8 @@ def cholesky_inv_upper(h: torch.Tensor) -> torch.Tensor:
     """Compute upper Cholesky factor Hu of H^-1 with mandatory >=1% GPTQ/QTIP damping."""
     d = h.shape[0]
     eye = torch.eye(d, device=h.device, dtype=torch.float32)
+    if not torch.isfinite(h).all():
+        return eye
     h = 0.5 * (h + h.T)
     mean_diag = torch.diagonal(h).mean().clamp(min=1e-8)
     for damp in (0.01, 0.05, 0.2, 0.5):
@@ -187,10 +186,29 @@ def cholesky_inv_upper(h: torch.Tensor) -> torch.Tensor:
             h_d = h + (damp * mean_diag) * eye
             l_fac = torch.linalg.cholesky(h_d)
             h_inv = torch.cholesky_inverse(l_fac)
-            return torch.linalg.cholesky(h_inv, upper=True)
+            hu = torch.linalg.cholesky(h_inv, upper=True)
+            if torch.isfinite(hu).all():
+                return hu
         except RuntimeError:
             continue
     return eye
+
+
+def cholesky_inv_upper_batched(hs: torch.Tensor) -> torch.Tensor:
+    """Batched upper Cholesky factor Hu of H^-1 with >=1% damping; falls back per matrix on non-PD or non-finite."""
+    d = hs.shape[-1]
+    hs = 0.5 * (hs + hs.transpose(-1, -2))
+    mean_diag = hs.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).clamp(min=1e-8).unsqueeze(-1)
+    eye = torch.eye(d, device=hs.device, dtype=torch.float32)
+    try:
+        l_fac = torch.linalg.cholesky(hs.float() + (0.01 * mean_diag) * eye)
+        h_inv = torch.cholesky_inverse(l_fac)
+        hu = torch.linalg.cholesky(h_inv, upper=True)
+        if torch.isfinite(hu).all():
+            return hu
+    except RuntimeError:
+        pass
+    return torch.stack([cholesky_inv_upper(h) for h in hs])
 
 
 def gdn2_positional_weights(seq_len: int, device: torch.device) -> torch.Tensor:

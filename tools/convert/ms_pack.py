@@ -110,7 +110,7 @@ class Experts:
     A record's k is one width, a list of one width per expert, or a list of [k_gate, k_up, k_down] per expert."""
 
     def __init__(self, exp_dir: Path, n_layers: int):
-        self.layers = []
+        self.layers, self.shapes = [], []
         for l in range(n_layers):
             p = exp_dir / f"blk.{l}.experts.json"
             if not p.exists():
@@ -136,7 +136,7 @@ class Experts:
             for kr in ks_roles:
                 if not set(kr) <= set(MS_BITS):
                     raise PackError(f"{p.name}: K {raw_k}")
-            files, sizes = [], []
+            files, sizes, shapes = [], [], []
             for role, kr in zip(ROLES, ks_roles):
                 t = rec["tensors"][f"blk.{l}.ffn_{role}_exps.weight"]
                 n_in, n_out = (int(d) for d in t["shape"])
@@ -148,9 +148,11 @@ class Experts:
                     raise PackError(f"{f.name}: {f.stat().st_size} B, expected {sum(per)}")
                 files.append(f)
                 sizes.append(per)
+                shapes.append((n_in, n_out))
             if self.layers and n != self.layers[0][1]:
                 raise PackError(f"{p.name}: {n} experts, layer 0 has {self.layers[0][1]}")
             self.layers.append((k, n, files, sizes, per_proj))
+            self.shapes.append(shapes)
         self.n_expert = self.layers[0][1]
         self.mixed = any(not isinstance(k, int) for k, *_ in self.layers)
 
@@ -159,8 +161,13 @@ class Experts:
         return (0 if isinstance(k, int) else MIX_HEAD) + sum(s[e] for s in sizes)
 
     def blob_bytes(self, l: int) -> int:
-        """The layer's slot: its widest blob."""
-        return max(self.expert_bytes(l, e) for e in range(self.n_expert))
+        """The layer's slot: a uniform layer's blob; a mixed layer's head plus gate, up, down all at its widest K
+        (the engine's check, also with per-projection widths)."""
+        k = self.layers[l][0]
+        if isinstance(k, int):
+            return self.expert_bytes(l, 0)
+        kmax = max(max(v) if isinstance(v, list) else v for v in k)
+        return MIX_HEAD + sum(payload_bytes(n_in, n_out, kmax) for n_in, n_out in self.shapes[l])
 
     def layer_bytes(self, l: int) -> int:
         return sum(self.expert_bytes(l, e) for e in range(self.n_expert))

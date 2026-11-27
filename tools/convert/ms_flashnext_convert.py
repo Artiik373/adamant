@@ -54,9 +54,9 @@ SPINE = {  # HF module -> GGUF tensor suffix
 _PACK_SHIFTS: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
-def pack_rows(states: torch.Tensor, scales: torch.Tensor, k: int) -> bytes:
-    """MS rows (ms_pack.py format): fp16 scale, uint16 start state, MSB-first k-bit symbols of states[:, 1:], zero pad."""
-    rows, n = states.shape
+def _pack_rows_gpu(states: torch.Tensor, scales: torch.Tensor, k: int) -> torch.Tensor:
+    """Pack [..., rows, in] states and [..., rows] scales into [..., rows, rb] uint8 on device."""
+    *lead, rows, n = states.shape
     rb = ms_row_bytes(n, k)
     key = (states.device, k)
     shifts = _PACK_SHIFTS.get(key)
@@ -67,16 +67,29 @@ def pack_rows(states: torch.Tensor, scales: torch.Tensor, k: int) -> bytes:
         )
         _PACK_SHIFTS[key] = shifts
     s_k, s_8 = shifts
-    sym = (states[:, 1:] & ((1 << k) - 1)).to(torch.uint8)
-    bits = ((sym.unsqueeze(-1) >> s_k) & 1).reshape(rows, -1)
+    s_flat = states.reshape(-1, n)
+    sc_flat = scales.reshape(-1)
+    sym = (s_flat[:, 1:] & ((1 << k) - 1)).to(torch.uint8)
+    bits = ((sym.unsqueeze(-1) >> s_k) & 1).reshape(s_flat.shape[0], -1)
     nbytes = (bits.shape[1] + 7) // 8
-    bits = torch.nn.functional.pad(bits, (0, nbytes * 8 - bits.shape[1])).reshape(rows, nbytes, 8)
+    bits = torch.nn.functional.pad(bits, (0, nbytes * 8 - bits.shape[1])).reshape(s_flat.shape[0], nbytes, 8)
     packed = (bits << s_8).sum(-1, dtype=torch.uint8)
-    out = torch.zeros(rows, rb, dtype=torch.uint8, device=sym.device)
-    out[:, 0:2] = scales.to(torch.float16).view(torch.uint8).reshape(rows, 2)
-    out[:, 2:4] = (states[:, 0] & ms.STATE_MASK).to(torch.int16).view(torch.uint8).reshape(rows, 2)
+    out = torch.zeros(s_flat.shape[0], rb, dtype=torch.uint8, device=sym.device)
+    out[:, 0:2] = sc_flat.to(torch.float16).view(torch.uint8).reshape(-1, 2)
+    out[:, 2:4] = (s_flat[:, 0] & ms.STATE_MASK).to(torch.int16).view(torch.uint8).reshape(-1, 2)
     out[:, 4 : 4 + nbytes] = packed
-    return out.cpu().numpy().tobytes()
+    return out.reshape(*lead, rows, rb)
+
+
+def pack_rows(states: torch.Tensor, scales: torch.Tensor, k: int) -> bytes:
+    """MS rows (ms_pack.py format): fp16 scale, uint16 start state, MSB-first k-bit symbols of states[:, 1:], zero pad."""
+    return _pack_rows_gpu(states, scales, k).cpu().numpy().tobytes()
+
+
+def pack_rows_batched(states: torch.Tensor, scales: torch.Tensor, k: int) -> list[bytes]:
+    """Pack [E, rows, in] states with one D2H transfer."""
+    arr = _pack_rows_gpu(states, scales, k).cpu().numpy()
+    return [arr[i].tobytes() for i in range(arr.shape[0])]
 
 
 VITERBI = (48, 12)   # search window, commit length; set from --window/--commit
@@ -86,39 +99,46 @@ SIGN_TRIALS = 1     # sign-seed trials per matrix; set from --sign-trials
 SCALE_PASSES = 1    # Viterbi scale search passes; set from --scale-passes
 
 
-def refit_scales(w: torch.Tensor, states: torch.Tensor, scales: torch.Tensor, h: torch.Tensor, lut):
+def refit_scales(w: torch.Tensor, states: torch.Tensor, scales: torch.Tensor, h: torch.Tensor, lut,
+                 return_q: bool = True):
     """Each row's fp16 scale refitted for its fixed codes c: s = (c H w^T) / (c H c^T), the least H-weighted error;
     a row keeps its old scale where the rounded refit is not better. w, states [E, out, in], h [E, in, in]."""
     c = lut[states.long()]
     ch = torch.bmm(c, h)
-    s_new = ((ch * w).sum(-1) / (ch * c).sum(-1).clamp(min=1e-30)).to(torch.float16)
-    def err(s):
-        e = w - c * s.float().unsqueeze(-1)
-        return (torch.bmm(e, h) * e).sum(-1)
-    s_new = torch.where(torch.isfinite(s_new) & (err(s_new) < err(scales)), s_new, scales)
-    return s_new, c * s_new.float().unsqueeze(-1)
+    b = (ch * w).sum(-1)
+    a = (ch * c).sum(-1)
+    s_new = (b / a.clamp(min=1e-30)).to(torch.float16)
+    sf_new = s_new.float()
+    sf_old = scales.float()
+    # e^T H e - w^T H w = s * (s * a - 2 * b), avoiding two [E, out, in] @ [E, in, in] bmm calls
+    e_new = sf_new * (sf_new * a - 2.0 * b)
+    e_old = sf_old * (sf_old * a - 2.0 * b)
+    s_new = torch.where(torch.isfinite(s_new) & (e_new < e_old), s_new, scales)
+    q = c * s_new.float().unsqueeze(-1) if return_q else None
+    return s_new, q
 
 
 def _viterbi_with_scale_passes(w_rot: torch.Tensor, hu: torch.Tensor, h_rot: torch.Tensor, k: int, lut, passes: int,
-                               viterbi: tuple[int, int]):
+                               viterbi: tuple[int, int], return_q: bool = True):
     if passes >= 2 and k <= 3:
         coarse = (min(viterbi[0], 16), min(viterbi[1], 12))
-        scales0, states, _ = viterbi_code_batched_cuda(w_rot, hu, k, lut, *coarse)
+        scales0, states, _ = viterbi_code_batched_cuda(w_rot, hu, k, lut, *coarse, return_quant=False)
         scales, q = refit_scales(w_rot, states, scales0, h_rot, lut)
-        scales2, states2, _ = viterbi_code_batched_cuda(w_rot, hu, k, lut, *viterbi, scales=scales)
+        scales2, states2, _ = viterbi_code_batched_cuda(w_rot, hu, k, lut, *viterbi, scales=scales, return_quant=False)
         scales2, q2 = refit_scales(w_rot, states2, scales2, h_rot, lut)
         e1 = (torch.bmm(w_rot - q, h_rot) * (w_rot - q)).sum(-1)
         e2 = (torch.bmm(w_rot - q2, h_rot) * (w_rot - q2)).sum(-1)
         better = e2 < e1
         scales = torch.where(better, scales2, scales)
         states = torch.where(better.unsqueeze(-1), states2, states)
-        q = torch.where(better.unsqueeze(-1), q2, q)
+        q = torch.where(better.unsqueeze(-1), q2, q) if return_q else None
         return scales, states, q
-    scales0, states, _ = viterbi_code_batched_cuda(w_rot, hu, k, lut, *viterbi)
-    scales, q = refit_scales(w_rot, states, scales0, h_rot, lut)
+    scales0, states, _ = viterbi_code_batched_cuda(w_rot, hu, k, lut, *viterbi, return_quant=False)
+    scales, q = refit_scales(w_rot, states, scales0, h_rot, lut, return_q=return_q)
     return scales, states, q
 
 
+@torch.no_grad()
 def code(ws: torch.Tensor, hs: torch.Tensor, k: int, lut, seeds, sign_trials: int | None = None,
          scale_passes: int | None = None, viterbi: tuple[int, int] | None = None,
          return_deq: bool = True) -> list:
@@ -132,19 +152,22 @@ def code(ws: torch.Tensor, hs: torch.Tensor, k: int, lut, seeds, sign_trials: in
             seeds = [ms.best_sign_seed_joint(w, h, blk, s, trials) for w, h, s in zip(ws, hs, seeds)]
         else:
             seeds = [ms.best_sign_seed(w, blk, s, trials) for w, s in zip(ws, seeds)]
-    rot = [ms.rotate_weight_and_hessian(w, h, block_size=blk, seed=s) for w, h, s in zip(ws, hs, seeds)]
-    hu = torch.stack([ms.cholesky_inv_upper(r[1]) for r in rot])
-    w_rot = torch.stack([r[0] for r in rot])
-    h_rot = torch.stack([r[1] for r in rot])
-    scales, states, q = _viterbi_with_scale_passes(w_rot, hu, h_rot, k, lut, passes, vit)
-    out = []
-    for i, r in enumerate(rot):
-        signs = r[2]
-        deq = ms.fwht_blocks(q[i], block_size=blk) * signs.unsqueeze(0) if return_deq else None
-        out.append((pack_rows(states[i], scales[i], k), signs.to(torch.int8).cpu().numpy(), deq))
-    return out
+    signs = torch.stack([ms.random_hadamard_signs(ws.shape[2], s, torch.device("cpu")) for s in seeds]).to(
+        device=ws.device, dtype=torch.float32
+    )
+    w_rot = ms.fwht_blocks(ws * signs.unsqueeze(1), blk)
+    h_rot = ms.fwht_blocks(
+        ms.fwht_blocks(hs * signs.unsqueeze(1), blk).transpose(-1, -2) * signs.unsqueeze(1), blk
+    ).transpose(-1, -2)
+    hu = ms.cholesky_inv_upper_batched(h_rot)
+    scales, states, q = _viterbi_with_scale_passes(w_rot, hu, h_rot, k, lut, passes, vit, return_q=return_deq)
+    packed = pack_rows_batched(states, scales, k)
+    signs_np = signs.to(torch.int8).cpu().numpy()
+    deqs = ms.fwht_blocks(q, block_size=blk) * signs.unsqueeze(1) if return_deq else None
+    return [(packed[i], signs_np[i], deqs[i] if deqs is not None else None) for i in range(ws.shape[0])]
 
 
+@torch.no_grad()
 def code_rows(w: torch.Tensor, h: torch.Tensor, k: int, lut, seed: int, chunk: int = 16384,
               sign_trials: int | None = None, scale_passes: int | None = None,
               viterbi: tuple[int, int] | None = None):
@@ -161,7 +184,8 @@ def code_rows(w: torch.Tensor, h: torch.Tensor, k: int, lut, seed: int, chunk: i
     parts = []
     for r0 in range(0, w.shape[0], chunk):
         w_rot = ms.fwht_blocks(w[r0 : r0 + chunk].float() * signs.unsqueeze(0), blk)
-        scales, states, _ = _viterbi_with_scale_passes(w_rot.unsqueeze(0), hu, h_rot_b, k, lut, passes, vit)
+        scales, states, _ = _viterbi_with_scale_passes(w_rot.unsqueeze(0), hu, h_rot_b, k, lut, passes, vit,
+                                                       return_q=False)
         parts.append(pack_rows(states[0], scales[0], k))
     return b"".join(parts), signs.to(torch.int8).cpu().numpy()
 
@@ -220,52 +244,128 @@ def _norm_expert_ks(k, n_exp: int) -> list[tuple[int, int, int]]:
     return [(v[0], v[1], v[2]) if isinstance(v, (list, tuple)) else (v, v, v) for v in k]
 
 
+@torch.no_grad()
 def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0.0, tok_w=None,
                  cold_frac: float | None = None) -> dict:
     """k: one width for the layer, a list of one width per expert, or a list of [k_gate, k_up, k_down] per expert."""
     ex = moe.experts
     dev = idx.device
-    h_all = x_ref = None
+    h_all = x_ref_f = None
     if tau > 0:   # the layer-wide statistics the shrinkage pulls toward: all tokens, and a fixed sample of them
         h_all = sum((cb := c.to(dev).float()).T @ cb for c in x.split(65536)) / x.shape[0]   # in chunks: no fp32 copy
         g = torch.Generator(device="cpu").manual_seed(l)
-        x_ref = x[torch.randperm(x.shape[0], generator=g)[:2048].to(x.device)].to(dev)
+        x_ref_f = x[torch.randperm(x.shape[0], generator=g)[:2048].to(x.device)].to(dev).float()
     n_exp, two_ff, n_embd = ex.gate_up_proj.shape
     n_ff = two_ff // 2
+    # CSR index of routed tokens per expert in one sort instead of scanning idx n_exp times
+    flat_idx = idx.reshape(-1)
+    counts = torch.bincount(flat_idx, minlength=n_exp)
+    order = torch.argsort(flat_idx)
+    del flat_idx
+    tok_all = (order // idx.shape[1]).to(torch.int32)
+    if wts is not None:
+        wt_all = (wts.float().reshape(-1) ** 2)[order]
+        if tok_w is not None:
+            wt_all = wt_all * tok_w[tok_all.long()]
+    elif tok_w is not None:
+        wt_all = tok_w[tok_all.long()]
+    else:
+        wt_all = None
+    del order
+    counts_list = counts.tolist()
+    offsets = [0] * (n_exp + 1)
+    for ei, c in enumerate(counts_list):
+        offsets[ei + 1] = offsets[ei] + c
+    tok_src = tok_all.cpu() if x.device != dev else tok_all
+    if x.device != dev:
+        del tok_all
+    eye_in = torch.eye(n_embd, device=dev) if tau <= 0 else None
+    eye_dn = torch.eye(n_ff, device=dev) if tau <= 0 else None
+
     cf = COLD_FRAC if cold_frac is None else cold_frac
     is_cold = [False] * n_exp
     if cf > 0.0:
-        counts = torch.bincount(idx.reshape(-1), minlength=n_exp)
         n_cold = min(n_exp, max(0, int(n_exp * cf)))
         if n_cold > 0:
             for ei in torch.topk(counts, n_cold, largest=False).indices.tolist():
                 is_cold[ei] = True
     k_triples = _norm_expert_ks(k, n_exp)
     files = {n: open(out_dir / f"blk.{l}.ffn_{n}_exps.ms", "wb") for n in ("gate", "up", "down")}
-    # experts per batch: the back-pointer buffer grows with the window; group widths over 32-expert chunks to avoid fragmentation
-    eb = EXPERT_BATCH or max(1, 8 * 32 // VITERBI[0])
-    chunk_exp = min(n_exp, max(eb, 32))
+    # experts per batch: scale with 2^k since backptr shrinks as 1 << (14 - k)
+    def _eb_for(vit_w: int, kk: int) -> int:
+        if EXPERT_BATCH:
+            return EXPERT_BATCH
+        return min(32, max(1, 8 * 32 // vit_w) * min(4, 1 << max(0, kk - 2)))
+    chunk_exp = min(n_exp, 32)
     zero = 0
     try:
         for e0 in range(0, n_exp, chunk_exp):
             es = list(range(e0, min(e0 + chunk_exp, n_exp)))
             w_gu_b = ex.gate_up_proj[es].to(dev).float()
             w_dn_b = ex.down_proj[es].to(dev).float()
-            hs = [expert_hessians(x, idx, e, w_gu_b[i], wts, tau, h_all, x_ref, tok_w) for i, e in enumerate(es)]
-            zero += sum(1 for h in hs if h[2] == 0)
+            if tau > 0:
+                gr, ur = torch.matmul(x_ref_f, w_gu_b.transpose(1, 2)).chunk(2, -1)
+                ar = torch.nn.functional.silu(gr) * ur
+                hd_all_b = torch.bmm(ar.transpose(1, 2), ar) / x_ref_f.shape[0]
+                del gr, ur, ar
+            h_gus, h_dns = [], []
+            for i, e in enumerate(es):
+                n = counts_list[e]
+                if n == 0:
+                    zero += 1
+                    if tau <= 0:
+                        h_gus.append(eye_in)
+                        h_dns.append(eye_dn)
+                    else:
+                        h_gus.append(h_all)
+                        h_dns.append(hd_all_b[i])
+                    continue
+                tok_e = tok_src[offsets[e] : offsets[e + 1]]
+                p = wt_all[offsets[e] : offsets[e + 1]] if wt_all is not None else None
+                s_in = s_dn = None
+                for c in range(0, n, 32768):
+                    xe = x[tok_e[c : c + 32768].long()].to(dev).float()
+                    g, u = (xe @ w_gu_b[i].T).chunk(2, -1)
+                    a = torch.nn.functional.silu(g) * u
+                    del g, u
+                    if p is None:
+                        si, sd = xe.T @ xe, a.T @ a
+                    else:
+                        pc = p[c : c + 32768, None]
+                        si, sd = (xe * pc).T @ xe, (a * pc).T @ a
+                    del xe, a
+                    if s_in is None:
+                        s_in, s_dn = si, sd
+                    else:
+                        s_in += si
+                        s_dn += sd
+                if tau <= 0:
+                    h_gus.append(s_in)
+                    h_dns.append(s_dn)
+                else:
+                    if p is None:
+                        m = float(n)
+                        t = tau
+                    else:
+                        m = p.sum()
+                        t = tau * (m / (m * m / (p * p).sum()))
+                    h_gus.append((s_in + t * h_all) / (m + t))
+                    h_dns.append((s_dn + t * hd_all_b[i]) / (m + t))
             got_g, got_u, got_d = {}, {}, {}
             for cold in (False, True):
                 kw = {"sign_trials": 1, "scale_passes": 1, "viterbi": COLD_VITERBI} if cold else {}
+                vit_w = COLD_VITERBI[0] if cold else VITERBI[0]
                 same_ks = sorted({k_triples[es[i]][0] for i in range(len(es))
                                   if is_cold[es[i]] == cold and k_triples[es[i]][0] == k_triples[es[i]][1]})
                 for kk in same_ks:
+                    eb = _eb_for(vit_w, kk)
                     sub = [i for i in range(len(es)) if is_cold[es[i]] == cold
                            and k_triples[es[i]][0] == kk and k_triples[es[i]][1] == kk]
                     rb_gu = ms_row_bytes(n_embd, kk) * n_ff
                     for b0 in range(0, len(sub), eb):
                         sub_b = sub[b0 : b0 + eb]
                         ids = [es[i] for i in sub_b]
-                        gu = code(w_gu_b[sub_b], torch.stack([hs[i][0] for i in sub_b]), kk, lut,
+                        gu = code(w_gu_b[sub_b], torch.stack([h_gus[i] for i in sub_b]), kk, lut,
                                   [l * 4096 + 2 * e + 1 for e in ids], return_deq=False, **kw)
                         for e, (rows, signs, _) in zip(ids, gu):
                             got_g[e] = (rows[:rb_gu], signs)
@@ -274,22 +374,24 @@ def code_experts(moe, x, idx, k, lut, l, out_dir: Path, wts=None, tau: float = 0
                     diff_ks = sorted({k_triples[es[i]][proj_idx] for i in range(len(es))
                                       if is_cold[es[i]] == cold and k_triples[es[i]][0] != k_triples[es[i]][1]})
                     for kk in diff_ks:
+                        eb = _eb_for(vit_w, kk)
                         sub = [i for i in range(len(es)) if is_cold[es[i]] == cold
                                and k_triples[es[i]][0] != k_triples[es[i]][1] and k_triples[es[i]][proj_idx] == kk]
                         for b0 in range(0, len(sub), eb):
                             sub_b = sub[b0 : b0 + eb]
                             ids = [es[i] for i in sub_b]
-                            res = code(w_gu_b[sub_b, sl_gu], torch.stack([hs[i][0] for i in sub_b]), kk, lut,
+                            res = code(w_gu_b[sub_b, sl_gu], torch.stack([h_gus[i] for i in sub_b]), kk, lut,
                                        [l * 4096 + 2 * e + 1 + proj_idx * 2048 for e in ids], return_deq=False, **kw)
                             for e, (rows, signs, _) in zip(ids, res):
                                 got_p[e] = (rows, signs)
                 dn_ks = sorted({k_triples[es[i]][2] for i in range(len(es)) if is_cold[es[i]] == cold})
                 for kk in dn_ks:
+                    eb = _eb_for(vit_w, kk)
                     sub = [i for i in range(len(es)) if is_cold[es[i]] == cold and k_triples[es[i]][2] == kk]
                     for b0 in range(0, len(sub), eb):
                         sub_b = sub[b0 : b0 + eb]
                         ids = [es[i] for i in sub_b]
-                        dn = code(w_dn_b[sub_b], torch.stack([hs[i][1] for i in sub_b]), kk, lut,
+                        dn = code(w_dn_b[sub_b], torch.stack([h_dns[i] for i in sub_b]), kk, lut,
                                   [l * 4096 + 2 * e + 2 for e in ids], return_deq=False, **kw)
                         for e, (rows_d, signs_d, _) in zip(ids, dn):
                             got_d[e] = (rows_d, signs_d)
@@ -556,13 +658,16 @@ def code_mtp(cfg, hf: Path, wmap: dict, h, cal_ids, kws, bs, dev, lut, k_proj: i
         layer((h2 + e2.unsqueeze(-2)).flatten(-2).to(torch.bfloat16), **kw)
     for hk_ in hooks:
         hk_.remove()
+    del top, emb
     assert fill[0] == x.shape[0], (fill[0], x.shape)
     coded = {}
     for i, m in enumerate(MTP_PROJ):
         w = mods[m].weight.float()
         rows, signs, _ = code(w[None], (hs.pop(m) / x.shape[0])[None], k_proj, lut, [9000 + i])[0]
         coded[m] = (rows, signs, w.shape[0], w.shape[1])
-    _, wts, idx = layer.mlp.gate(x)
+    idx = torch.cat([layer.mlp.gate(c)[2] for c in x.split(65536)])
+    layer.mlp.experts.to("cpu")
+    torch.cuda.empty_cache()
     rec = code_experts(layer.mlp, x, idx, k_exp, lut, 0, d, None, tau)
     ex = rec["tensors"]
     blob = sum(int(ms_row_bytes(int(t["shape"][0]), k_exp)) * int(t["shape"][1]) + int(t["shape"][0]) for t in ex.values())
@@ -636,10 +741,12 @@ def main() -> None:
         p.error("--mtp-only runs every original layer: not with --two-stream, --reuse-layers or --stop-after")
 
     dev = torch.device("cuda:0")
+    cap_bytes = None
     if args.max_vram_gib > 0:
         tot_vram = torch.cuda.get_device_properties(dev).total_memory
         frac = min(1.0, (args.max_vram_gib * (1 << 30)) / tot_vram)
         torch.cuda.set_per_process_memory_fraction(frac, dev)
+        cap_bytes = int(frac * tot_vram)
     torch.backends.cuda.matmul.allow_tf32 = True  # Hessian sums: TF32 inputs, FP32 accumulation
     global VITERBI, COLD_VITERBI, COLD_FRAC, EXPERT_BATCH, SIGN_TRIALS, SCALE_PASSES
     VITERBI = (args.window, args.commit)
@@ -787,11 +894,13 @@ def main() -> None:
             wts, idx = torch.cat([p[0] for p in parts]), torch.cat([p[1] for p in parts])
             del parts
         if x.device != dev:
-            # Move 5 GiB expert weights to CPU so x (6.25 GiB) fits on GPU with headroom below --max-vram-gib
+            # Move 5 GiB expert weights to CPU so x fits on GPU with headroom below --max-vram-gib
             moe.experts.to("cpu")
             torch.cuda.empty_cache()
             free_b, _ = torch.cuda.mem_get_info(dev)
-            if free_b > x.numel() * x.element_size() + (5 << 30):
+            if cap_bytes is not None:
+                free_b = min(free_b, cap_bytes - torch.cuda.memory_allocated(dev))
+            if free_b > x.numel() * x.element_size() + (7 << 30):
                 x = x.to(dev)
         rec = code_experts(moe, x, idx, plan[l], lut, l, out / "experts", wts if args.hess_affinity else None,
                            args.hess_tau, tok_w)
