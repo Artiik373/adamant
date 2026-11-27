@@ -34,6 +34,88 @@ const std::unordered_map<uint32_t, uint8_t>& char_to_byte() {
 
 ReplyForm g_reply_form;
 
+void note_special_token(const ReplyForm& form, bool blocks, const std::string& key, int ty, int64_t id, PackVocab& out) {
+    if (ty != 3 && ty != 4) return;
+    if (blocks) {
+        if (key == form.header) out.block_header = (int32_t) id;
+        else if (key == form.think_open) out.think_open = (int32_t) id;
+        else if (key == form.think_close) out.think_close = (int32_t) id;
+        else if (key == form.answer_open) out.answer_open = (int32_t) id;
+        return;
+    }
+    if (key == form.think_open) out.think_open = (int32_t) id;
+    else if (key == form.think_close) out.think_close = (int32_t) id;
+}
+
+std::string decode_bpe(const std::string& key, const std::unordered_map<uint32_t, uint8_t>& to_byte) {
+    std::string b;
+    for (size_t i = 0; i < key.size();) {
+        const uint32_t cp = next_cp(key, i);
+        const auto it = to_byte.find(cp);
+        if (it != to_byte.end()) b += (char) it->second;
+        else put_utf8(b, cp);
+    }
+    return b;
+}
+
+bool finish_vocab(std::vector<std::string> bytes, const std::vector<int32_t>& end_ids, bool blocks, PackVocab& out) {
+    std::vector<int32_t> ends = end_ids;
+    if (blocks && (out.block_header < 0 || out.think_close < 0))   // not this vocabulary's form: no thinking known
+        out.think_open = out.think_close = out.block_header = out.answer_open = -1;
+    if (out.block_header >= 0 && std::find(ends.begin(), ends.end(), out.think_close) == ends.end())
+        ends.push_back(out.think_close);   // the answer block's end: allowed where the grammar can end
+    out.vocab = std::make_shared<const Vocab>(std::move(bytes), std::move(ends));
+    return true;
+}
+
+bool eat_bool(Scan& sc, bool& val) {
+    sc.ws();
+    if (sc.s.compare(sc.i, 4, "true") == 0) { sc.i += 4; val = true; return true; }
+    if (sc.s.compare(sc.i, 5, "false") == 0) { sc.i += 5; val = false; return true; }
+    return false;
+}
+
+bool skip_json(Scan& sc, int depth = 0) {
+    if (depth > 64) return false;
+    sc.ws();
+    if (sc.i >= sc.s.size()) return false;
+    const char c = sc.s[sc.i];
+    if (c == '"') {
+        std::string tmp;
+        return sc.str(tmp);
+    }
+    if (c == '{') {
+        ++sc.i;
+        if (sc.eat('}')) return true;
+        std::string k;
+        do {
+            if (!sc.str(k) || !sc.eat(':') || !skip_json(sc, depth + 1)) return false;
+        } while (sc.eat(','));
+        return sc.eat('}');
+    }
+    if (c == '[') {
+        ++sc.i;
+        if (sc.eat(']')) return true;
+        do {
+            if (!skip_json(sc, depth + 1)) return false;
+        } while (sc.eat(','));
+        return sc.eat(']');
+    }
+    if (sc.s.compare(sc.i, 4, "true") == 0 || sc.s.compare(sc.i, 4, "null") == 0) { sc.i += 4; return true; }
+    if (sc.s.compare(sc.i, 5, "false") == 0) { sc.i += 5; return true; }
+    if (c == '-' || (c >= '0' && c <= '9')) {
+        const size_t start = sc.i;
+        if (sc.s[sc.i] == '-') ++sc.i;
+        while (sc.i < sc.s.size()) {
+            const char d = sc.s[sc.i];
+            if ((d >= '0' && d <= '9') || d == '.' || d == 'e' || d == 'E' || d == '+' || d == '-') ++sc.i;
+            else break;
+        }
+        return sc.i > start;
+    }
+    return false;
+}
+
 }  // namespace
 
 void set_reply_form(const ReplyForm& form) { g_reply_form = form; }
@@ -69,37 +151,106 @@ bool vocab_from_pack(std::string_view vocab_json, std::string_view types_json, s
             if (!sc.str(key) || !sc.eat(':') || !sc.integer(id)) { err = "vocab.json: bad entry"; return false; }
             if (id < 0 || (size_t) id >= n_vocab) continue;
             const int ty = types[(size_t) id];
-            std::string& b = bytes[(size_t) id];
-            if (blocks && (ty == 3 || ty == 4)) {   // a reply of blocks: its tokens may be control tokens
-                if (key == form.header) out.block_header = (int32_t) id;
-                else if (key == form.think_open) out.think_open = (int32_t) id;
-                else if (key == form.think_close) out.think_close = (int32_t) id;
-                else if (key == form.answer_open) out.answer_open = (int32_t) id;
-            }
+            note_special_token(form, blocks, key, ty, id, out);
             if (ty == 3 || ty == 5 || ty == 6) continue;   // control, unused and byte entries never appear as text
-            if (ty == 4) {
-                b = key;   // an added token keeps its literal text
-                if (blocks) continue;
-                if (key == form.think_open) out.think_open = (int32_t) id;
-                else if (key == form.think_close) out.think_close = (int32_t) id;
-                continue;
-            }
-            for (size_t i = 0; i < key.size();) {
-                const uint32_t cp = next_cp(key, i);
-                const auto it = to_byte.find(cp);
-                if (it != to_byte.end()) b += (char) it->second;
-                else put_utf8(b, cp);
-            }
+            if (ty == 4) { bytes[(size_t) id] = key; continue; }
+            bytes[(size_t) id] = decode_bpe(key, to_byte);
         } while (sc.eat(','));
     }
     if (!sc.eat('}')) { err = "vocab.json: unterminated"; return false; }
-    std::vector<int32_t> ends = end_ids;
-    if (blocks && (out.block_header < 0 || out.think_close < 0))   // not this vocabulary's form: no thinking known
-        out.think_open = out.think_close = out.block_header = out.answer_open = -1;
-    if (out.block_header >= 0 && std::find(ends.begin(), ends.end(), out.think_close) == ends.end())
-        ends.push_back(out.think_close);   // the answer block's end: allowed where the grammar can end
-    out.vocab = std::make_shared<const Vocab>(std::move(bytes), std::move(ends));
-    return true;
+    return finish_vocab(std::move(bytes), end_ids, blocks, out);
+}
+
+bool vocab_from_tokenizer_json(std::string_view tokenizer_json, size_t n_vocab,
+                               const std::vector<int32_t>& end_ids, PackVocab& out, std::string& err) {
+    std::vector<int8_t> types(n_vocab, -1);
+    std::vector<std::string> bytes(n_vocab);
+    out.think_open = out.think_close = out.block_header = out.answer_open = -1;
+    const ReplyForm& form = reply_form();
+    const bool blocks = !form.header.empty();
+    const auto& to_byte = char_to_byte();
+    bool saw_vocab = false;
+    Scan sc{tokenizer_json};
+    if (!sc.eat('{')) { err = "tokenizer.json: not an object"; return false; }
+    if (!sc.eat('}')) {
+        std::string top_key;
+        do {
+            if (!sc.str(top_key) || !sc.eat(':')) { err = "tokenizer.json: bad entry"; return false; }
+            if (top_key == "model") {
+                if (!sc.eat('{')) { err = "tokenizer.json: model is not an object"; return false; }
+                if (!sc.eat('}')) {
+                    std::string mkey;
+                    do {
+                        if (!sc.str(mkey) || !sc.eat(':')) { err = "tokenizer.json: bad model entry"; return false; }
+                        if (mkey == "vocab") {
+                            saw_vocab = true;
+                            if (!sc.eat('{')) { err = "tokenizer.json: model.vocab is not an object"; return false; }
+                            if (!sc.eat('}')) {
+                                std::string tok;
+                                do {
+                                    int64_t id = 0;
+                                    if (!sc.str(tok) || !sc.eat(':') || !sc.integer(id)) {
+                                        err = "tokenizer.json: bad model.vocab entry";
+                                        return false;
+                                    }
+                                    if (id >= 0 && (size_t) id < n_vocab && types[(size_t) id] < 0) {
+                                        types[(size_t) id] = 1;
+                                        bytes[(size_t) id] = decode_bpe(tok, to_byte);
+                                    }
+                                } while (sc.eat(','));
+                                if (!sc.eat('}')) { err = "tokenizer.json: model.vocab unterminated"; return false; }
+                            }
+                        } else if (!skip_json(sc)) {
+                            err = "tokenizer.json: bad model field";
+                            return false;
+                        }
+                    } while (sc.eat(','));
+                    if (!sc.eat('}')) { err = "tokenizer.json: model unterminated"; return false; }
+                }
+            } else if (top_key == "added_tokens") {
+                if (!sc.eat('[')) { err = "tokenizer.json: added_tokens is not an array"; return false; }
+                if (!sc.eat(']')) {
+                    do {
+                        if (!sc.eat('{')) { err = "tokenizer.json: bad added_token"; return false; }
+                        int64_t id = -1;
+                        std::string content;
+                        bool special = false;
+                        if (!sc.eat('}')) {
+                            std::string akey;
+                            do {
+                                if (!sc.str(akey) || !sc.eat(':')) { err = "tokenizer.json: bad added_token field"; return false; }
+                                if (akey == "id") {
+                                    if (!sc.integer(id)) { err = "tokenizer.json: bad added_token id"; return false; }
+                                } else if (akey == "content") {
+                                    if (!sc.str(content)) { err = "tokenizer.json: bad added_token content"; return false; }
+                                } else if (akey == "special") {
+                                    if (!eat_bool(sc, special)) { err = "tokenizer.json: bad added_token special"; return false; }
+                                } else if (!skip_json(sc)) {
+                                    err = "tokenizer.json: bad added_token value";
+                                    return false;
+                                }
+                            } while (sc.eat(','));
+                            if (!sc.eat('}')) { err = "tokenizer.json: added_token unterminated"; return false; }
+                        }
+                        if (id >= 0 && (size_t) id < n_vocab) {
+                            const int ty = special ? 3 : 4;
+                            types[(size_t) id] = (int8_t) ty;
+                            note_special_token(form, blocks, content, ty, id, out);
+                            if (ty == 3) bytes[(size_t) id].clear();
+                            else bytes[(size_t) id] = content;
+                        }
+                    } while (sc.eat(','));
+                    if (!sc.eat(']')) { err = "tokenizer.json: added_tokens unterminated"; return false; }
+                }
+            } else if (!skip_json(sc)) {
+                err = "tokenizer.json: bad field";
+                return false;
+            }
+        } while (sc.eat(','));
+    }
+    if (!sc.eat('}')) { err = "tokenizer.json: unterminated"; return false; }
+    if (!saw_vocab) { err = "tokenizer.json: missing model.vocab"; return false; }
+    return finish_vocab(std::move(bytes), end_ids, blocks, out);
 }
 
 bool Guard::begin(const std::string& grammar_json, const int64_t* prompt, size_t n_prompt, std::string& err) {

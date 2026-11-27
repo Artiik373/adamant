@@ -1,6 +1,6 @@
-// src/models/inkling2/pretok_inkling2.cpp - the inkling2 pre-tokenizer: the text split into the pieces BPE merges.
+// src/program/tokenizer/pretok_o200k.cpp - the o200k pre-tokenizer (Inkling 2, GigaChat4): the text split into the pieces BPE merges.
 //
-// The checkpoint's tokenizer.json splits with OpenAI's o200k expression (llama.cpp's GPT4O pre-type), its alternatives
+// The checkpoints' tokenizer.json split with OpenAI's o200k expression (llama.cpp's GPT4O pre-type), its alternatives
 // tried in order at each position, the first that matches taking its piece:
 //   [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
 //   [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
@@ -11,21 +11,15 @@
 //   \s+
 // The letters' case classes are the Unicode categories (llama.cpp approximates them with ASCII case); letters, numbers,
 // marks and whitespace come from the shared table.
-#include "models/inkling2/adapter.hpp"
+#include "basalt/program/pretok_o200k.hpp"
 
 #include "unicode_flags.hpp"
 
 #include <algorithm>
 #include <utility>
 
-namespace basalt::models::inkling2 {
+namespace basalt::program::tokenizer {
 
-using program::tokenizer::cpt_flag_table;
-using program::tokenizer::decode_cp;
-using program::tokenizer::kLetter;
-using program::tokenizer::kMark;
-using program::tokenizer::kNumber;
-using program::tokenizer::kWhitespace;
 
 namespace {
 
@@ -456,7 +450,7 @@ size_t match(const Text& t, size_t i) {
 
 }  // namespace
 
-void pretok_inkling2(const char* text, size_t size, std::vector<size_t>& ends) {
+void pretok_o200k(const char* text, size_t size, std::vector<size_t>& ends) {
     ends.clear();
     const uint8_t* s = (const uint8_t*) text;
     const uint16_t* table = cpt_flag_table();
@@ -482,4 +476,4 @@ void pretok_inkling2(const char* text, size_t size, std::vector<size_t>& ends) {
     }
 }
 
-}  // namespace basalt::models::inkling2
+}  // namespace basalt::program::tokenizer

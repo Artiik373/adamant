@@ -326,6 +326,34 @@ int main() {
         Guard g(pv);
         CHECK(!g.begin("{", nullptr, 0, err));
     }
+    {   // HF tokenizer.json fallback (no split vocab.json/token_type.json), with special:true think tags
+        const char* tj = R"({
+            "version": "1.0",
+            "added_tokens": [
+                {"id": 6, "content": "<think>", "special": true},
+                {"id": 7, "content": "</think>", "special": true},
+                {"id": 8, "content": "<|message_sep|>", "special": true},
+                {"id": 11, "content": "<tool_call>", "special": false}
+            ],
+            "model": {
+                "type": "BPE",
+                "vocab": {"{": 0, "}": 1, "\"a\"": 2, ":": 3, "1": 4, "\u0120x": 9, "hello": 12},
+                "merges": ["h e"]
+            }
+        })";
+        PackVocab hfpv;
+        std::string herr;
+        CHECK(vocab_from_tokenizer_json(tj, 14, {8}, hfpv, herr));
+        CHECK(hfpv.think_open == 6 && hfpv.think_close == 7);
+        CHECK(hfpv.vocab->bytes(6).empty() && hfpv.vocab->bytes(7).empty());
+        CHECK(hfpv.vocab->bytes(8).empty() && hfpv.vocab->bytes(11) == "<tool_call>");
+        CHECK(hfpv.vocab->bytes(9) == " x" && hfpv.vocab->bytes(0) == "{");
+        Guard hg(hfpv);
+        const int64_t prompt[] = {6};
+        CHECK(hg.begin(jo, prompt, 1, herr));
+        const int32_t stream[] = {12, 7, 0, 1, 8};
+        CHECK(hg.scan(stream, 5, 0) == -1);
+    }
     if (g_fail == 0) std::printf("grammar_guard_test: ok\n");
     return g_fail == 0 ? 0 : 1;
 }

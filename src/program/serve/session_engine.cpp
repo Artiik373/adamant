@@ -81,11 +81,22 @@ public:
             std::string gerr;
             basalt::program::grammar::PackVocab pv;
             std::vector<int32_t> ends(o.eos_ids.begin(), o.eos_ids.end());
-            if (!basalt::core::read_range(model_file.range("tokenizer/vocab.json"), vj, gerr) ||
-                !basalt::core::read_range(model_file.range("tokenizer/token_type.json"), tj, gerr) ||
-                !basalt::program::grammar::vocab_from_pack(std::string_view((const char*) vj.data(), vj.size()),
-                                                           std::string_view((const char*) tj.data(), tj.size()),
-                                                           (size_t) n_vocab, ends, pv, gerr)) {
+            const bool has_split = model_file.find("tokenizer/vocab.json") != nullptr;
+            bool ok = false;
+            if (has_split) {
+                ok = basalt::core::read_range(model_file.range("tokenizer/vocab.json"), vj, gerr) &&
+                     basalt::core::read_range(model_file.range("tokenizer/token_type.json"), tj, gerr) &&
+                     basalt::program::grammar::vocab_from_pack(std::string_view((const char*) vj.data(), vj.size()),
+                                                                std::string_view((const char*) tj.data(), tj.size()),
+                                                                (size_t) n_vocab, ends, pv, gerr);
+            } else if (model_file.find("tokenizer/tokenizer.json") != nullptr) {
+                ok = basalt::core::read_range(model_file.range("tokenizer/tokenizer.json"), vj, gerr) &&
+                     basalt::program::grammar::vocab_from_tokenizer_json(
+                         std::string_view((const char*) vj.data(), vj.size()), (size_t) n_vocab, ends, pv, gerr);
+            } else {
+                gerr = "pack has neither tokenizer/vocab.json nor tokenizer/tokenizer.json";
+            }
+            if (!ok) {
                 basalt::log::error("basalt serve", "--grammar on: %s", gerr.c_str());
                 return 2;
             }

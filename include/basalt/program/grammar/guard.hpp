@@ -36,6 +36,10 @@ struct PackVocab {
 bool vocab_from_pack(std::string_view vocab_json, std::string_view types_json, size_t n_vocab,
                      const std::vector<int32_t>& end_ids, PackVocab& out, std::string& err);
 
+/// Same from a Hugging Face tokenizer.json (`model.vocab` + `added_tokens`, for packs without split files).
+bool vocab_from_tokenizer_json(std::string_view tokenizer_json, size_t n_vocab,
+                               const std::vector<int32_t>& end_ids, PackVocab& out, std::string& err);
+
 /// Draws the refused row again with `bias` (n_vocab floats, added to the logits) and returns the token; false on a failure.
 using DrawFn = std::function<bool(const std::vector<float>& bias, int32_t& token)>;
 /// Reads the refused row's logits (n_vocab floats); false on a failure.

@@ -195,6 +195,8 @@ if(BUILD_TESTING)
 endif()
 endif()
 
+include(src/models/gigachat4/gigachat4.cmake)
+
 if(BASALT_MODEL_HY4FLASH)
 add_library(hy4flash_kernels STATIC src/models/hy4flash/kernels/mla.cu src/models/hy4flash/kernels/ops.cu
   src/models/hy4flash/kernels/indexer.cu)
@@ -277,7 +279,7 @@ add_library(inkling2_kernels STATIC src/models/inkling2/kernels/ops.cu src/model
   src/models/inkling2/kernels/prompt_ops.cu src/models/inkling2/kernels/qsa.cu)
 target_include_directories(inkling2_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(inkling2_kernels PUBLIC ${_gpu_runtime_target})
-add_library(model_inkling2 STATIC src/models/inkling2/adapter.cpp src/models/inkling2/pretok_inkling2.cpp
+add_library(model_inkling2 STATIC src/models/inkling2/adapter.cpp
   src/models/inkling2/pack.cpp src/models/inkling2/model.cpp src/models/inkling2/session.cpp src/models/inkling2/walk.cpp
   src/models/inkling2/prompt.cpp src/models/inkling2/vision.cpp src/models/inkling2/vision_encoder.cpp
   src/models/inkling2/dspark.cpp src/models/inkling2/spill.cpp src/models/inkling2/cpu_experts.cpp src/models/inkling2/qsa.cpp)
@@ -300,12 +302,12 @@ if(BUILD_TESTING)
   target_include_directories(inkling2_prompt_parity PRIVATE ${_gpu_include_directories})
   target_link_libraries(inkling2_prompt_parity PRIVATE inkling2_kernels kernels mmq prefill_q8 window_gemm ggml_quants ${_gpu_runtime_target})
   basalt_gpu_test(NAME inkling2_prompt_parity COMMAND inkling2_prompt_parity)
-  add_executable(inkling2_pretok_test src/models/inkling2/pretok_test.cpp src/models/inkling2/pretok_inkling2.cpp)
+  add_executable(inkling2_pretok_test src/models/inkling2/pretok_test.cpp)
   target_include_directories(inkling2_pretok_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
   target_link_libraries(inkling2_pretok_test PRIVATE tokenizer)
   basalt_cpu_test(NAME inkling2_pretok_test COMMAND inkling2_pretok_test)
   # the 337 entries only ignore_merges reaches, against the official tokenizer (skipped without the pack)
-  add_executable(inkling2_tokenizer_test src/models/inkling2/tokenizer_test.cpp src/models/inkling2/pretok_inkling2.cpp)
+  add_executable(inkling2_tokenizer_test src/models/inkling2/tokenizer_test.cpp)
   target_include_directories(inkling2_tokenizer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
   target_link_libraries(inkling2_tokenizer_test PRIVATE tokenizer core)
   basalt_cpu_test(NAME inkling2_tokenizer_test COMMAND inkling2_tokenizer_test
@@ -816,7 +818,8 @@ target_link_libraries(grammar PRIVATE warnings)
 
 # the C++ byte-level BPE tokenizer the engine runs on request text (CPU only)
 add_library(tokenizer STATIC src/program/tokenizer/bpe.cpp
-            src/program/tokenizer/unicode_flags.cpp src/program/tokenizer/pretok_qwen35.cpp)
+            src/program/tokenizer/unicode_flags.cpp src/program/tokenizer/pretok_qwen35.cpp
+            src/program/tokenizer/pretok_o200k.cpp)
 target_include_directories(tokenizer PUBLIC include PRIVATE src/program/tokenizer)
 target_link_libraries(tokenizer PRIVATE warnings)
 if(BUILD_TESTING)
