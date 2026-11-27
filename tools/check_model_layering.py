@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-MODELS = ("qwen4exp", "hy4flash", "hy4")
+MODELS = ("qwen4exp", "hy4flash", "hy4", "gigachat4")
 NAMES = re.compile(r"qwen4exp|hy4flash|Hy4-flash|Flash-Next|Qwen3\.8|\b(248044|248045|248046|248056|248058|248059|248320)\b")
 status = 0
 

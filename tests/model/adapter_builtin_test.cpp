@@ -56,6 +56,11 @@ int main() {
 #else
     expect("inkling2", false);
 #endif
+#ifdef BASALT_MODEL_GIGACHAT4
+    expect("gigachat4", true);
+#else
+    expect("gigachat4", false);
+#endif
     check(model::adapter_names().size() == built, "registering twice keeps one adapter per name");
     if (const model::ModelAdapter* hy = model::find_adapter("hy4")) {
         check(hy->make_model() == nullptr, "hy4 runs its own start");

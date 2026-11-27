@@ -27,3 +27,5 @@ switch. Several entries can share one address ([router](../configuration/models.
 
 The adapter registry in `src/models/builtin.cpp` is the list of architectures the engine can run; a model's own code lives in
 `src/models/<model>` ([adding a model](../adding-a-model.md)).
+
+GigaChat4-37B-A4B has its architecture and kernels in the tree but does not run yet ([status](gigachat4.md)).
