@@ -749,9 +749,10 @@ void head_major_ids(int32_t* ids, int32_t* bounds, int heads, int rows, void* st
 
 void q8_0_heads_gemv(const void* w, const float* x, int x_head_stride, int x_tok_stride, int heads, int rows, int k, int n_tok,
                      float* y, void* stream) {
-    if ((k != 512 && k != 192) || ((uintptr_t) w & 15)) throw std::invalid_argument("q8_0_heads_gemv: rows of 512 or 192, 16-byte aligned");
+    if ((k != 512 && k != 192 && k != 128) || ((uintptr_t) w & 15))
+        throw std::invalid_argument("q8_0_heads_gemv: rows of 512, 192 or 128, 16-byte aligned");
     const int nb = k / 32;
-    const auto kern = nb == 16 ? heads_gemv_kernel<16> : heads_gemv_kernel<6>;   // v_b's rows (the latent), k_b's (the query's nope part)
+    const auto kern = nb == 16 ? heads_gemv_kernel<16> : nb == 6 ? heads_gemv_kernel<6> : heads_gemv_kernel<4>;   // v_b's rows (the latent), k_b's (the query's nope part)
     for (int t0 = 0; t0 < n_tok; t0 += kAttTok) {
         const int T = std::min(kAttTok, n_tok - t0), ltr = gemv_rows_log2(rows, nb, T, kGemvTile), tr = 1 << ltr;
         kern<<<heads * (rows / tr), kGemvThreads, gemv_smem(tr, nb, T), (cudaStream_t) stream>>>(
