@@ -75,7 +75,7 @@ bool QfnRequest::refill_issue(PfPart& p, std::string& e, bool assign) {
     const basalt::core::OnDevice on(p.dev);
     for (const auto& [i, slot] : p.lent) {   // queued, one wait
         const uint8_t* b = runtime_.srcp->blob(i / runtime_.g.n_expert, i % runtime_.g.n_expert);
-        const int64_t nb = (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(i / runtime_.g.n_expert);
+        const int64_t nb = (int64_t) basalt::kernels::cpu::expert_layout().expert_bytes(i / runtime_.g.n_expert, i % runtime_.g.n_expert);
         if (b == nullptr || !(p.cache->fill_slot_queued(slot, b, e, nb)))
             return false;
         if (assign) runtime_.host_res[(size_t) i] = slot;

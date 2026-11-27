@@ -59,7 +59,7 @@ bool QfnRuntime::home_given_up(int64_t live, const char* why, std::string& e) {
     std::vector<uint8_t*> dst;
     if (!src.homes_take(give, e, dst)) return false;
     for (size_t k = 0; k < give.size(); ++k) {
-        const size_t bytes = (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(give[k].first);
+        const size_t bytes = (size_t) basalt::kernels::cpu::expert_layout().expert_bytes(give[k].first, give[k].second);
         if (cudaMemcpyAsync(dst[k], xcache.device_slot(slots[k]), bytes, cudaMemcpyDeviceToHost, 0) != cudaSuccess) {
             e = std::string("copying an expert to RAM failed: ") + cudaGetErrorString(cudaGetLastError());
             (void) cudaDeviceSynchronize();   // queued copies stop writing before their regions are freed
@@ -185,7 +185,8 @@ bool QfnRuntime::vram_command(const std::string& cmd, std::string& e, bool for_s
                 float best = -1.0f;
                 for (int64_t ex = 0; ex < g.n_expert; ++ex) {
                     const size_t j = (size_t) (layer * g.n_expert + ex);
-                    if (host_res[j] >= 0 || (src.complement_ready() && !src.has_resident(layer, ex))) continue;
+                    if (host_res[j] >= 0 || (src.complement_ready() && !src.has_resident(layer, ex)) ||
+                        basalt::kernels::cpu::expert_layout().expert_bytes(layer, ex) > xcache.slot_cap(slot)) continue;
                     const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[j];
                     if (u > best) { best = u; pick = (int64_t) j; }
                 }
@@ -196,7 +197,7 @@ bool QfnRuntime::vram_command(const std::string& cmd, std::string& e, bool for_s
                 e = "VRAM: refilling the cache failed: an expert has no RAM copy";
                 return false;
             }
-            fills.push_back({slot, b, (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer)});
+            fills.push_back({slot, b, (int64_t) basalt::kernels::cpu::expert_layout().expert_bytes(layer, pick % g.n_expert)});
             host_res[(size_t) pick] = slot;
         }
         // after a SLEEP the RAM copy is registered again in address order (WAKE): the copies follow it

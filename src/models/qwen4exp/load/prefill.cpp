@@ -99,7 +99,7 @@ int prefill(Context& context) {
             const Clock::time_point tr = Clock::now();
             for (const auto& [i, slot] : lent) {   // queued, one wait
                 const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
-                const int64_t nb = (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                const int64_t nb = (int64_t) basalt::kernels::cpu::expert_layout().expert_bytes(i / g.n_expert, i % g.n_expert);
                 if (b == nullptr || !(xcache.fill_slot_queued(slot, b, err, nb))) {
                     basalt::log::error("basalt generate", "refilling a lent slot failed: %s", err.c_str());
                     return 1;

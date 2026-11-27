@@ -95,6 +95,7 @@ struct DmRouteArgs {
     /// and per count of the layer's distinct CPU misses the staged ones (kDmCap + 1 entries, device); null: none
     const unsigned long long* stage_src = nullptr;
     const int32_t* stage_k = nullptr;
+    const uint32_t* stage_len = nullptr;   ///< this layer's [n_expert] blob bytes (a mixed layer's differ), or null
 };
 /// Blocks dec_moe_route launches for `n_tok` rows (the arrival counter advances by this much).
 int dec_moe_route_blocks(int n_tok, int n_embd);

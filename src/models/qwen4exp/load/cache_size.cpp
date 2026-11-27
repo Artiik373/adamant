@@ -238,7 +238,7 @@ int cache_size(Context& context) {
         const size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
         std::vector<int64_t> blobs;
         blobs.reserve(profile.size());
-        for (const auto& pr : profile) blobs.push_back((int64_t) lay.blob_bytes(pr.first));
+        for (const auto& pr : profile) blobs.push_back((int64_t) lay.expert_bytes(pr.first, pr.second));
         const int64_t n_sized = basalt::core::blobs_within(blobs, std::min<uint64_t>(budget, (uint64_t) free_room));
         // An exact count is never trimmed to the room: it is honoured, or the start stops. (A count above the
         // profile's size is clamped to it.)

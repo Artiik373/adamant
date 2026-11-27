@@ -174,6 +174,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_stage_kernel(DmRouteArgs a, uin
     __shared__ int32_t s_gidx[kDmCap], s_pos[kDmCap], s_start[kDmCap + 1];
     __shared__ int32_t s_ng, s_ne;
     __shared__ unsigned long long s_src[kDmStageMax];
+    __shared__ long long s_len[kDmStageMax];
     const int tid = threadIdx.x, n = a.n_tok * a.k;
     if (tid < n) s_ids[tid] = __ldcg(a.ids + tid);
     __syncthreads();
@@ -187,7 +188,10 @@ __global__ void __launch_bounds__(kDmThreads) dm_stage_kernel(DmRouteArgs a, uin
     dm_stage_split(a, s_ids, s_kind, n, tid, s_first);
     dm_group(s_ids, s_kind, n, 1, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, s_start, &s_ng, &s_ne);
     const int ng = min(s_ng, kDmStageMax);
-    if (tid < n && s_first[tid] && s_gidx[tid] < kDmStageMax) s_src[s_gidx[tid]] = a.stage_src[s_ids[tid]];
+    if (tid < n && s_first[tid] && s_gidx[tid] < kDmStageMax) {
+        s_src[s_gidx[tid]] = a.stage_src[s_ids[tid]];
+        s_len[s_gidx[tid]] = a.stage_len != nullptr ? (long long) a.stage_len[s_ids[tid]] : blob;   // its own bytes
+    }
     __syncthreads();
     if (blockIdx.x == 0) {
         DmPlan* p = a.plan;
@@ -207,7 +211,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_stage_kernel(DmRouteArgs a, uin
         const unsigned long long src = s_src[g];
         const uint4* s = (const uint4*) (src & ~127ull);
         uint4* d = (uint4*) (staging + (long long) g * stride);
-        const long long chunks = (long long) ((src + (unsigned long long) blob + 127ull) / 128ull - src / 128ull) * 8;
+        const long long chunks = (long long) ((src + (unsigned long long) s_len[g] + 127ull) / 128ull - src / 128ull) * 8;
         long long i = (long long) blockIdx.x * kDmThreads + tid;
         for (; i + (kDmStageUnroll - 1) * step < chunks; i += kDmStageUnroll * step) {
             uint4 v[kDmStageUnroll];

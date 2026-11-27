@@ -141,7 +141,7 @@ int cache_fill(Context& context) {
                 const basalt::core::OnDevice on(0);
                 return xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
                                           srcp->blob(profile[0].first, profile[0].second), e,
-                                          (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(profile[0].first));
+                                          (int64_t) basalt::kernels::cpu::expert_layout().expert_bytes(profile[0].first, profile[0].second));
             });
         basalt::log::info("basalt generate", "pre-filled %lld of %lld slots from the profile (%.0f MB, read in the start's "
                              "pass; slot 0 verified after it)",
@@ -167,7 +167,7 @@ int cache_fill(Context& context) {
             const int64_t b = ((int64_t) lay.blob_bytes(pr.first) + 255) / 256 * 256;
             if (used + b > room) break;
             used += b;
-            sized.push_back((int64_t) lay.blob_bytes(pr.first));
+            sized.push_back((int64_t) lay.expert_bytes(pr.first, pr.second));
         }
         if (sized.empty() ||
             !st.cache.open_sized(sized, g.n_layers, g.n_expert, err)) {
@@ -199,7 +199,7 @@ int cache_fill(Context& context) {
             const basalt::core::OnDevice on(st.dev);
             if (st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
                                      srcp->blob(st.profile[0].first, st.profile[0].second), e,
-                                     (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(st.profile[0].first)))
+                                     (int64_t) basalt::kernels::cpu::expert_layout().expert_bytes(st.profile[0].first, st.profile[0].second)))
                 return true;
             e = "layer split, CUDA" + std::to_string(st.dev) + " expert cache: " + e;
             return false;

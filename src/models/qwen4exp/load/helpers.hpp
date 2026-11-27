@@ -58,8 +58,8 @@ bool resident_stage_swaps(basalt::core::FileExpertSource& src, const std::vector
         const int64_t q = (int64_t) staged.size();
         if (q >= src.exchange_capacity()) continue;
         const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
-        if (slot < 0) continue;
-        if (!copy_back(s.layer, slot, src.exchange_buffer(q))) return false;
+        if (slot < 0 || !src.exchange_fits(s.layer, s.in, s.out)) continue;
+        if (!copy_back(s.layer, s.out, slot, src.exchange_buffer(q))) return false;
         staged.push_back({s.layer, s.in, s.out, q});
         kept.push_back(s);
     }

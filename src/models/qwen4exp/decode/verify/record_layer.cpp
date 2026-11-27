@@ -283,6 +283,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         if (v_.dm_->stage_src != nullptr && (v_.batch_rec_ || v_.dm_->stage_decode)) {   // the layer's CPU misses split between the pool and the staged copy
             ra.stage_src = v_.dm_->stage_src + l * g.n_expert;
             ra.stage_k = v_.dm_->stage_k;
+            ra.stage_len = v_.dm_->stage_len + l * g.n_expert;
         }
         PdlScope pr(false);   // after the router's kernel: a plain launch
         if (glue_on) {   // the ring's work inside post's gate/up launch, released by the read's counts

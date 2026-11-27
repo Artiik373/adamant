@@ -222,9 +222,9 @@ bool Verifier::dm_init(std::string& err) {
         d->stage_decode = exl3_experts;
         // per layer: the pool's experts after its doorbell, the staged ones after the copy, their own launches and
         // the combine's wait for them
-        constexpr double kLinkBytesPerUs = 18e3, kPoolFixUs = 15.0, kStageFixUs = 35.0;
-        // the pool's rate: trellis rows are decoded on the CPU, which is slower than reading the other formats
-        const double kPoolBytesPerUs = exl3_experts ? 22e3 : 45e3;
+        constexpr double kLinkBytesPerUs = 16e3, kPoolFixUs = 15.0, kStageFixUs = 35.0;
+        // the pool's rate: trellis rows decode on CPU slower than i-quant; balance large bursts across PCIe and pool
+        const double kPoolBytesPerUs = lay.fmt[0].exl3_w != 0 ? 22e3 : lay.fmt[0].ms_k != 0 ? 26e3 : 45e3;
         const double cpu_us = (double) blob / kPoolBytesPerUs, link_us = (double) blob / kLinkBytesPerUs;
         std::vector<int32_t> kt((size_t) kDmCap + 1, 0);
         for (int m = 1; m <= kDmCap; ++m) {
@@ -234,12 +234,16 @@ bool Verifier::dm_init(std::string& err) {
                 if (t < best) { best = t; kt[(size_t) m] = k; }
             }
         }
+        std::vector<uint32_t> len((size_t) LE);
+        for (int64_t i = 0; i < LE; ++i) len[(size_t) i] = (uint32_t) lay.expert_bytes(i / g.n_expert, i % g.n_expert);
         int st_least = 0, st_greatest = 0;   // the copy's blocks go first as the FFN read's leave the SMs
         bool sok = cudaMalloc((void**) &d->stage_src, (size_t) LE * 8) == cudaSuccess &&
                    cudaMemset(d->stage_src, 0, (size_t) LE * 8) == cudaSuccess &&
                    cudaMallocHost((void**) &d->stage_host, (size_t) LE * 8) == cudaSuccess &&
                    cudaMalloc((void**) &d->stage_k, kt.size() * 4) == cudaSuccess &&
                    basalt::core::device_copy(d->stage_k, kt.data(), kt.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+                   cudaMalloc((void**) &d->stage_len, len.size() * 4) == cudaSuccess &&
+                   basalt::core::device_copy(d->stage_len, len.data(), len.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
                    cudaDeviceGetStreamPriorityRange(&st_least, &st_greatest) == cudaSuccess &&
                    cudaStreamCreateWithPriority(&d->st_s, cudaStreamNonBlocking, st_greatest) == cudaSuccess &&
                    cudaEventCreateWithFlags(&d->st_fork, cudaEventDisableTiming) == cudaSuccess &&
@@ -297,7 +301,7 @@ void Verifier::dm_free() {
     for (void* p : {(void*) d->res0, (void*) d->res1, (void*) d->plan, (void*) d->ctr, (void*) d->slot_off, d->vscr,
                     (void*) d->vsync, d->xq_pub, (void*) d->wstat,
                     (void*) d->ptab0, (void*) d->pub, (void*) d->cseen, (void*) d->landed,
-                    (void*) d->stage_src, (void*) d->stage_k, (void*) d->route_counts})
+                    (void*) d->stage_src, (void*) d->stage_k, (void*) d->stage_len, (void*) d->route_counts})
         if (p) cudaFree(p);
     if (d->stage_host) cudaFreeHost(d->stage_host);
     if (d->pin) cudaFreeHost(d->pin);

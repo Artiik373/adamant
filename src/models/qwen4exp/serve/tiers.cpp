@@ -51,7 +51,7 @@ bool resident_spare_swaps(basalt::core::FileExpertSource& src, const std::vector
                           std::vector<Swap>& swaps, CopyBack&& copy_back, Wait&& wait,
                           std::vector<std::pair<int32_t, int32_t>>& released) {
     if (!src.complement_ready() || swaps.empty()) return true;
-    struct Home { int32_t layer, out; uint64_t off; };
+    struct Home { int32_t layer, out; uint64_t off, cap; };
     std::vector<Home> homes;
     std::vector<Swap> kept;
     kept.reserve(swaps.size());
@@ -59,16 +59,16 @@ bool resident_spare_swaps(basalt::core::FileExpertSource& src, const std::vector
         if (!src.has_resident(s.layer, s.in) || src.has_resident(s.layer, s.out)) { kept.push_back(s); continue; }
         const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
         if (slot < 0) continue;
-        uint64_t off = 0;
-        uint8_t* dst = src.spare_take(s.layer, off);
+        uint64_t off = 0, cap = 0;
+        uint8_t* dst = src.spare_take(s.layer, s.out, off, cap);
         if (dst == nullptr) continue;
-        if (!copy_back(s.layer, slot, dst)) {
+        if (!copy_back(s.layer, s.out, slot, dst)) {
             basalt::log::error("basalt serve", "adaptive spare copy failed at layer %d slot %d (%s)",
                                (int) s.layer, (int) slot, cudaGetErrorString(cudaPeekAtLastError()));
-            src.spare_return(s.layer, off);
+            src.spare_return(off, cap);
             return false;
         }
-        homes.push_back({s.layer, s.out, off});
+        homes.push_back({s.layer, s.out, off, cap});
         released.emplace_back(s.layer, s.in);
         kept.push_back(s);
     }
@@ -79,7 +79,7 @@ bool resident_spare_swaps(basalt::core::FileExpertSource& src, const std::vector
             return false;
         }
         for (const Home& h : homes)
-            if (!src.spare_land(h.layer, h.out, h.off)) {
+            if (!src.spare_land(h.layer, h.out, h.off, h.cap)) {
                 basalt::log::error("basalt serve", "adaptive spare land failed at layer %d expert %d",
                                    (int) h.layer, (int) h.out);
                 return false;
@@ -195,6 +195,7 @@ void QfnRuntime::rank_swaps(std::vector<Swap>& swaps, bool across) {
         });
         for (size_t i = 0; i < nc; ++i) {
             if (cand[i].u < vict[i].u + 1.5f) break;
+            if (!slot_fits(vict[i].layer, vict[i].e, cand[i].layer, cand[i].e)) continue;
             swaps.push_back({cand[i].u - vict[i].u, cand[i].layer, cand[i].e, vict[i].e, vict[i].layer});
         }
         std::stable_sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
@@ -230,6 +231,7 @@ void QfnRuntime::rank_swaps(std::vector<Swap>& swaps, bool across) {
                           [](auto& a, auto& b) { return a.first < b.first; });
         for (size_t i = 0; i < nc; ++i) {
             if (cand[i].first < vict[i].first + 1.5f) break;
+            if (!slot_fits((int32_t) l, vict[i].second, (int32_t) l, cand[i].second)) continue;
             swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second, (int32_t) l});
         }
     }
@@ -266,8 +268,17 @@ void QfnRuntime::rank_once(std::vector<Swap>& swaps, size_t room) {
     });
     for (size_t i = 0; i < nc; ++i) {
         if (cand[i].u < vict[i].u + once_bar) break;
+        if (!slot_fits(vict[i].layer, vict[i].e, cand[i].layer, cand[i].e)) continue;
         swaps.push_back({cand[i].u - vict[i].u, cand[i].layer, cand[i].e, vict[i].e, vict[i].layer});
     }
+}
+
+bool QfnRuntime::slot_fits(int32_t lout, int32_t out, int32_t layer, int32_t in) const {
+    const int32_t slot = host_res[(size_t) lout * g.n_expert + out];
+    if (slot < 0) return false;
+    const int stn = multi_gpu ? stage_of(lout) : 0;
+    const basalt::core::ExpertCache& c = stn > 0 ? stages[(size_t) stn - 1]->cache : xcache;
+    return basalt::kernels::cpu::expert_layout().expert_bytes(layer, in) <= c.slot_cap(slot);
 }
 
 bool QfnRuntime::adapt() {
@@ -276,13 +287,13 @@ bool QfnRuntime::adapt() {
     rank_swaps(swaps, false);
     if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
     std::vector<int> staged_on;   // the devices whose adapt streams hold copies back (-1: CUDA0)
-    const auto copy_back = [&](int32_t layer, int32_t slot, uint8_t* dst) -> bool {
+    const auto copy_back = [&](int32_t layer, int32_t expert, int32_t slot, uint8_t* dst) -> bool {
         const int stn = multi_gpu ? stage_of(layer) : 0;
         GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
         const basalt::core::OnDevice on(gs ? gs->dev : -1);
         staged_on.push_back(gs ? gs->dev : -1);
         return cudaMemcpyAsync(dst, gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot),
-                               (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer),
+                               (size_t) src.blob_size(layer, expert),
                                cudaMemcpyDeviceToHost, gs ? gs->adapt_stream : adapt_stream) == cudaSuccess;
     };
     const auto wait_copies = [&]() -> bool {
@@ -307,7 +318,7 @@ bool QfnRuntime::adapt() {
         const basalt::core::OnDevice on(gs ? gs->dev : -1);
         if (slot < 0 || b == nullptr ||
             cudaMemcpyAsync(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
-                            (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                            (size_t) basalt::kernels::cpu::expert_layout().expert_bytes(s.layer, s.in),
                             cudaMemcpyHostToDevice, gs ? gs->adapt_stream : adapt_stream) != cudaSuccess) {
             basalt::log::error("basalt serve", "adaptive swap copy failed (layer %d, slot %d): %s",
                          (int) s.layer, (int) slot, cudaGetErrorString(cudaGetLastError()));
@@ -382,7 +393,8 @@ bool QfnRuntime::xq_round(std::vector<Swap>* ranked) {
             int32_t best = -1;
             for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                 const size_t k = (size_t) s.layer * g.n_expert + e;
-                if (host_res[k] < 0 || src.has_resident(s.layer, e) || taken.count(k)) continue;
+                if (host_res[k] < 0 || src.has_resident(s.layer, e) || taken.count(k) ||
+                    !slot_fits(s.layer, e, s.layer, s.in)) continue;
                 if (best < 0 || u[e] < u[best]) best = e;
             }
             if (best < 0 || u[s.in] - promote_margin < u[best] + 1.5f) return true;
@@ -393,11 +405,11 @@ bool QfnRuntime::xq_round(std::vector<Swap>* ranked) {
         if (slot < 0) return true;
         const bool xchg = src.complement_ready() && (p2p || src.has_resident(s.layer, s.in)) &&
                           !src.has_resident(s.lout, s.out);
-        uint64_t off = 0;
+        uint64_t off = 0, cap = 0;
         if (xchg) {
-            uint8_t* dst = src.spare_take(s.lout, off);
+            uint8_t* dst = src.spare_take(s.lout, s.out, off, cap);
             if (dst == nullptr) { ++n_noplace; return true; }   // no free place: a later round
-            if (cudaMemcpyAsync(dst, xcache.device_slot(slot), (size_t) lay.blob_bytes(s.lout),
+            if (cudaMemcpyAsync(dst, xcache.device_slot(slot), (size_t) src.blob_size(s.lout, s.out),
                                 cudaMemcpyDeviceToHost, adapt_stream) != cudaSuccess) {
                 basalt::log::error("basalt serve", "an eviction copy failed (layer %d, slot %d): %s",
                              (int) s.lout, (int) slot, cudaGetErrorString(cudaGetLastError()));
@@ -405,7 +417,7 @@ bool QfnRuntime::xq_round(std::vector<Swap>* ranked) {
             }
         }
         if (p2p) peer.hold(s.layer, s.in);
-        xq.push_back({s.layer, s.in, s.out, s.lout, slot, off, xchg,
+        xq.push_back({s.layer, s.in, s.out, s.lout, slot, off, cap, xchg,
                       peer.valid() && peer.has(s.layer, s.in), p2p});
         return true;
     };
@@ -453,7 +465,7 @@ bool QfnRuntime::xq_advance(bool wait) {
     if (!nowait && !sync_event(adapt_ev, "adaptive advance sync")) return false;
     if (xq_stage == 1) {
         for (const XSwap& x : xq) {
-            if (x.xchg && !src.spare_land(x.lout, x.out, x.off)) {
+            if (x.xchg && !src.spare_land(x.lout, x.out, x.off, x.cap)) {
                 basalt::log::error("basalt serve", "an evicted expert has no RAM place (layer %d, expert %d)",
                              (int) x.lout, (int) x.out);
                 return false;
@@ -508,7 +520,7 @@ bool QfnRuntime::xq_advance(bool wait) {
                 for (size_t k = 0; k < ord.size(); ++k) {
                     const XSwap& x = xq[ord[k]];
                     const uint8_t* b = srcp->blob(x.layer, x.in);
-                    if (b == nullptr || cudaMemcpyAsync(xcache.device_slot(x.slot), b, (size_t) lay2.blob_bytes(x.layer),
+                    if (b == nullptr || cudaMemcpyAsync(xcache.device_slot(x.slot), b, (size_t) lay2.expert_bytes(x.layer, x.in),
                                                         cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess)
                         basalt::log::warn("basalt serve", "adaptive swap copy failed (layer %d, slot %d): %s",
                                      (int) x.layer, (int) x.slot, cudaGetErrorString(cudaGetLastError()));

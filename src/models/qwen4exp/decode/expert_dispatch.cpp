@@ -348,7 +348,7 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
                 // count of distinct experts moved rather than of looks.
                 const uint8_t* b = d.src->blob(d.layers, e);
                 std::string ferr;
-                if (b == nullptr || !d.cache->fill_slot(cand, b, cs, ferr, (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(d.layers))) {
+                if (b == nullptr || !d.cache->fill_slot(cand, b, cs, ferr, (int64_t) basalt::kernels::cpu::expert_layout().expert_bytes(d.layers, e))) {
                     d.failed = true;
                     d.fail = "the expert cache could not fill a slot";
                     d.fail_layer = d.layers;

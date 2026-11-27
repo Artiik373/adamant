@@ -89,6 +89,7 @@ struct DecMoe {
     unsigned long long* stage_host = nullptr;
     uint64_t stage_gen = 0;
     int32_t* stage_k = nullptr;
+    uint32_t* stage_len = nullptr;   // every expert's blob bytes
     cudaStream_t st_s = nullptr;
     cudaEvent_t st_fork = nullptr, st_join = nullptr;
     int64_t stage_stride = 0;

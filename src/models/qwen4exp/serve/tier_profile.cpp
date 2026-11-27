@@ -140,7 +140,7 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
             const uint64_t* off = c.slot_offsets();
             if (off == nullptr) return true;
             const uint64_t end = sl + 1 < (size_t) c.full_slots() ? off[sl + 1] : (uint64_t) c.full_bytes();
-            return lay.blob_bytes(i / n_expert) <= end - off[sl];
+            return lay.expert_bytes(i / n_expert, i % n_expert) <= end - off[sl];
         };
     };
     const auto pair_up = [](const std::vector<std::pair<int32_t, int32_t>>& want, const std::vector<int32_t>& res,
@@ -166,7 +166,7 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
         }
     };
     pair_up(want_main, host_res, holder, todo, fits_in(xcache));
-    struct Mv { int32_t slot, in, out; uint64_t off; bool xchg; };
+    struct Mv { int32_t slot, in, out; uint64_t off, cap; bool xchg; };
     std::vector<Mv> mv;
     int64_t moved = 0, kept = 0;
     for (int pass = 0; pass < 2 && !todo.empty(); ++pass) {   // an expert still resident somewhere waits a pass
@@ -181,20 +181,20 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
                 const int64_t li = in / g.n_expert, ei = in % g.n_expert;
                 const bool xchg = out >= 0 && src.complement_ready() && src.has_resident(li, ei) &&
                                   !src.has_resident(out / g.n_expert, out % g.n_expert);
-                uint64_t off = 0;
+                uint64_t off = 0, cap = 0;
                 if (xchg) {
-                    uint8_t* dst = src.spare_take(out / g.n_expert, off);
+                    uint8_t* dst = src.spare_take(out / g.n_expert, out % g.n_expert, off, cap);
                     if (dst == nullptr) {
                         if (mv.empty()) { e = "PROBE adapt: no free RAM place for an evicted expert"; return false; }
                         break;
                     }
-                    if (cudaMemcpyAsync(dst, xcache.device_slot(slot), (size_t) lay.blob_bytes(out / g.n_expert),
+                    if (cudaMemcpyAsync(dst, xcache.device_slot(slot), (size_t) src.blob_size(out / g.n_expert, out % g.n_expert),
                                         cudaMemcpyDeviceToHost, adapt_stream) != cudaSuccess) {
                         e = std::string("PROBE adapt: an eviction copy failed: ") + cudaGetErrorString(cudaGetLastError());
                         return false;
                     }
                 }
-                mv.push_back({slot, in, out, off, xchg});
+                mv.push_back({slot, in, out, off, cap, xchg});
             }
             if (mv.empty()) break;
             if (cudaStreamSynchronize(adapt_stream) != cudaSuccess) {
@@ -204,7 +204,7 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
             for (const Mv& m : mv) {
                 if (m.out < 0) continue;
                 const int64_t lo = m.out / g.n_expert, eo = m.out % g.n_expert;
-                if (m.xchg && !src.spare_land(lo, eo, m.off)) {
+                if (m.xchg && !src.spare_land(lo, eo, m.off, m.cap)) {
                     e = "PROBE adapt: an evicted expert has no RAM place";
                     return false;
                 }
@@ -215,7 +215,7 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
             for (const Mv& m : mv) {
                 const int64_t li = m.in / g.n_expert;
                 const uint8_t* b = srcp->blob(li, m.in % g.n_expert);
-                if (b == nullptr || cudaMemcpyAsync(xcache.device_slot(m.slot), b, (size_t) lay.blob_bytes(li),
+                if (b == nullptr || cudaMemcpyAsync(xcache.device_slot(m.slot), b, (size_t) lay.expert_bytes(li, m.in % g.n_expert),
                                                     cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) {
                     e = "PROBE adapt: an expert's copy into its slot failed";
                     return false;

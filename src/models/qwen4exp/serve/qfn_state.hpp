@@ -350,7 +350,7 @@ private:
     std::vector<int32_t> prof_rank{};
     bool adapt_fast{};
     float fast_decay{};
-    struct XSwap { int32_t layer, in, out, lout, slot; uint64_t off; bool xchg, promo, p2p; };
+    struct XSwap { int32_t layer, in, out, lout, slot; uint64_t off, cap; bool xchg, promo, p2p; };
     bool peer_excl{};
     bool xq_across{};
     std::vector<XSwap> xq{};
@@ -459,6 +459,7 @@ private:
     bool adapt_peers(const std::vector<int32_t>& r0, std::string& perr);
     void apply_pending(bool wait, bool exchanges = true);
     void rank_swaps(std::vector<Swap>& swaps, bool across);
+    bool slot_fits(int32_t lout, int32_t out, int32_t layer, int32_t in) const;   ///< `in` fits `out`'s slot
     void rank_once(std::vector<Swap>& swaps, size_t room);
     bool adapt();
     void xq_settle();

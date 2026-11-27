@@ -102,6 +102,8 @@ bool QfnRuntime::move_routed_below(int64_t first, const char* why, std::string& 
                                                   out_of.empty() ? nullptr : out_of.data() + (size_t) (l * g.n_expert),
                                                   (int32_t) g.n_expert, first, trades);
         for (const serve_loans::RoutedTrade& t : trades) {
+            const uint64_t nb = lay.expert_bytes(l, t.hot);
+            if (nb > xcache.slot_cap(t.to)) continue;   // stays in the tail, which sends it to RAM
             const void* from = xcache.device_slot(t.from);
             cudaMemcpyKind kind = cudaMemcpyDeviceToDevice;
             if (t.from_ram) {
@@ -110,7 +112,7 @@ bool QfnRuntime::move_routed_below(int64_t first, const char* why, std::string& 
                 kind = cudaMemcpyHostToDevice;
                 ++from_ram;
             }
-            if (cudaMemcpyAsync(xcache.device_slot(t.to), from, (size_t) lay.blob_bytes(l), kind, adapt_stream) !=
+            if (cudaMemcpyAsync(xcache.device_slot(t.to), from, (size_t) nb, kind, adapt_stream) !=
                 cudaSuccess)
                 return give_up(std::string("moving an expert out of the cache's tail: ") +
                                cudaGetErrorString(cudaGetLastError()));
@@ -172,7 +174,7 @@ bool QfnRuntime::cache_regrow(std::string& e) {
             float best = -1.0f;
             for (int64_t ex = 0; ex < g.n_expert; ++ex) {
                 const int64_t j = layer * g.n_expert + ex;
-                if (!usable(j)) continue;
+                if (!usable(j) || basalt::kernels::cpu::expert_layout().expert_bytes(layer, ex) > xcache.slot_cap(slot)) continue;
                 const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[(size_t) j];
                 if (u > best) { best = u; pick = j; }
             }
@@ -180,7 +182,7 @@ bool QfnRuntime::cache_regrow(std::string& e) {
         if (pick < 0) continue;
         const uint8_t* b = srcp->blob(layer, pick % g.n_expert);
         if (b == nullptr || !xcache.fill_slot_queued(slot, b, ferr,
-                (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer))) {
+                (int64_t) basalt::kernels::cpu::expert_layout().expert_bytes(layer, pick % g.n_expert))) {
             e = "elastic KV: refilling the cache failed: " + ferr;
             return false;
         }

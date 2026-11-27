@@ -228,7 +228,7 @@ void QfnRuntime::enc_command(const std::string& cmd) {
     // the slots get their experts back from RAM, in the same slots, then the table goes up again
     for (const auto& [i, slot] : p.lent) {
         const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
-        const int64_t nb = (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+        const int64_t nb = (int64_t) basalt::kernels::cpu::expert_layout().expert_bytes(i / g.n_expert, i % g.n_expert);
         if (b == nullptr || !p.cache->fill_slot_queued(slot, b, e, nb)) {
             basalt::log::error("basalt serve", "image encoder: refilling the expert cache failed: %s", e.c_str());
             reply_err("refilling the expert cache failed: " + e, true);

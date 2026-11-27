@@ -146,16 +146,18 @@ int decode(Context& context) {
                 const size_t nc = std::min(cand.size(), vict.size());
                 std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                                   [](auto& a, auto& b) { return a.first < b.first; });
+                const auto& lay = basalt::kernels::cpu::expert_layout();
                 for (size_t i = 0; i < nc; ++i) {
                     if (cand[i].first < vict[i].first + 1.5f) break;
+                    if (lay.expert_bytes(l, cand[i].second) > xcache.slot_cap(r[vict[i].second])) continue;
                     swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
                 }
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
-            const auto copy_back = [&](int32_t layer, int32_t slot, uint8_t* dst) -> bool {
+            const auto copy_back = [&](int32_t layer, int32_t expert, int32_t slot, uint8_t* dst) -> bool {
                 return cudaMemcpyAsync(dst, xcache.device_slot(slot),
-                                       (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer),
+                                       (size_t) basalt::kernels::cpu::expert_layout().expert_bytes(layer, expert),
                                        cudaMemcpyDeviceToHost, adapt_stream) == cudaSuccess;
             };
             if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, copy_back,
@@ -169,7 +171,7 @@ int decode(Context& context) {
                 const uint8_t* b = srcp->blob(s.layer, s.in);
                 // asynchronous: the copies run while the MTP drafts; the next window waits for them
                 if (slot < 0 || b == nullptr ||
-                    cudaMemcpyAsync(xcache.device_slot(slot), b, (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                    cudaMemcpyAsync(xcache.device_slot(slot), b, (size_t) basalt::kernels::cpu::expert_layout().expert_bytes(s.layer, s.in),
                                     cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) {
                     basalt::log::error("basalt generate", "an adaptive refill failed");
                     return false;
