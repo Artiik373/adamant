@@ -168,6 +168,11 @@ void test_complement_plan() {
     require(!make_cache_complement_plan(2, 3, {3, 5}, {{2, 0}}, {}, offsets, bytes, error),
             "out-of-range pair accepted");
     require(!make_cache_complement_plan(2, 3, {0, 5}, {}, {}, offsets, bytes, error), "zero-size layer accepted");
+    // a mixed layer (slot 5) packs its blobs at their own sizes 2, 5, 3
+    const std::vector<std::vector<uint64_t>> eoff{{}, {0, 2, 7, 10}};
+    require(make_cache_complement_plan(2, 3, {3, 5}, {{0, 1}, {1, 1}}, {}, offsets, bytes, error, &eoff), error);
+    require(bytes == 11 && offsets == std::vector<uint64_t>{0, kNoCacheComplement, 3, 6, kNoCacheComplement, 8},
+            "mixed layer not packed at its blobs' own sizes");
 }
 
 void test_resident_lend_region() {
@@ -560,6 +565,42 @@ void test_host_memory_namespaced() {
 
 }  // namespace
 
+// A mixed MS layer (layout v9, per-projection K): blobs at their own offsets, slot-sized reads ending in the pad slot.
+void test_mixed_layout() {
+    using namespace basalt::core;
+    using namespace basalt::kernels::cpu;
+    constexpr int64_t layers = 1, experts = 3;
+    TempDirectory dir;
+    std::string err;
+    const std::string text = "# experts v9: layer gu_type d_type offset blob_bytes up_type (n_expert 3, total 0)\n";
+    // the slot is the head plus gate, up, down at the widest K: ask the loader for it, then write the real line
+    NativeFmt wide;
+    require(native_fmt(125, 125, 2560, 640, wide, err, 0.0f, 125), "MS_C5 format is unavailable: " + err);
+    const uint64_t slot = (uint64_t) wide.bytes + 16;
+    const std::string line = "0 135 135 0 " + std::to_string(slot) + " 135 335225555\n";
+    require(expert_layout_load_text(text + line, layers, experts, err, 2560, 640), "mixed layout: " + err);
+    const ExpertLayout& lay = expert_layout();
+    require(lay.eoff[0].size() == 4 && lay.eoff[0][1] < slot && lay.eoff[0][3] - lay.eoff[0][2] == slot,
+            "mixed layout offsets are wrong");
+    const uint64_t total = lay.total;
+    create_experts(dir.path, total + slot, {{lay.eoff[0][0], 'a'}, {lay.eoff[0][1], 'b'}, {lay.eoff[0][2], 'c'}});
+    FileExpertSource source;
+    require(source.open(FileRange((dir.path / "experts.bin").string()), layers, experts, err), "mixed open: " + err);
+    for (int64_t e = 0; e < experts; ++e) {
+        const uint8_t* b = source.blob(0, e);
+        int fd = -1;
+        uint64_t off = 0;
+        require(b && b[0] == "abc"[e], "mixed blob " + std::to_string(e) + " is at the wrong offset");
+        require(source.file_extent(0, e, fd, off) && off == lay.eoff[0][(size_t) e], "mixed file extent is wrong");
+    }
+    std::vector<uint8_t> copy((size_t) slot);
+    require(source.copy_blob(0, experts - 1, copy.data()) && copy[0] == 'c', "the last mixed blob's slot read failed");
+    source.close();
+    fs::resize_file(dir.path / "experts.bin", total);   // no pad slot
+    require(!source.open(FileRange((dir.path / "experts.bin").string()), layers, experts, err),
+            "a mixed section without its pad slot was accepted");
+}
+
 int main() {
     try {
         test_home_regions();
@@ -574,6 +615,7 @@ int main() {
         test_host_memory();
         test_host_memory_namespaced();
         test_native_variable_layout();
+        test_mixed_layout();
             std::cout << "file_expert_source_test: PASS\n";
         return 0;
     } catch (const std::exception& error) {

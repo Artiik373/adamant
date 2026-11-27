@@ -44,7 +44,8 @@ bool make_cache_complement_plan(
     int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
     const std::vector<std::pair<int32_t, int32_t>>& primary_gpu_pairs,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs,
-    std::vector<uint64_t>& offsets, uint64_t& bytes, std::string& err) {
+    std::vector<uint64_t>& offsets, uint64_t& bytes, std::string& err,
+    const std::vector<std::vector<uint64_t>>* eoff) {
     offsets.clear();
     bytes = 0;
     err.clear();
@@ -89,10 +90,13 @@ bool make_cache_complement_plan(
 
     offsets.assign(count, kNoCacheComplement);
     for (int64_t layer = 0; layer < n_layers; ++layer) {
-        const uint64_t blob_bytes = layer_blob_bytes[(size_t) layer];
+        const std::vector<uint64_t>* e =
+            eoff != nullptr && (size_t) layer < eoff->size() && !(*eoff)[(size_t) layer].empty() ? &(*eoff)[(size_t) layer] : nullptr;
         for (int64_t expert = 0; expert < n_expert; ++expert) {
             const size_t index = (size_t) layer * (size_t) n_expert + (size_t) expert;
             if (omitted[index] != 0) continue;
+            const uint64_t blob_bytes = e != nullptr ? (*e)[(size_t) expert + 1] - (*e)[(size_t) expert]
+                                                     : layer_blob_bytes[(size_t) layer];
             if (bytes > std::numeric_limits<uint64_t>::max() - blob_bytes) {
                 offsets.clear();
                 bytes = 0;
@@ -225,12 +229,8 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
             err = "FileExpertSource: the native expert layout is invalid at layer " + std::to_string(layer);
             return false;
         }
-        if (!layout.eoff[i].empty()) {   // shortcut: the file source maps fixed-size blobs; mixed layers need the arena
-            err = "FileExpertSource: layer " + std::to_string(layer) + " has per-expert MS widths; they need the "
-                  "RAM arena (run without --mmap-experts)";
-            return false;
-        }
-        const uint64_t layer_bytes = bytes * (uint64_t) n_expert;
+        // a mixed layer's blobs sit at their own offsets; every read stays slot-sized (the file's pad slot)
+        const uint64_t layer_bytes = layout.layer_bytes(layer);
         if (at > want || layer_bytes > want - at) {
             err = "FileExpertSource: the native expert layout exceeds its declared size at layer " +
                   std::to_string(layer);
@@ -247,9 +247,11 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
     const std::string& path = experts.path;
     uint64_t fsize = 0;
     if (!platform::file_size(path, fsize)) { err = "FileExpertSource: cannot open " + path; return false; }
-    // a whole file is exactly the experts; a section must be, and lie inside the file
+    // a whole file is exactly the experts (plus one pad slot when a layer is mixed); a section must be, and lie
+    // inside the file
     const uint64_t have = experts.bytes != 0 ? experts.bytes : fsize;
-    if (have != want || experts.offset > fsize || have > fsize - experts.offset) {
+    const bool mixed = std::any_of(layout.eoff.begin(), layout.eoff.end(), [](const auto& e) { return !e.empty(); });
+    if ((mixed ? have != want + layout.max_blob : have != want) || experts.offset > fsize || have > fsize - experts.offset) {
         char buf[400];
         std::snprintf(buf, sizeof buf,
                       "FileExpertSource: %s is %llu B but the loaded expert layout requires %llu B - this is not "
@@ -261,7 +263,7 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
     }
     platform::MapOptions mo;
     mo.offset = experts.offset;
-    mo.bytes = want;
+    mo.bytes = have;
     mo.shared = true;
     std::string map_err;
     auto view_map = platform::MappedFile::open_ro(path, &map_err, mo);
@@ -277,7 +279,8 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
     blobs_ = (int64_t) blob_count;
     n_layers_ = n_layers;
     n_expert_ = n_expert;
-    mapped_bytes_ = want;
+    mapped_bytes_ = have;
+    layer_eoff_ = layout.eoff;
     layer_offsets_ = std::move(layer_offsets);
     layer_blob_bytes_ = std::move(layer_blob_bytes);
     return true;
@@ -365,6 +368,8 @@ void FileExpertSource::close() {
     mapped_bytes_ = 0;
     file_off_ = 0;
     layer_offsets_.clear();
+    layer_eoff_.clear();
+    place_cap_.clear();
     layer_blob_bytes_.clear();
     reads_ = 0;
 }
@@ -373,7 +378,7 @@ void FileExpertSource::close() {
 bool ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     const uint8_t* b = blob(layer, expert);
     if (b == nullptr || dst == nullptr) return false;
-    std::memcpy(dst, b, (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer));
+    std::memcpy(dst, b, (size_t) basalt::kernels::cpu::expert_layout().expert_bytes(layer, expert));
     return true;
 }
 
@@ -381,7 +386,7 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
     if (dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
     const uint8_t* b = mapped_blob(layer, expert);
     if (b == nullptr) return false;
-    std::memcpy(dst, b, (size_t) layer_blob_bytes_[(size_t) layer]);
+    std::memcpy(dst, b, (size_t) blob_size(layer, expert));
     return true;
 }
 
@@ -396,7 +401,12 @@ bool plan_cache_slots(LoadPlan& plan, ExpertSource& src, ExpertCache& cache, int
             return false;
         }
         LoadItem it;
-        it.bytes = lay.blob_bytes(layer);
+        it.bytes = lay.expert_bytes(layer, expert);
+        if (it.bytes > cache.slot_cap(slots[i])) {
+            err = "ExpertCache::fill_slot: expert " + std::to_string(expert) + " of layer " + std::to_string(layer) +
+                  " does not fit slot " + std::to_string(slots[i]);
+            return false;
+        }
         it.dev = dst;
         it.device = device;
         int fd = -1;
@@ -477,12 +487,20 @@ const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) cons
     if (i >= layer_offsets_.size() || i >= layer_blob_bytes_.size()) return nullptr;
     const uint64_t blob_bytes = layer_blob_bytes_[i];
     if (blob_bytes == 0 || (uint64_t) expert > std::numeric_limits<uint64_t>::max() / blob_bytes) return nullptr;
-    const uint64_t expert_offset = (uint64_t) expert * blob_bytes;
-    const uint64_t layer_offset = layer_offsets_[i];
-    if (layer_offset > mapped_bytes_ || expert_offset > mapped_bytes_ - layer_offset) return nullptr;
-    const uint64_t offset = layer_offset + expert_offset;
-    if (blob_bytes > mapped_bytes_ - offset) return nullptr;
+    const uint64_t offset = expert_offset(layer, expert);
+    if (offset > mapped_bytes_ || blob_bytes > mapped_bytes_ - offset) return nullptr;
     return base_ + (size_t) offset;
+}
+
+uint64_t FileExpertSource::blob_size(int64_t layer, int64_t expert) const {
+    const auto& e = layer_eoff_[(size_t) layer];
+    return e.empty() ? layer_blob_bytes_[(size_t) layer] : e[(size_t) expert + 1] - e[(size_t) expert];
+}
+
+uint64_t FileExpertSource::expert_offset(int64_t layer, int64_t expert) const {
+    const auto& e = layer_eoff_[(size_t) layer];
+    return layer_offsets_[(size_t) layer] +
+           (e.empty() ? (uint64_t) expert * layer_blob_bytes_[(size_t) layer] : e[(size_t) expert]);
 }
 
 bool FileExpertSource::pin_cache_complement(
@@ -536,15 +554,15 @@ bool FileExpertSource::plan_cache_complement(
             if (slot == kNotResident) continue;
             primary_gpu_pairs.emplace_back((int32_t) layer, (int32_t) expert);
             on_gpu[(size_t) layer * (size_t) n_expert_ + (size_t) expert] = 1;
-            gpu_bytes += layer_blob_bytes_[(size_t) layer];
+            gpu_bytes += blob_size(layer, expert);
             pair_slot.push_back(slot);
-            if (slot >= 0 && slot < n_slots) slot_bytes[(size_t) slot] = layer_blob_bytes_[(size_t) layer];
+            if (slot >= 0 && slot < n_slots) slot_bytes[(size_t) slot] = blob_size(layer, expert);
         }
     }
     std::vector<uint64_t> offsets;
     uint64_t bytes = 0;
     if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, primary_gpu_pairs,
-                                            additional_gpu_pairs, offsets, bytes, err)) return false;
+                                            additional_gpu_pairs, offsets, bytes, err, &layer_eoff_)) return false;
     const bool what_fits = budget_bytes == kResidentWhatFits;   // the soft mode's second try
     uint64_t budget_physical = 0;   // the RAM reading a budget was sized from (0: no budget)
     if (budget_bytes > 0) {
@@ -576,15 +594,35 @@ bool FileExpertSource::plan_cache_complement(
     std::vector<std::pair<uint64_t, int64_t>> spare_sizes;   // (blob bytes, places)
     uint64_t spare_bytes = 0;
     if (spares_want_ > 0 && n_layers_ > 0) {
-        for (const uint64_t b : layer_blob_bytes_) {
+        bool has_var = false;
+        uint64_t max_b = 0;
+        for (size_t l = 0; l < layer_blob_bytes_.size(); ++l) {
+            const uint64_t b = layer_blob_bytes_[l];
             if (b == 0) continue;
+            max_b = std::max(max_b, b);
+            if (l < layer_eoff_.size() && !layer_eoff_[l].empty()) has_var = true;
             auto it = std::find_if(spare_sizes.begin(), spare_sizes.end(), [&](const auto& x) { return x.first == b; });
             if (it == spare_sizes.end()) spare_sizes.emplace_back(b, 1);
             else ++it->second;
         }
-        for (auto& [b, n] : spare_sizes) {
-            n = std::max<int64_t>(8, (spares_want_ * n + n_layers_ - 1) / n_layers_);
-            spare_bytes += (uint64_t) n * b;
+        if (has_var && max_b > 0) {
+            int64_t want = spares_want_;
+            uint64_t phys = budget_physical;
+            if (phys > 0 || available_memory_bytes(phys)) {
+                const uint64_t ar = ram_tier_room(phys, headroom_bytes, pin);
+                const uint64_t cap_b = budget_bytes > 0 ? std::min(budget_bytes, ar) : ar;
+                if (cap_b > bytes + (3ull << 30)) {
+                    const int64_t extra = (int64_t) ((cap_b - bytes - (3ull << 30)) / max_b);
+                    want = std::min<int64_t>(std::max<int64_t>(spares_want_, extra), 2048);
+                }
+            }
+            spare_sizes = {{max_b, want}};
+            spare_bytes = (uint64_t) want * max_b;
+        } else {
+            for (auto& [b, n] : spare_sizes) {
+                n = std::max<int64_t>(8, (spares_want_ * n + n_layers_ - 1) / n_layers_);
+                spare_bytes += (uint64_t) n * b;
+            }
         }
     }
 
@@ -616,7 +654,7 @@ bool FileExpertSource::plan_cache_complement(
                 if (pr.first < 0 || pr.second < 0 || pr.first >= n_layers_ || pr.second >= n_expert_) continue;
                 const size_t i = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
                 if (offsets[i] == kNoComplement || ranked[i] != kNoComplement) continue;   // on a GPU, or twice
-                const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
+                const uint64_t b = blob_size(pr.first, pr.second);
                 if (b > pack_bytes - at) continue;
                 ranked[i] = at;
                 at += b;
@@ -671,12 +709,30 @@ bool FileExpertSource::plan_cache_complement(
             for (size_t i = 0; i < primary_gpu_pairs.size(); ++i)
                 if (pair_slot[i] < keep_from) core.push_back(primary_gpu_pairs[i]);
             if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, core,
-                                                    additional_gpu_pairs, offsets, bytes, err)) return false;
+                                                    additional_gpu_pairs, offsets, bytes, err, &layer_eoff_)) return false;
         }
     }
 
+    // a mixed layer's blobs are packed tight but read slot-sized: one slot of slack past the last
+    if (bytes > 0)
+        for (size_t l = 0; l < layer_eoff_.size(); ++l)
+            if (!layer_eoff_[l].empty()) { bytes += *std::max_element(layer_blob_bytes_.begin(), layer_blob_bytes_.end()); break; }
     const uint64_t spare_at = bytes;
-    if (bytes == 0 || bytes + spare_bytes > budget) {   // no room: an evicted expert has nowhere to go
+    if (bytes > 0 && bytes < budget && bytes + spare_bytes > budget) {   // fewer places, as many as the room holds
+        const uint64_t room = budget - bytes;
+        uint64_t kept = 0;
+        for (auto& [b, n] : spare_sizes) {
+            n = (int64_t) ((uint64_t) n * room / spare_bytes);
+            kept += (uint64_t) n * b;
+        }
+        spare_sizes.erase(std::remove_if(spare_sizes.begin(), spare_sizes.end(), [](const auto& x) { return x.second <= 0; }),
+                          spare_sizes.end());
+        if (!spare_sizes.empty())
+            basalt::log::info("basalt", "FileExpertSource: %.2f of the %.2f GiB of places for the adaptive swaps fit the RAM budget",
+                              (double) kept / 1073741824.0, (double) spare_bytes / 1073741824.0);
+        spare_bytes = kept;
+    }
+    if (bytes == 0 || spare_sizes.empty() || bytes + spare_bytes > budget) {   // no room: an evicted expert has nowhere to go
         if (spares_want_ > 0 && bytes > 0)
             basalt::log::warn("basalt", "FileExpertSource: the adaptive swaps have no free place: the %.2f GiB of experts "
                                         "leave no room in the RAM budget for the %.2f GiB of places",
@@ -733,7 +789,7 @@ bool FileExpertSource::plan_cache_complement(
         for (int64_t expert = 0; expert < n_expert_; ++expert) {
             const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
             if (offsets[index] == kNoComplement) continue;
-            const uint64_t blob_bytes = layer_blob_bytes_[(size_t) layer];
+            const uint64_t blob_bytes = blob_size(layer, expert);
             if (offsets[index] > bytes || blob_bytes > bytes - offsets[index] || mapped_blob(layer, expert) == nullptr) {
                 err = "FileExpertSource: invalid blob bounds while building the cache complement";
                 release();
@@ -761,8 +817,8 @@ bool FileExpertSource::plan_cache_complement(
             if (offsets[index] == kNoComplement) continue;
             LoadItem it;
             it.file = load_file;
-            it.off = file_off_ + layer_offsets_[(size_t) layer] + (uint64_t) expert * layer_blob_bytes_[(size_t) layer];
-            it.bytes = layer_blob_bytes_[(size_t) layer];
+            it.off = file_off_ + expert_offset(layer, expert);
+            it.bytes = blob_size(layer, expert);
             it.host = (uint8_t*) host + offsets[index];
             it.count = on_gpu[index] ? 0 : it.bytes;
             read_bytes += it.bytes;
@@ -780,6 +836,13 @@ bool FileExpertSource::plan_cache_complement(
     complement_slice_dev_.clear();
     complement_bytes_ = bytes;
     complement_offsets_ = std::move(offsets);
+    place_cap_.assign((size_t) blobs_, 0);
+    for (int64_t layer = 0; layer < n_layers_; ++layer)
+        if (!layer_eoff_[(size_t) layer].empty())
+            for (int64_t expert = 0; expert < n_expert_; ++expert) {
+                const size_t i = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+                if (complement_offsets_[i] != kNoComplement) place_cap_[i] = blob_size(layer, expert);
+            }
     ++places_gen_;
     complement_pinned_ = false;
     complement_pin_limit_ = 0;
@@ -1016,7 +1079,8 @@ bool FileExpertSource::home_release(int64_t layer, int64_t expert) {
     const size_t i = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     if (i >= complement_offsets_.size() || complement_offsets_[i] == kNoComplement || complement_offsets_[i] < homes_start())
         return false;
-    spare_free_.emplace_back(complement_offsets_[i], layer_blob_bytes_[(size_t) layer]);
+    spare_free_.emplace_back(complement_offsets_[i], place_cap(i));
+    if (i < place_cap_.size()) place_cap_[i] = 0;
     complement_offsets_[i] = kNoComplement;
     ++places_gen_;
     return true;
@@ -1163,7 +1227,7 @@ uint64_t FileExpertSource::ram_take_back(uint64_t budget) {
         if (complement_offsets_[i] == kNoComplement && copy_from_files(layer, expert, base + off))
             complement_offsets_[i] = off;
         else
-            spare_free_.emplace_back(off, layer_blob_bytes_[(size_t) layer]);   // the place stays usable for swaps
+            spare_free_.emplace_back(off, place_cap(i));   // the place stays usable for swaps
     }
     spare_free_.insert(spare_free_.end(), piece.spares.begin(), piece.spares.end());
     piece.experts.clear();
@@ -1236,8 +1300,7 @@ uint64_t FileExpertSource::top_up(const std::vector<std::pair<int32_t, int32_t>>
     for (size_t k = 0; k < pick.size(); ++k) {
         LoadItem it;
         it.file = top_file;
-        it.off = file_off_ + layer_offsets_[(size_t) pick[k].first] +
-                 (uint64_t) pick[k].second * layer_blob_bytes_[(size_t) pick[k].first];
+        it.off = file_off_ + expert_offset(pick[k].first, pick[k].second);
         it.bytes = layer_blob_bytes_[(size_t) pick[k].first];
         it.host = (uint8_t*) arena + (size_t) at[k];
         it.count = 0;
@@ -1310,28 +1373,63 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     return true;
 }
 
-uint8_t* FileExpertSource::spare_take(int64_t layer, uint64_t& off) {
-    if (!complement_ready_ || layer < 0 || layer >= n_layers_) return nullptr;
-    const uint64_t need = layer_blob_bytes_[(size_t) layer];
+uint8_t* FileExpertSource::spare_take(int64_t layer, int64_t expert, uint64_t& off, uint64_t& cap) {
+    if (!complement_ready_ || layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return nullptr;
+    const uint64_t need = blob_size(layer, expert);
+    // the smallest place that holds it, one outside the homes first: those regions can then be freed
     size_t pick = spare_free_.size();
-    for (size_t i = spare_free_.size(); i-- > 0;)   // a place outside the homes first: those regions can then be freed
-        if (spare_free_[i].second == need && (pick == spare_free_.size() || spare_free_[i].first < homes_start())) {
-            pick = i;
-            if (spare_free_[i].first < homes_start()) break;
+    auto better = [&](size_t i) {
+        if (pick == spare_free_.size()) return true;
+        const bool hi = spare_free_[i].first < homes_start(), hp = spare_free_[pick].first < homes_start();
+        return hi != hp ? hi : spare_free_[i].second < spare_free_[pick].second;
+    };
+    for (size_t i = 0; i < spare_free_.size(); ++i)
+        if (spare_free_[i].second >= need && better(i)) pick = i;
+    if (pick < spare_free_.size()) {
+        off = spare_free_[pick].first;
+        cap = spare_free_[pick].second;
+        spare_free_[pick] = spare_free_.back();
+        spare_free_.pop_back();
+        return (uint8_t*) host_at(off, need);
+    }
+    // No single free place fits `need`: relocate a smaller RAM-resident expert from an oversized place into the largest
+    // free hole (between verify windows, no worker reads complement_offsets_).
+    if (!spare_free_.empty() && place_cap_.size() == (size_t) blobs_) {
+        size_t hole_idx = 0;
+        for (size_t i = 1; i < spare_free_.size(); ++i)
+            if (spare_free_[i].second > spare_free_[hole_idx].second) hole_idx = i;
+        const uint64_t h_off = spare_free_[hole_idx].first, h_cap = spare_free_[hole_idx].second;
+        for (int64_t i = 0; i < blobs_; ++i) {
+            if (complement_offsets_[(size_t) i] == kNoComplement) continue;
+            const uint64_t pcap = place_cap((size_t) i);
+            if (pcap < need) continue;
+            const int64_t li = i / n_expert_, ei = i % n_expert_;
+            const uint64_t b = blob_size(li, ei);
+            if (b > h_cap) continue;
+            uint8_t* dst = (uint8_t*) host_at(h_off, b);
+            const uint8_t* src_b = (const uint8_t*) host_at(complement_offsets_[(size_t) i], b);
+            if (dst == nullptr || src_b == nullptr) continue;
+            std::memcpy(dst, src_b, (size_t) b);
+            off = complement_offsets_[(size_t) i];
+            cap = pcap;
+            complement_offsets_[(size_t) i] = h_off;
+            place_cap_[(size_t) i] = h_cap == layer_blob_bytes_[(size_t) li] ? 0 : h_cap;
+            spare_free_[hole_idx] = spare_free_.back();
+            spare_free_.pop_back();
+            ++places_gen_;
+            return (uint8_t*) host_at(off, need);
         }
-    if (pick == spare_free_.size()) return nullptr;
-    off = spare_free_[pick].first;
-    spare_free_[pick] = spare_free_.back();
-    spare_free_.pop_back();
-    return (uint8_t*) host_at(off, need);
+    }
+    return nullptr;
 }
 
-bool FileExpertSource::spare_land(int64_t layer, int64_t out, uint64_t off) {
+bool FileExpertSource::spare_land(int64_t layer, int64_t out, uint64_t off, uint64_t cap) {
     if (!complement_ready_ || layer < 0 || out < 0 || layer >= n_layers_ || out >= n_expert_) return false;
     const size_t i = (size_t) layer * (size_t) n_expert_ + (size_t) out;
     if (i >= complement_offsets_.size() || complement_offsets_[i] != kNoComplement ||
-        host_at(off, layer_blob_bytes_[(size_t) layer]) == nullptr) return false;
+        cap < blob_size(layer, out) || host_at(off, cap) == nullptr) return false;
     complement_offsets_[i] = off;
+    if (place_cap_.size() == (size_t) blobs_) place_cap_[i] = cap == layer_blob_bytes_[(size_t) layer] ? 0 : cap;
     ++exchanges_;
     ++places_gen_;
     return true;
@@ -1341,7 +1439,8 @@ bool FileExpertSource::spare_release(int64_t layer, int64_t in) {
     if (!complement_ready_ || layer < 0 || in < 0 || layer >= n_layers_ || in >= n_expert_) return false;
     const size_t i = (size_t) layer * (size_t) n_expert_ + (size_t) in;
     if (i >= complement_offsets_.size() || complement_offsets_[i] == kNoComplement) return false;
-    spare_free_.emplace_back(complement_offsets_[i], layer_blob_bytes_[(size_t) layer]);
+    spare_free_.emplace_back(complement_offsets_[i], place_cap(i));
+    if (i < place_cap_.size()) place_cap_[i] = 0;
     complement_offsets_[i] = kNoComplement;
     ++places_gen_;
     return true;
@@ -1349,13 +1448,11 @@ bool FileExpertSource::spare_release(int64_t layer, int64_t in) {
 
 bool FileExpertSource::equals_file(int64_t layer, int64_t expert, const uint8_t* bytes) const {
     if (bytes == nullptr || layer < 0 || layer >= n_layers_) return false;
-    std::vector<uint8_t> f((size_t) layer_blob_bytes_[(size_t) layer]);
+    std::vector<uint8_t> f((size_t) blob_size(layer, expert));
     return copy_from_files(layer, expert, f.data()) && std::memcmp(f.data(), bytes, f.size()) == 0;
 }
 
-void FileExpertSource::spare_return(int64_t layer, uint64_t off) {
-    if (layer >= 0 && layer < n_layers_) spare_free_.emplace_back(off, layer_blob_bytes_[(size_t) layer]);
-}
+void FileExpertSource::spare_return(uint64_t off, uint64_t cap) { spare_free_.emplace_back(off, cap); }
 
 uint8_t* FileExpertSource::exchange_buffer(int64_t q) const {
     if (xstage_ == nullptr || q < 0 || q >= xstage_cap_) return nullptr;
@@ -1367,11 +1464,11 @@ bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, in
     const size_t i_in = (size_t) layer * (size_t) n_expert_ + (size_t) in;
     const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
     if (override_.empty()) override_.assign((size_t) blobs_, nullptr);
-    if (override_[i_out] != nullptr) return false;
+    if (override_[i_out] != nullptr || blob_size(layer, out) > place_cap(i_in)) return false;   // out takes in's place
     for (const Exchange& x : staged_)
         if (x.in == i_in || x.q == q) return false;
     override_[i_out] = exchange_buffer(q);
-    staged_.push_back({i_in, i_out, q, layer_blob_bytes_[(size_t) layer]});
+    staged_.push_back({i_in, i_out, q, blob_size(layer, out)});
     return true;
 }
 
@@ -1406,7 +1503,13 @@ int64_t FileExpertSource::commit_exchanges() {
         const uint8_t* dst = at != kNoComplement ? host_at(at, x.bytes) : nullptr;
         if (src != nullptr && dst != nullptr) {
             if (!done) std::memcpy((uint8_t*) dst, src, (size_t) x.bytes);
-            if (detail::exchange_cache_complement(complement_offsets_, x.in, x.out)) ++n;
+            if (detail::exchange_cache_complement(complement_offsets_, x.in, x.out)) {
+                ++n;
+                if (x.in < place_cap_.size()) {
+                    place_cap_[x.out] = place_cap_[x.in];
+                    place_cap_[x.in] = 0;
+                }
+            }
         }
         override_[x.out] = nullptr;
     }

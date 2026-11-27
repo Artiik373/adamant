@@ -327,7 +327,7 @@ bool PeerExperts::verify_fill(std::string& err) {
     const auto& lay = basalt::kernels::cpu::expert_layout();
     On on(device_);
     if (!cache_.verify_slot(res_[(size_t) (first_.first * n_expert_ + first_.second)], src_->blob(first_.first, first_.second), err,
-                            (int64_t) lay.blob_bytes(first_.first))) {
+                            (int64_t) lay.expert_bytes(first_.first, first_.second))) {
         err = "peer experts: " + err;
         return false;
     }
@@ -633,17 +633,17 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
         for (const Swap& s : swaps) {
             const int32_t slot = res_[(size_t) (s.layer * n_expert_ + s.out)];
             if (slot < 0 || !fsrc_->has_resident(s.layer, s.in)) continue;
-            uint64_t off = kHasPlace;
+            uint64_t off = kHasPlace, cap = 0;
             if (!fsrc_->has_resident(s.layer, s.out)) {
-                uint8_t* dst = fsrc_->spare_take(s.layer, off);
+                uint8_t* dst = fsrc_->spare_take(s.layer, s.out, off, cap);
                 if (dst == nullptr) continue;
-                if (!ck(cudaMemcpyAsync(dst, cache_.device_slot(slot), (size_t) lay.blob_bytes(s.layer),
+                if (!ck(cudaMemcpyAsync(dst, cache_.device_slot(slot), (size_t) fsrc_->blob_size(s.layer, s.out),
                                         cudaMemcpyDeviceToHost, refill_), "evict", err)) {
-                    fsrc_->spare_return(s.layer, off);
+                    fsrc_->spare_return(off, cap);
                     return false;
                 }
             }
-            evicting_.push_back({s.layer, s.in, s.out, slot, off});
+            evicting_.push_back({s.layer, s.in, s.out, slot, off, cap});
         }
         return evicting_.empty() || ck(cudaEventRecord(evict_ev_, refill_), "evict event", err);
     }
@@ -694,7 +694,7 @@ bool PeerExperts::reassign(int64_t layer, int32_t in, int64_t lout, int32_t out,
 bool PeerExperts::copy_to(int64_t layer, int64_t expert, uint8_t* dst, cudaStream_t stream, std::string& err) {
     const uint8_t* p = slot_ptr(layer, expert);
     if (p == nullptr) { err = "peer experts: an expert to copy out is not resident"; return false; }
-    return ck(cudaMemcpyPeerAsync(dst, 0, p, device_, (size_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer),
+    return ck(cudaMemcpyPeerAsync(dst, 0, p, device_, (size_t) basalt::kernels::cpu::expert_layout().expert_bytes(layer, expert),
                                   stream), "copy to the primary", err);
 }
 
@@ -843,12 +843,12 @@ bool PeerExperts::issue_pending(bool wait) {
         const bool placed = x.off == kHasPlace;
         // the slot may have been reassigned or its victim promoted since the round was planned
         if (res_[(size_t) (x.layer * n_expert_ + x.out)] != x.slot || (placed && !fsrc_->has_resident(x.layer, x.out))) {
-            if (!placed) fsrc_->spare_return(x.layer, x.off);
+            if (!placed) fsrc_->spare_return(x.off, x.cap);
             continue;
         }
         const uint8_t* b = src_->blob(x.layer, x.in);
-        if (!placed && !fsrc_->spare_land(x.layer, x.out, x.off)) {
-            fsrc_->spare_return(x.layer, x.off);   // the victim got a place meanwhile: try again next round
+        if (!placed && !fsrc_->spare_land(x.layer, x.out, x.off, x.cap)) {
+            fsrc_->spare_return(x.off, x.cap);   // the victim got a place meanwhile: try again next round
             continue;
         }
         if (b == nullptr ||

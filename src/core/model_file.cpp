@@ -380,6 +380,17 @@ bool ModelFile::register_gguf_view(std::string& err) const {
     const Json* kv = meta_.get("gguf_kv");
     const Json* tensors = meta_.get("tensors");
     const Section* gg = find("gguf");
+    if (kv == nullptr && gg == nullptr) {
+        if (const Json* arch = meta_.get("arch"); arch != nullptr && arch->is_string() && !arch->s.empty()) {
+            auto view = std::make_shared<VirtualGguf>();
+            MetaValue mv;
+            mv.type = MetaType::STRING;
+            mv.s = arch->s;
+            view->meta.emplace("general.architecture", std::move(mv));
+            gguf_register_virtual(path_, std::move(view));
+            return true;
+        }
+    }
     if (kv == nullptr || !kv->is_object() || tensors == nullptr || !tensors->is_object()) {
         err = path_ + ": meta has no gguf_kv / tensors";
         return false;

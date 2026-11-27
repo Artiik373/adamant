@@ -446,7 +446,8 @@ const uint8_t* ExpertCache::device_slot(int32_t slot) const {
 }
 
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    const int64_t cap = slot >= 0 && slot < slots_ ? (int64_t) slot_cap(slot) : 0;   // never past the slot's end
+    const size_t n = (size_t) (bytes > 0 && bytes <= cap ? bytes : cap);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot: slot " + std::to_string(slot) + " is outside 0.." +
@@ -468,7 +469,8 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
 }
 
 bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    const int64_t cap = slot >= 0 && slot < slots_ ? (int64_t) slot_cap(slot) : 0;   // never past the slot's end
+    const size_t n = (size_t) (bytes > 0 && bytes <= cap ? bytes : cap);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot_blocking: slot outside the arena";
@@ -488,7 +490,8 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
 }
 
 bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    const int64_t cap = slot >= 0 && slot < slots_ ? (int64_t) slot_cap(slot) : 0;   // never past the slot's end
+    const size_t n = (size_t) (bytes > 0 && bytes <= cap ? bytes : cap);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr || host_blob == nullptr) {
         err = dst == nullptr ? "ExpertCache::fill_slot_queued: slot outside the arena"

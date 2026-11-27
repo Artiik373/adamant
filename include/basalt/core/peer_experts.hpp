@@ -207,7 +207,7 @@ private:
     std::vector<uint8_t> hold_;                       ///< [n_layers * n_expert]: not to be evicted
     /// `off` is the RAM place the victim is copied to, or `kHasPlace` when the victim already has one
     static constexpr uint64_t kHasPlace = ~0ull;
-    struct Evict { int32_t layer, in, out, slot; uint64_t off; };
+    struct Evict { int32_t layer, in, out, slot; uint64_t off, cap; };
     std::vector<Evict> evicting_;                     ///< exclusive swaps whose victim is still being copied to RAM
     cudaEvent_t evict_ev_ = nullptr;
     int64_t resident_ = 0, entries_ = 0, experts_ = 0, swaps_ = 0;

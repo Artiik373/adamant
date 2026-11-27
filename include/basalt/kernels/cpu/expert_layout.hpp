@@ -34,6 +34,11 @@ struct ExpertLayout {
         const auto& e = eoff[(size_t) layer];
         return layer_offset(layer) + (e.empty() ? (uint64_t) expert * blob_bytes(layer) : e[(size_t) expert]);
     }
+    /// One expert's own bytes (a mixed layer's are at most its slot).
+    uint64_t expert_bytes(int64_t layer, int64_t expert) const {
+        const auto& e = eoff[(size_t) layer];
+        return e.empty() ? blob_bytes(layer) : e[(size_t) expert + 1] - e[(size_t) expert];
+    }
     /// All of a layer's blobs (a mixed layer's are smaller than its slot).
     uint64_t layer_bytes(int64_t layer) const {
         const auto& e = eoff[(size_t) layer];

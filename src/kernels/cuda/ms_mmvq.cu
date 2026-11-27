@@ -4,6 +4,7 @@
 #include "../ms_1mad_cuda.cuh"
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cstdint>
 #include <stdexcept>
@@ -150,22 +151,68 @@ __global__ void __launch_bounds__(kWarps * 32, 4) ms_gemv_cols_kernel(const uint
 // reads a column's 4 values as one 8-byte load.  A column's sums take one order whatever columns ride along.
 constexpr int kTcWarps = 8;
 constexpr int kTcCh = 128;                    // input columns a staged row chunk
-constexpr size_t kTcSmemMax = 64 * 1024;      // the staged columns' shared memory at most
+constexpr size_t kTcSmemMax = 80 * 1024;      // the staged columns' shared memory at most
 
-__device__ __forceinline__ uint32_t tc_h2(float lo, float hi) {
-    const __half2 h = __floats2half2_rn(lo, hi);
-    return *reinterpret_cast<const uint32_t*>(&h);
+
+// Two 1MAD states to an fp16 pair (lo in the low half): the byte sum lands in the mantissa of 1024, and one HSUB2 of
+// 1024 + 510 leaves the exact weight.
+__device__ __forceinline__ uint32_t tc_pair(uint32_t lo, uint32_t hi) {
+    uint32_t a, b;
+    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(a) : "r"(lo * mc::kMadMul + mc::kMadAdd), "r"(0x01010101u), "r"(0x6400u));
+    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(b) : "r"(hi * mc::kMadMul + mc::kMadAdd), "r"(0x01010101u), "r"(0x6400u));
+    const uint32_t h = __byte_perm(a, b, 0x5410);
+    const __half2 r = __hsub2(*reinterpret_cast<const __half2*>(&h), __float2half2_rn(1534.0f));
+    return *reinterpret_cast<const uint32_t*>(&r);
+}
+
+// The rotated, scaled fp16 columns of a call, rotated once for all of its blocks.  A ring of buffers, a call a slot in
+// launch order, so calls that overlap on two streams never share one.
+// shortcut: a call whose columns exceed kTcBufHalf rotates in each block, raise kTcBufHalf if a window outgrows it.
+constexpr int kTcRing = 8;
+constexpr int kTcBufHalf = 16 * 6144;
+constexpr int kTcBufCols = 64;
+__device__ __half g_tc_x[kTcRing][kTcBufHalf];
+__device__ float g_tc_m[kTcRing][kTcBufCols];
+
+// Column blockIdx.x of the call: its largest |x| (127 times its largest Q8_1 scale), then H(signs * x) / sqrt(hb) / that.
+__global__ void __launch_bounds__(kTcWarps * 32) ms_tc_rotate_kernel(const uint8_t* __restrict__ w,
+                                                                   const mc::MsQ81* __restrict__ x, int n_in,
+                                                                   int n_out, int k, int slot) {
+    __shared__ float s_m[kTcWarps];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, j = blockIdx.x;
+    const mc::MsQ81* xq = x + (size_t) j * (n_in / 32);
+    float m = 0.0f;
+    for (int b = threadIdx.x; b < n_in / 32; b += kTcWarps * 32) m = fmaxf(m, fabsf(__half2float(xq[b].d)));
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, o));
+    if (lane == 0) s_m[warp] = m;
+    __syncthreads();
+    m = s_m[0];
+    for (int i = 1; i < kTcWarps; ++i) m = fmaxf(m, s_m[i]);
+    const float cm = m > 0.0f ? 127.0f * m : 1.0f;
+    if (threadIdx.x == 0) g_tc_m[slot][j] = cm;
+    const int8_t* signs = reinterpret_cast<const int8_t*>(w + (size_t) n_out * mc::ms_row_bytes(n_in, k));
+    const int hb = mc::ms_hadamard_block(n_in), per = n_in / hb;
+    const float rs = rsqrtf((float) hb);
+    for (int b = warp; b < per; b += kTcWarps)
+        mc::ms_rotate_block_warp(&g_tc_x[slot][(size_t) j * n_in], [&](int i) {
+            const mc::MsQ81& q = xq[i >> 5];
+            return __half2float(q.d) * (float) q.qs[i & 31] * (float) __ldg(signs + i);
+        }, b * hb, hb, rs / cm);
 }
 
 template <int K>
 __global__ void __launch_bounds__(kTcWarps * 32, 2) ms_gemv_tc_kernel(const uint8_t* __restrict__ w,
                                                                     const mc::MsQ81* __restrict__ x,
                                                                     float* __restrict__ y, int n_in, int n_out,
-                                                                    int col0, int nc, int ks) {
+                                                                    int col0, int nc, int ks, int slot) {
     static_assert(3 * K + 14 <= 32, "4 states must fit one 32-bit window");
-    // a chunk's windows start at bits 18 + c K (c = k0 .. k0 + 124 in steps of 4) and read two words each
+    // a chunk's windows start at bits 18 + c K (c = k0 .. k0 + kTcCh - 4 in steps of 4) and read two words each
     constexpr int kChWords = (31 + (kTcCh - 4) * K) / 32 + 2;
-    __shared__ uint32_t s_w[kTcWarps][16][kChWords];
+    __shared__ union {
+        uint32_t w[kTcWarps][16][kChWords];
+        float4 red[kTcWarps][32];
+    } s_u;
     __shared__ float s_cmax[8];
     extern __shared__ uint2 s_x[];                // column j's values from s_x + j * n_in / 4, 4 fp16 an element
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
@@ -174,7 +221,14 @@ __global__ void __launch_bounds__(kTcWarps * 32, 2) ms_gemv_tc_kernel(const uint
     const int hb = mc::ms_hadamard_block(n_in);
     const float rs = rsqrtf((float) hb);
     const int8_t* signs = reinterpret_cast<const int8_t*>(w + (size_t) n_out * stride_words * 4);
-    for (int j = warp; j < nc; j += kTcWarps) {
+    __half* s_xh = reinterpret_cast<__half*>(s_x);
+    if (slot >= 0) {   // the columns rotated once: a copy from L2
+        if (threadIdx.x < nc) s_cmax[threadIdx.x] = g_tc_m[slot][cb + threadIdx.x];
+        const uint4* src = reinterpret_cast<const uint4*>(&g_tc_x[slot][(size_t) cb * n_in]);
+        uint4* dst = reinterpret_cast<uint4*>(s_x);
+        for (int i = threadIdx.x; i < nc * n_in / 8; i += kTcWarps * 32) dst[i] = src[i];
+    }
+    for (int j = warp; slot < 0 && j < nc; j += kTcWarps) {
         const mc::MsQ81* xq = x + (size_t) (cb + j) * (n_in / 32);
         float m = 0.0f;
         for (int b = lane; b < n_in / 32; b += 32) m = fmaxf(m, fabsf(__half2float(xq[b].d)));
@@ -183,9 +237,8 @@ __global__ void __launch_bounds__(kTcWarps * 32, 2) ms_gemv_tc_kernel(const uint
         if (lane == 0) s_cmax[j] = m > 0.0f ? 127.0f * m : 1.0f;
     }
     __syncthreads();
-    __half* s_xh = reinterpret_cast<__half*>(s_x);
     const int per = n_in / hb;   // n_in % 32 == 0: the Hadamard blocks are 32 or more, a warp each
-    for (int b = warp; b < nc * per; b += kTcWarps) {
+    for (int b = warp; slot < 0 && b < nc * per; b += kTcWarps) {
         const int j = b / per;
         const mc::MsQ81* xq = x + (size_t) (cb + j) * (n_in / 32);
         mc::ms_rotate_block_warp(s_xh + (size_t) j * n_in, [&](int i) {
@@ -196,12 +249,11 @@ __global__ void __launch_bounds__(kTcWarps * 32, 2) ms_gemv_tc_kernel(const uint
     __syncthreads();
 
     const uint32_t* g32 = reinterpret_cast<const uint32_t*>(w);
-    uint32_t(*sw)[kChWords] = s_w[warp];
+    uint32_t(*sw)[kChWords] = s_u.w[warp];
     const bool col_on = g < nc;
     const int n_tiles = n_out / 16, n_chunks = (n_in + kTcCh - 1) / kTcCh;
     // ks warps share a tile (each every ks-th chunk; partial sums added in shared memory), kTcWarps / ks tiles a block
     const int tpb = kTcWarps / ks, tg = warp / ks, kq = warp % ks;
-    __shared__ float4 s_red[kTcWarps][32];
     // lane l holds word l of the 16 rows' chunk: the next chunk is in flight while the warp decodes the staged one
     uint32_t buf[16];
     auto fetch = [&](int tile, int ch) {
@@ -234,12 +286,10 @@ __global__ void __launch_bounds__(kTcWarps * 32, 2) ms_gemv_tc_kernel(const uint
                 const int p = 18 + c * K - 32 * wlo, wi = p >> 5, off = p & 31;
                 const uint32_t v0 = __funnelshift_l(sw[g][wi + 1], sw[g][wi], off);
                 const uint32_t v1 = __funnelshift_l(sw[g + 8][wi + 1], sw[g + 8][wi], off);
-                const uint32_t a0 = tc_h2(mc::decode_1mad_dp4a(v0 >> 18), mc::decode_1mad_dp4a((v0 >> (18 - K)) & mc::kStateMask));
-                const uint32_t a2 = tc_h2(mc::decode_1mad_dp4a((v0 >> (18 - 2 * K)) & mc::kStateMask),
-                                          mc::decode_1mad_dp4a((v0 >> (18 - 3 * K)) & mc::kStateMask));
-                const uint32_t a1 = tc_h2(mc::decode_1mad_dp4a(v1 >> 18), mc::decode_1mad_dp4a((v1 >> (18 - K)) & mc::kStateMask));
-                const uint32_t a3 = tc_h2(mc::decode_1mad_dp4a((v1 >> (18 - 2 * K)) & mc::kStateMask),
-                                          mc::decode_1mad_dp4a((v1 >> (18 - 3 * K)) & mc::kStateMask));
+                const uint32_t a0 = tc_pair(v0 >> 18, (v0 >> (18 - K)) & mc::kStateMask);
+                const uint32_t a2 = tc_pair((v0 >> (18 - 2 * K)) & mc::kStateMask, (v0 >> (18 - 3 * K)) & mc::kStateMask);
+                const uint32_t a1 = tc_pair(v1 >> 18, (v1 >> (18 - K)) & mc::kStateMask);
+                const uint32_t a3 = tc_pair((v1 >> (18 - 2 * K)) & mc::kStateMask, (v1 >> (18 - 3 * K)) & mc::kStateMask);
                 uint2 b = make_uint2(0u, 0u);
                 if (col_on) b = s_x[((size_t) g * n_in + c) >> 2];
                 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
@@ -248,11 +298,12 @@ __global__ void __launch_bounds__(kTcWarps * 32, 2) ms_gemv_tc_kernel(const uint
             }
         }
         if (ks > 1) {   // the tile's partial sums, in split order
-            s_red[warp][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+            __syncthreads();
+            s_u.red[warp][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
             __syncthreads();
             if (kq == 0)
                 for (int q = 1; q < ks; ++q) {
-                    const float4 r = s_red[warp + q][lane];
+                    const float4 r = s_u.red[warp + q][lane];
                     acc[0] += r.x; acc[1] += r.y; acc[2] += r.z; acc[3] += r.w;
                 }
             __syncthreads();
@@ -405,8 +456,14 @@ int sm_count() {
 
 template <int K>
 cudaError_t launch_tc(const uint8_t* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
-    static const bool big = cudaFuncSetAttribute(ms_gemv_tc_kernel<K>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                 (int) kTcSmemMax) == cudaSuccess;
+    static const bool big = [&] {
+        if (cudaFuncSetAttribute(ms_gemv_tc_kernel<K>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int) kTcSmemMax) != cudaSuccess)
+            return false;
+        cudaFuncSetAttribute(ms_gemv_tc_kernel<K>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                             cudaSharedmemCarveoutMaxShared);
+        return true;
+    }();
     if (!big) return cudaErrorInvalidValue;
     const int fit = (int) (kTcSmemMax / ((size_t) n_in * 2));
     if (fit < 1) return cudaErrorInvalidValue;
@@ -416,10 +473,16 @@ cudaError_t launch_tc(const uint8_t* w, const void* x, float* y, int n_in, int n
     int ks = 1;
     while (ks < kTcWarps && ks * 2 <= n_chunks && (int64_t) tiles * ks < (int64_t) sm_count() * 16) ks *= 2;
     const int tpb = kTcWarps / ks, need = (tiles + tpb - 1) / tpb;
+    int slot = -1;
+    if ((int64_t) ncols * n_in > 8192 && (int64_t) ncols * n_in <= kTcBufHalf && ncols <= kTcBufCols) {   // few columns: the launch costs more
+        static std::atomic<unsigned> next{0};   // launch order; a captured graph keeps each call's slot
+        slot = (int) (next++ % kTcRing);
+        ms_tc_rotate_kernel<<<ncols, kTcWarps * 32, 0, s>>>(w, static_cast<const mc::MsQ81*>(x), n_in, n_out, K, slot);
+    }
     auto go = [&](int nc, int col0, int chunks) {
         const int want = sm_count() * 2 / chunks, gy = want < 1 ? 1 : want > need ? need : want;
         ms_gemv_tc_kernel<K><<<dim3(chunks, gy), kTcWarps * 32, (size_t) nc * n_in * 2, s>>>(
-            w, static_cast<const mc::MsQ81*>(x), y, n_in, n_out, col0, nc, ks);
+            w, static_cast<const mc::MsQ81*>(x), y, n_in, n_out, col0, nc, ks, slot);
     };
     go(cpb, 0, full);
     if (rest > 0) go(rest, full * cpb, 1);

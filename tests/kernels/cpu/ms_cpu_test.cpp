@@ -218,16 +218,16 @@ void check_prepare(std::mt19937& g, int n) {
 void bench(std::mt19937& g, int k, int n_in, int n_out) {
     const auto p = payload(g, k, n_in, n_out);
     const int8_t* signs = (const int8_t*) p.data() + (size_t) n_out * basalt::ms_row_bytes((uint64_t) n_in, k);
-    std::vector<float> x((size_t) n_in, 0.5f), y((size_t) n_out * 4);
-    MsAct a[4];
-    const MsAct* ap[4];
-    float* yp[4];
-    for (int t = 0; t < 4; ++t) {
+    std::vector<float> x((size_t) n_in, 0.5f), y((size_t) n_out * 8);
+    MsAct a[8];
+    const MsAct* ap[8];
+    float* yp[8];
+    for (int t = 0; t < 8; ++t) {
         ms_act_prepare(x.data(), signs, n_in, a[t]);
         ap[t] = &a[t];
         yp[t] = y.data() + (size_t) t * n_out;
     }
-    for (int nt : {1, 3}) {
+    for (int nt : {1, 3, 8}) {
         const int reps = 200;
         const auto t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < reps; ++i) ms_rows(k, p.data(), n_in, ap, nt, yp, 0, n_out);

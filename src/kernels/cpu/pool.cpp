@@ -1,11 +1,13 @@
 // src/kernels/cpu/pool.cpp - the CPU expert pool.  Read pool.hpp first; it explains the protocol.
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/kernels/cpu/cpu_quota.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <chrono>
 #include "basalt/platform/compiler.hpp"
 
@@ -381,12 +383,79 @@ void ExpertPool::native_gu_range(int e, int r0, int r1) {
         exl3_gu_cols(*nfmt_, j.blob, j.nact, j.nt, ff, up, r0, r1, (batch_stamp_ << 7) | (uint64_t) e);
         return;
     }
+    if (nfmt_->ms_k != 0) {
+        const uint8_t* blob = j.blob;
+        const NativeFmt& f = ms_blob_fmt(*nfmt_, blob);
+        const int n = (int) f.n_embd;
+        auto prep_ms_e = [&](int ei) {
+            const ExpertJobMulti& je = mjobs_[ei];
+            const uint8_t* eb = je.blob;
+            const NativeFmt& ef = ms_blob_fmt(*nfmt_, eb);
+            const int en = (int) ef.n_embd;
+            const int8_t* esg = (const int8_t*) eb + ef.up_off - en;
+            const int8_t* esu = (const int8_t*) eb + ef.down_off - en;
+            SplitBufMulti& esb = split_multi_[(size_t) ei];
+            esb.ms_same_u = std::memcmp(esg, esu, (size_t) en) == 0;
+            for (int t = 0; t < je.nt; ++t) {
+                ms_act_prepare((const float*) je.nact[t], esg, en, esb.ms_ag[t]);
+                if (!esb.ms_same_u) ms_act_prepare((const float*) je.nact[t], esu, en, esb.ms_au[t]);
+            }
+        };
+        FusedExpert& fe = fused_[(size_t) e];
+        if (fe.ms_gu_ready.load(std::memory_order_acquire) != 2) {
+            int expected = 0;
+            if (fe.ms_gu_ready.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+                prep_ms_e(e);
+                fe.ms_gu_ready.store(2, std::memory_order_release);
+            } else {
+                // Help prepare other batch experts instead of spinning idle while expert e finishes.
+                for (int k = 1; k < fused_n_ && fe.ms_gu_ready.load(std::memory_order_acquire) != 2; ++k) {
+                    const int ei = (e + k) % fused_n_;
+                    int ex = 0;
+                    if (fused_[(size_t) ei].ms_gu_ready.load(std::memory_order_relaxed) == 0 &&
+                        fused_[(size_t) ei].ms_gu_ready.compare_exchange_strong(ex, 1, std::memory_order_acq_rel)) {
+                        prep_ms_e(ei);
+                        fused_[(size_t) ei].ms_gu_ready.store(2, std::memory_order_release);
+                    }
+                }
+                while (fe.ms_gu_ready.load(std::memory_order_acquire) != 2) basalt::platform::cpu_relax();
+            }
+        }
+        const MsAct* ag[MAXT];
+        const MsAct* au[MAXT];
+        float* up[MAXT];
+        for (int t = 0; t < j.nt; ++t) {
+            ag[t] = &sb.ms_ag[t];
+            au[t] = sb.ms_same_u ? &sb.ms_ag[t] : &sb.ms_au[t];
+            up[t] = sb.up[t];
+        }
+        ms_rows(basalt::ms_bits((uint32_t) f.gu_type), blob, n, ag, j.nt, ff, r0, r1);
+        ms_rows(basalt::ms_bits((uint32_t) f.up_type), blob + f.up_off, n, au, j.nt, up, r0, r1);
+        for (int t = 0; t < j.nt; ++t)
+            for (int r = r0; r < r1; ++r) {
+                float a = ff[t][r], b = sb.up[t][r];
+                if (f.swiglu_limit > 0.f) {
+                    a = std::fmin(a, f.swiglu_limit);
+                    b = std::fmax(std::fmin(b, f.swiglu_limit), -f.swiglu_limit);
+                }
+                ff[t][r] = (a / (1.f + std::exp(-a))) * b;
+            }
+        return;
+    }
     native_gu_rows(*nfmt_, j.blob, j.nact, j.nt, ff, r0, r1);
 }
 
 void ExpertPool::native_down_range(int e, int r0, int r1) {
     SplitBufMulti& sb = split_multi_[(size_t) e];
     const ExpertJobMulti& j = mjobs_[e];
+    if (nfmt_->ms_k != 0) {
+        const uint8_t* blob = j.blob;
+        const NativeFmt& f = ms_blob_fmt(*nfmt_, blob);
+        const MsAct* ad[MAXT];
+        for (int t = 0; t < j.nt; ++t) ad[t] = &sb.ms_ad[t];
+        ms_rows(basalt::ms_bits((uint32_t) f.d_type), blob + f.down_off, (int) f.n_ff, ad, j.nt, j.out, r0, r1);
+        return;
+    }
     if (q2_native_kernels(nfmt_->d_type)) {
         // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
         const ActQ* a2[MAXT];
@@ -409,6 +478,13 @@ void ExpertPool::exl3_finish_block(int e, int b) {
 
 void ExpertPool::native_quantize(int e) {
     SplitBufMulti& sb = split_multi_[(size_t) e];
+    if (nfmt_->ms_k != 0) {
+        const uint8_t* blob = mjobs_[e].blob;
+        const NativeFmt& f = ms_blob_fmt(*nfmt_, blob);
+        const int8_t* sd = (const int8_t*) blob + f.down_off + (size_t) f.n_embd * f.d_row;
+        for (int t = 0; t < mjobs_[e].nt; ++t) ms_act_prepare(sb.ff[t], sd, (int) f.n_ff, sb.ms_ad[t]);
+        return;
+    }
     for (int t = 0; t < mjobs_[e].nt; ++t)
         if (q2_native_kernels(nfmt_->d_type)) act_quant_any(sb.ff[t], (int) nfmt_->n_ff, sb.a2[t]);
         else native_quant_h(*nfmt_, sb.ff[t], sb.hq[t]);
@@ -492,6 +568,7 @@ int ExpertPool::split_multi_batch(const NativeFmt& f, ExpertJobMulti* jobs, int 
         for (int b = 0; b < (exl3_ppb_ > 0 ? gu_blocks : 0); ++b)
             fused_[(size_t) e].blk_left[b].store(exl3_ppb_, std::memory_order_relaxed);
         fused_[(size_t) e].ready.store(0, std::memory_order_relaxed);
+        if (f.ms_k != 0) fused_[(size_t) e].ms_gu_ready.store(0, std::memory_order_relaxed);
     }
     return nb * (fused_gu_parts_ + fused_d_parts_);
 }

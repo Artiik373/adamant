@@ -73,6 +73,10 @@ public:
     bool open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert, std::string& err);
     /// Byte offset of each slot in the arena (null for uniform slots).
     const uint64_t* slot_offsets() const { return off_.empty() ? nullptr : off_.data(); }
+    /// The bytes slot `slot` holds.
+    uint64_t slot_cap(int32_t slot) const {
+        return off_.empty() ? (uint64_t) blob_ : off_[(size_t) slot + 1] - off_[(size_t) slot];
+    }
     void close();
 
     bool valid() const { return base_ != nullptr; }

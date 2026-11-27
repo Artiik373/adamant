@@ -256,17 +256,17 @@ __device__ __forceinline__ void chunk(bool window, const uint8_t* base, float sc
 // memory (none for one head). L2: read through L2 only (the chunks were written by other blocks of the same launch).
 __host__ __device__ constexpr int merge_scratch_floats(int hb, int n_chunks) { return 2 * hb * n_chunks + hb; }
 
-template <int HB, bool L2>
+template <int HB, bool L2, bool HasSink = true>
 __device__ __forceinline__ void merge(const float* o, size_t o_head, const float* mlp, size_t ml_head, int n_chunks, const float* sinks,
                                       float* scratch, float2 (&out)[HB]) {
     auto ld = [](const float* p) { return L2 ? __ldcg(p) : *p; };
     auto ld2 = [](const float* p) { return L2 ? __ldcg(reinterpret_cast<const float2*>(p)) : *reinterpret_cast<const float2*>(p); };
     const int tid = threadIdx.x;
     if constexpr (HB == 1) {   // one head: the chunks stream through once, no scratch
-        const float sink = sinks[0];
+        const float sink = HasSink ? sinks[0] : -INFINITY;
         float M = sink;
         for (int c = 0; c < n_chunks; ++c) M = fmaxf(M, ld(mlp + 2 * c));
-        float denom = expf(sink - M);
+        float denom = (HasSink && M > -INFINITY) ? expf(sink - M) : 0.f;
         float acc0 = 0.f, acc1 = 0.f;
         for (int c = 0; c < n_chunks; ++c) {
             const float m = ld(mlp + 2 * c);
@@ -277,7 +277,7 @@ __device__ __forceinline__ void merge(const float* o, size_t o_head, const float
             acc0 = fmaf(v.x, e, acc0);
             acc1 = fmaf(v.y, e, acc1);
         }
-        const float inv = 1.0f / denom;
+        const float inv = denom > 0.f ? 1.0f / denom : 0.f;
         out[0] = make_float2(acc0 * inv, acc1 * inv);
         return;
     }
@@ -293,10 +293,10 @@ __device__ __forceinline__ void merge(const float* o, size_t o_head, const float
     if (tid < HB) {
         float* wh = w + tid * n_chunks;
         const float* lh = l + tid * n_chunks;
-        const float sink = sinks[tid];
+        const float sink = HasSink ? sinks[tid] : -INFINITY;
         float M = sink;
         for (int c = 0; c < n_chunks; ++c) M = fmaxf(M, wh[c]);
-        float denom = expf(sink - M);
+        float denom = (HasSink && M > -INFINITY) ? expf(sink - M) : 0.f;
         for (int c = 0; c < n_chunks; ++c) {
             const float m = wh[c];
             if (m == -INFINITY) {
@@ -307,7 +307,7 @@ __device__ __forceinline__ void merge(const float* o, size_t o_head, const float
             denom = fmaf(lh[c], e, denom);
             wh[c] = e;
         }
-        inv[tid] = 1.0f / denom;
+        inv[tid] = denom > 0.f ? 1.0f / denom : 0.f;
     }
     __syncthreads();
     float acc[HB][2];

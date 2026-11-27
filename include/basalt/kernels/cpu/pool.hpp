@@ -21,6 +21,7 @@
 #pragma once
 
 #include "basalt/kernels/cpu/expert.hpp"
+#include "basalt/kernels/cpu/ms_expert.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/platform/cpu.hpp"
 
@@ -212,6 +213,10 @@ private:
         alignas(64) float up[MAXT][kNativeMaxFF];   // EXL3: the up product before its output transform
         ActQ a2[MAXT];
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // native down activations
+        MsAct ms_ag[MAXT];
+        MsAct ms_au[MAXT];
+        MsAct ms_ad[MAXT];
+        bool ms_same_u = false;
     };
     const NativeFmt* nfmt_ = nullptr;
     // run_split_multi_native's one batch per layer (mode 8): per expert, the gate/up parts left to do (EXL3: the
@@ -219,6 +224,7 @@ private:
     struct alignas(64) FusedExpert {
         std::atomic<int> gu_left{0};
         std::atomic<int> ready{0};
+        std::atomic<int> ms_gu_ready{0};
         std::atomic<int> blk_left[kNativeMaxFF / 128];   // EXL3: gate/up parts left in each 128-block
     };
     std::unique_ptr<FusedExpert[]> fused_;

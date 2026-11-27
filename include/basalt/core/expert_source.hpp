@@ -56,7 +56,8 @@ bool make_cache_complement_plan(
     int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
     const std::vector<std::pair<int32_t, int32_t>>& primary_gpu_pairs,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs,
-    std::vector<uint64_t>& offsets, uint64_t& bytes, std::string& err);
+    std::vector<uint64_t>& offsets, uint64_t& bytes, std::string& err,
+    const std::vector<std::vector<uint64_t>>* eoff = nullptr);   ///< a mixed layer's blob offsets: its blobs packed tight
 
 /// Resolve one blob through the compact copy when present, otherwise preserve its exact mapped-file fallback.
 const uint8_t* cache_complement_blob_or_fallback(
@@ -325,6 +326,10 @@ public:
     uint8_t* exchange_buffer(int64_t q) const;
     /// Requires `has_resident(layer, in)`, `!has_resident(layer, out)` and `exchange_buffer(q)` holding out's blob.
     bool stage_exchange(int64_t layer, int64_t in, int64_t out, int64_t q);
+    /// `out`'s blob fits `in`'s RAM place (a mixed layer's places differ in size).
+    bool exchange_fits(int64_t layer, int64_t in, int64_t out) const {
+        return blob_size(layer, out) <= place_cap((size_t) layer * (size_t) n_expert_ + (size_t) in);
+    }
     /// After the GPU copies of every staged swap have landed.  Returns how many exchanges were applied.
     int64_t commit_exchanges();
     /// The copies of `commit_exchanges` ahead of it (it then only moves the bookkeeping), at most `max_bytes` per call
@@ -340,14 +345,16 @@ public:
     // Call between verify windows (the pool reads the offsets during one).
     void set_spares(int64_t n) { spares_want_ = n; }
     int64_t spares_free() const { return (int64_t) spare_free_.size(); }
-    /// A free place for `layer`'s blob (its host address; `off` its offset), or nullptr.
-    uint8_t* spare_take(int64_t layer, uint64_t& off);
-    /// `out` (held by no place) is read from the place at `off` from now on.
-    bool spare_land(int64_t layer, int64_t out, uint64_t off);
+    /// The smallest free place that holds `expert`'s blob (its host address; `off` its offset, `cap` its bytes), or
+    /// nullptr.
+    uint8_t* spare_take(int64_t layer, int64_t expert, uint64_t& off, uint64_t& cap);
+    /// `out` (held by no place) is read from the place at `off` (of `cap` bytes) from now on.
+    bool spare_land(int64_t layer, int64_t out, uint64_t off, uint64_t cap);
     /// `in`'s place is free (it is resident on the GPU now).
     bool spare_release(int64_t layer, int64_t in);
     /// A place `spare_take` gave, unused.
-    void spare_return(int64_t layer, uint64_t off);
+    void spare_return(uint64_t off, uint64_t cap);
+    uint64_t blob_size(int64_t layer, int64_t expert) const;   ///< the blob's own bytes (a mixed layer's < its slot)
     /// After loading, before any reader runs: keeps more experts in RAM, in a second region placed after the first
     /// in the offset space, hottest first (`rank`) as far as ram_tier_room of the available RAM and the reserve allows,
     /// less the file cache's floor (set_file_cache) while experts stay in the file.
@@ -408,6 +415,12 @@ private:
     mutable std::unique_ptr<AdviseWorker> advise_worker_;
     mutable std::once_flag advise_once_;
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
+    uint64_t expert_offset(int64_t layer, int64_t expert) const;   ///< from the mapping's start
+    /// The bytes of the place blob i holds (0 in place_cap_: its layer's slot).
+    uint64_t place_cap(size_t i) const {
+        return i < place_cap_.size() && place_cap_[i] != 0 ? place_cap_[i] : layer_blob_bytes_[i / (size_t) n_expert_];
+    }
+    std::vector<uint64_t> place_cap_;   ///< per blob: its place's bytes when they differ from the slot (mixed layers)
     /// The blob's bytes from the mapped file into `dst`.
     bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;
     static constexpr uint64_t kNoComplement = detail::kNoCacheComplement;
@@ -422,6 +435,7 @@ private:
     int64_t n_expert_ = 0;
     uint64_t mapped_bytes_ = 0;
     std::vector<uint64_t> layer_offsets_, layer_blob_bytes_;
+    std::vector<std::vector<uint64_t>> layer_eoff_;   ///< a mixed layer's blob offsets (the layout's eoff)
     void* complement_arena_ = nullptr;
     const uint8_t* complement_host_ = nullptr;
     RamAllocation complement_allocation_;
